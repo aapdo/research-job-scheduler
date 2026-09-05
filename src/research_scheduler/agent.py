@@ -69,6 +69,24 @@ def dataset_status(path):
     return result
 
 
+def cgroup_memory_headroom(host_available_mib, maximum, current, stat):
+    """Admission estimate including clean inactive cache, capped by both limits.
+
+    Active, dirty/writeback and anonymous memory are not counted as reclaimable.
+    Missing memory.stat information falls back to raw cgroup headroom.
+    """
+    limit, used = max(0, int(maximum)), max(0, int(current))
+    inactive = max(0, int(stat.get('inactive_file', 0)))
+    excluded = max(0, int(stat.get('file_dirty', 0))) + max(0, int(stat.get('file_writeback', 0)))
+    reclaimable = min(used, max(0, inactive - excluded))
+    potential = max(0, limit - used + reclaimable) / 1024**2
+    return min(host_available_mib, limit / 1024**2, potential), {
+        'limit_mib': limit / 1024**2, 'current_mib': used / 1024**2,
+        'raw_headroom_mib': max(0, limit-used) / 1024**2,
+        'clean_inactive_file_estimate_mib': reclaimable / 1024**2,
+    }
+
+
 def probe(node):
     start = time.time()
     before = cpu_sample()
@@ -86,11 +104,17 @@ def probe(node):
             cpu_count = min(cpu_count, float(quota) / float(period))
     except (OSError, ValueError):
         pass
+    memory_cgroup = None
     try:
         maximum = Path("/sys/fs/cgroup/memory.max").read_text().strip()
         if maximum != "max":
             current = int(Path("/sys/fs/cgroup/memory.current").read_text())
-            available = min(available, max(0, int(maximum) - current) / 1024**2)
+            try:
+                stat = {k: int(v) for k, v in (line.split() for line in
+                        Path('/sys/fs/cgroup/memory.stat').read_text().splitlines())}
+            except (OSError, ValueError):
+                stat = {}
+            available, memory_cgroup = cgroup_memory_headroom(available, maximum, current, stat)
     except (OSError, ValueError):
         pass
     d_pids = [int(x.name) for x in Path("/proc").iterdir() if x.name.isdigit()
@@ -102,6 +126,8 @@ def probe(node):
                   cpu_percent=cpu, cpu_count=cpu_count, ram_available_mib=available,
                   ram_total_mib=mem["MemTotal"], disk_free_mib=shutil.disk_usage(root).free / 1024**2,
                   d_state=len(d_pids), d_state_pids=d_pids, gpus=[], assets={}, datasets={}, read_ok=True)
+    if memory_cgroup is not None:
+        result['memory_cgroup'] = memory_cgroup
     try:
         query = subprocess.check_output(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu",
                                          "--format=csv,noheader,nounits"], text=True, stderr=subprocess.PIPE, timeout=8)
