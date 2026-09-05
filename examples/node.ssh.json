@@ -10,6 +10,7 @@
   "labels": {"environment": "torch-research-v1", "storage": "local"},
   "gpus": [],
   "assets": {},
+  "datasets": {"vehicle-v1": "/srv/datasets/vehicle-v1"},
   "policy": {
     "stable_polls": 3,
     "gpu_margin_mib": 1536,

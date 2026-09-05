@@ -7,7 +7,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from .schema import check, experiment_spec, group_spec, node_spec, validate_dag
+from .schema import absolute, check, experiment_spec, group_spec, identifier, node_spec, validate_dag
 
 ACTIVE = ("starting", "running", "unknown")
 
@@ -97,11 +97,25 @@ class Store:
             self.event("group_registered", g["id"], g)
         return g
 
+    def set_dataset(self, node_id, name, path):
+        """Update future placement only; live attempts keep their frozen mapping."""
+        identifier(name)
+        absolute(path)
+        with self.lock(), self.db:
+            n = self.specs("nodes").get(node_id)
+            check(n is not None, "unknown node: " + node_id)
+            n.setdefault("datasets", {})[name] = path
+            n = node_spec(n)
+            self.db.execute("UPDATE nodes SET spec=? WHERE id=?", (dumps(n), node_id))
+            self.db.execute("DELETE FROM snapshots WHERE node=?", (node_id,))
+            self.event("dataset_path_registered", node_id, {"dataset": name, "path": path})
+        return {"node": node_id, "dataset": name, "path": path}
+
     def register_experiment(self, raw):
         e = experiment_spec(raw)
         with self.lock(), self.db:
             existing = self.specs("experiments").get(e["id"])
-            if existing == e:
+            if existing is not None and experiment_spec(existing) == e:
                 return e  # idempotent registration, never resets completed jobs
             check(existing is None, "experiment already exists; use a new revision ID")
             jobs = {j["id"]: j["spec"] for j in self.jobs()}

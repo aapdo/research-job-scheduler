@@ -63,6 +63,10 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
             continue
         _, node_id, chosen = min(candidates)
         placement = {"job": j["id"], "decision": "ready", "node": node_id, "gpus": chosen}
+        if spec.get("dataset"):
+            placement.update(dataset=spec["dataset"], dataset_path=nodes[node_id]["datasets"][spec["dataset"]])
+        elif spec.get("dataset_path"):
+            placement["dataset_path"] = spec["dataset_path"]
         plan.append(placement)
         held.append({"id": "planned:" + j["id"], "job": j["id"], "node": node_id,
                      "created": now, "released": False, "status": "starting",
@@ -79,11 +83,19 @@ def fit(job, node, snap, held, history, successful, groups, now):
         return "host constraint", []
     if any(node["labels"].get(k) != v for k, v in job["labels"].items()):
         return "label constraint", []
+    dataset = job.get("dataset", "")
+    dataset_path = node.get("datasets", {}).get(dataset)
+    if dataset and not dataset_path:
+        return "dataset path not registered on node: " + dataset, []
     reason = base_health(node, snap, now)
     if reason:
         return reason, []
     if snap.get("stable_polls", 0) < p["stable_polls"]:
         return "waiting for stable health polls", []
+    if dataset:
+        observed = snap.get("datasets", {}).get(dataset, {})
+        if observed.get("path") != dataset_path or not observed.get("available"):
+            return "dataset path unavailable/unprobed: " + dataset + " (" + dataset_path + ")", []
     for key, sha in job["assets"].items():
         if snap.get("assets", {}).get(key) != sha:
             return "missing/unverified frozen asset: " + key, []

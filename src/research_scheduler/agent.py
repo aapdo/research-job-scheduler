@@ -54,6 +54,21 @@ def cpu_sample():
     return sum(ticks), ticks[3] + ticks[4]
 
 
+def dataset_status(path):
+    """Lightweight path/access check, not a dataset content or split audit."""
+    result = {"path": path, "available": False}
+    try:
+        entry = Path(path)
+        directory = entry.is_dir()
+        result["available"] = ((directory or entry.is_file())
+                               and os.access(path, os.R_OK | (os.X_OK if directory else 0)))
+        if not result["available"]:
+            result["reason"] = "path missing or not readable/searchable"
+    except OSError as exc:
+        result["reason"] = str(exc)
+    return result
+
+
 def probe(node):
     start = time.time()
     before = cpu_sample()
@@ -86,7 +101,7 @@ def probe(node):
     result = dict(time=start, hostname=os.uname().nodename, boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                   cpu_percent=cpu, cpu_count=cpu_count, ram_available_mib=available,
                   ram_total_mib=mem["MemTotal"], disk_free_mib=shutil.disk_usage(root).free / 1024**2,
-                  d_state=len(d_pids), d_state_pids=d_pids, gpus=[], assets={}, read_ok=True)
+                  d_state=len(d_pids), d_state_pids=d_pids, gpus=[], assets={}, datasets={}, read_ok=True)
     try:
         query = subprocess.check_output(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu",
                                          "--format=csv,noheader,nounits"], text=True, stderr=subprocess.PIPE, timeout=8)
@@ -109,6 +124,8 @@ def probe(node):
                 result["assets"][key] = sha
         except OSError:
             pass
+    if not d_pids:
+        result["datasets"] = {name: dataset_status(path) for name, path in node.get("datasets", {}).items()}
     policy = node["policy"]
     if policy.get("read_probe_path"):
         if d_pids:
@@ -194,6 +211,8 @@ def run(request):
             encoded = json.dumps(frozen, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
             if hashlib.sha256(encoded).hexdigest() != request["spec_sha256"]:
                 raise ValueError("immutable attempt specification hash mismatch")
+            if request.get("dataset") and not dataset_status(request["dataset_path"])["available"]:
+                raise ValueError("dataset path became unavailable before execution: " + request["dataset_path"])
             for contract in request["input_files"]:
                 if digest(contract["path"]) != contract["sha256"]:
                     raise ValueError("input hash mismatch: " + contract["path"])

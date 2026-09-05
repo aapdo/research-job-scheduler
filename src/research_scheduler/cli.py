@@ -32,6 +32,10 @@ def parser():
     g.add_argument("node")
     g.add_argument("uuid")
     g.add_argument("state", choices=["enabled", "disabled"])
+    ds = sub.add_parser("set-dataset", help="register a node-specific path for a named dataset (future attempts only)")
+    ds.add_argument("node")
+    ds.add_argument("dataset")
+    ds.add_argument("path")
     sub.add_parser("inventory")
     sub.add_parser("probe", help="read-only server/GPU resource and health probes")
     sub.add_parser("plan", help="refresh resources and show hypothetical placements; no launches")
@@ -65,6 +69,9 @@ def status_text(store):
             location = (a["node"] + " " + ",".join(a["spec"]["gpus"])) if a else "unassigned"
             lines.append(f"  {j['id']} | {j['spec']['kind']} | {j['status']} | {location}")
             lines.append("    확인할 질문: " + (j["spec"]["purpose"] or experiment["rq"]))
+            if j["spec"].get("dataset"):
+                path = a["spec"].get("dataset_path", "") if a else "resolved at placement"
+                lines.append("    dataset: " + j["spec"]["dataset"] + " -> " + path)
             if j["reason"]:
                 lines.append("    reason: " + j["reason"])
     return "\n".join(lines) or "No experiments registered."
@@ -104,6 +111,8 @@ def main(argv=None):
             gpu = next(g for g in node["gpus"] if g["uuid"] == args.uuid)
             gpu["enabled"] = args.state == "enabled"
             result = store.register_node(node)
+        elif cmd == "set-dataset":
+            result = store.set_dataset(args.node, args.dataset, args.path)
         elif cmd == "readmit-node":
             with store.lock(), store.db:
                 if controller.node_health().get(args.node, {}).get("phase") != "unavailable":

@@ -7,6 +7,7 @@
 ## 구현된 기능
 
 - 서버 등록, SSH/local 실행, GPU 자동 조회 및 UUID별 등록·사용 허용.
+- 서버별 데이터셋 경로 등록, 실험의 데이터셋 이름을 선택 서버의 경로로 해석.
 - `project → experiment(name, RQ) → job(train/eval/prepare/analysis)` 구조.
   각 job의 `purpose`에 무엇을 확인하는 실험인지 기록합니다.
 - 우선순위, 성공 의존성 DAG, CPU-only 작업, 동일 서버의 여러 GPU 동시 예약.
@@ -31,6 +32,7 @@ git clone https://github.com/aapdo/research-job-scheduler.git
 cd research-job-scheduler
 python3 -m venv .venv
 .venv/bin/pip install -e .
+source .venv/bin/activate
 python3 -m unittest discover -s tests -v
 ```
 
@@ -99,7 +101,8 @@ canonical DB만 사용하세요. 다른 DB를 사용하는 스케줄러끼리는
 | `id`, `name`, `kind`, `purpose` | 고유 ID, 표시 이름, 학습/평가 등 종류, 확인할 질문 |
 | `argv` | 실행 파일과 인수 배열. shell 문자열을 eval하지 않음 |
 | `cwd`, `env`, `config` | 작업 폴더, 환경 변수, attempt에 저장할 JSON 설정 |
-| `dataset_path` | 사용자가 지정한 경로를 그대로 기록·전달 |
+| `dataset` | 서버 `datasets`에 등록한 논리 이름. 선택 서버의 실제 경로로 해석 |
+| `dataset_path` | 기존 직접 경로 지정 방식. `dataset`과 동시에 지정 불가 |
 | `resources.gpu_count` | 같은 서버에서 필요한 GPU 수. 0이면 CPU-only |
 | `resources.vram_mib` | **GPU 한 개당** 예상 VRAM. 합산 용량이 아님 |
 | `resources.parameter_count` | 참고용 parameter 수. VRAM으로 자동 환산하지 않음 |
@@ -116,7 +119,7 @@ canonical DB만 사용하세요. 다른 DB를 사용하는 스케줄러끼리는
 사용 가능한 치환 값은 다음과 같습니다. `argv`, `env`, `cwd`, `config`의 문자열에서 치환합니다.
 
 - `{attempt_dir}`, `{config_path}`: 이번 실행만의 출력 폴더와 설정 JSON.
-- `{dataset_path}`: 등록한 데이터 경로. 서버별 symlink 구성은 사용자의 책임.
+- `{dataset_path}`: `dataset`으로 해석한 서버별 경로 또는 직접 지정한 `dataset_path`.
 - `{gpus}`, `{gpu_count}`: 할당한 GPU UUID 목록과 개수.
 - `{dep:job-id}`: 성공한 dependency의 attempt 폴더.
 
@@ -125,9 +128,35 @@ canonical DB만 사용하세요. 다른 DB를 사용하는 스케줄러끼리는
 
 ### 데이터셋과 결과 경로
 
-데이터셋 경로 매핑/등록 서비스, 자동 복사, symlink 생성, 재샘플링은 **하지 않습니다**.
-예를 들어 모든 서버에 `/datasets/vehicle-v1` symlink를 사용자가 구성한 뒤 동일한
-`dataset_path`를 지정합니다. 데이터셋의 내용·split 동등성도 사용자가 관리합니다.
+서버마다 다른 경로를 사용할 때는 같은 논리 이름에 서버별 실제 경로를 등록합니다.
+서버 등록 JSON에 `"datasets": {"vehicle-v1": "/data/vehicle"}`를 넣거나 아래 명령으로
+등록·수정할 수 있습니다. 데이터셋 이름에 버전을 포함하는 것을 권장합니다.
+
+```bash
+research-scheduler --db /local/path/scheduler/state.db set-dataset research-node-a vehicle-v1 /data/vehicle
+research-scheduler --db /local/path/scheduler/state.db set-dataset research-node-b vehicle-v1 /mnt/datasets/vehicle
+```
+
+실험의 job에는 물리 경로 대신 `dataset`을 지정하고 실행 명령/설정에서 치환 값을 사용합니다.
+아래는 전체 job이 아닌 관련 필드의 예시입니다.
+
+```json
+{
+  "dataset": "vehicle-v1",
+  "argv": ["python3", "train.py", "--data-root", "{dataset_path}"],
+  "config": {"data_root": "{dataset_path}"}
+}
+```
+
+`plan`에 선택 서버와 해석된 `dataset_path`가 표시됩니다. 해당 이름이 미등록이거나,
+원격 probe에서 경로 존재·접근 권한을 확인하지 못한 서버에는 해당 job을 배치하지 않습니다.
+runner도 child 시작 전에 경로를 다시 확인합니다. 파일·디렉터리·정상 symlink 경로를 허용합니다.
+`set-dataset`은 앞으로의 배치에만 적용되며, 이미 생성된 attempt의 명령·설정·경로는 변경하지 않습니다.
+
+기존 `dataset_path` 직접 지정도 계속 지원합니다. 이 경우 서버별 해석이나 새 path preflight를
+적용하지 않고 기존처럼 그대로 전달합니다. `dataset`과 `dataset_path` 중 하나만 지정하세요.
+서버별 경로 매핑은 데이터셋 **복사·다운로드·symlink 생성·재샘플링을 수행하지 않습니다**.
+같은 이름을 등록했다고 데이터 내용까지 같다는 뜻은 아니며, 내용·split 동등성은 사용자가 관리합니다.
 필요하면 선택적 `input_files`로 frozen manifest hash를 확인할 수 있으나,
 manifest hash 일치만으로 모든 이미지 내용의 동일성을 보증하지는 않습니다.
 

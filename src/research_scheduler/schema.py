@@ -28,7 +28,7 @@ def number(value, name, minimum=0, integer=False):
 
 
 def absolute(value):
-    check(isinstance(value, str) and PurePosixPath(value).is_absolute()
+    check(isinstance(value, str) and "\x00" not in value and PurePosixPath(value).is_absolute()
           and ".." not in PurePosixPath(value).parts, "expected absolute path without '..'")
 
 
@@ -41,7 +41,7 @@ def file_contract(value):
 def node_spec(raw):
     n = copy.deepcopy(raw)
     fields(n, "id transport target python work_root storage_domain labels gpus enabled max_jobs "
-           "cpu_limit ram_limit_mib policy assets startup_group recovery")
+           "cpu_limit ram_limit_mib policy assets startup_group recovery datasets")
     identifier(n["id"])
     n.setdefault("transport", "ssh")
     check(n["transport"] in ("local", "ssh"), "transport must be local or ssh")
@@ -52,7 +52,7 @@ def node_spec(raw):
     absolute(n["work_root"])
     check(n["work_root"] not in ("/", "/home", "/tmp"), "use a dedicated work_root")
     for k, v in dict(enabled=False, max_jobs=1, labels={}, gpus=[], assets={},
-                     policy={}, recovery={}, storage_domain="", startup_group="").items():
+                     policy={}, recovery={}, datasets={}, storage_domain="", startup_group="").items():
         n.setdefault(k, v)
     check(isinstance(n["enabled"], bool), "enabled must be boolean")
     number(n["max_jobs"], "max_jobs", 1, True)
@@ -62,6 +62,10 @@ def node_spec(raw):
     check(isinstance(n["labels"], dict) and isinstance(n["assets"], dict), "labels/assets must be objects")
     for a in n["assets"].values():
         file_contract(a)
+    check(isinstance(n["datasets"], dict), "datasets must map dataset names to absolute paths")
+    for name, path in n["datasets"].items():
+        identifier(name)
+        absolute(path)
     p = n["policy"]
     fields(p, "stable_polls max_snapshot_age_s max_cpu_percent max_gpu_percent min_free_ram_mib "
            "min_free_disk_mib gpu_margin_mib max_idle_used_mib allow_gpu_sharing "
@@ -138,7 +142,7 @@ def experiment_spec(raw):
     check(isinstance(e["jobs"], list) and e["jobs"], "at least one job required")
     for j in e["jobs"]:
         fields(j, "id name kind purpose argv cwd env config resources depends_on priority labels hosts "
-               "assets input_files outputs max_attempts metadata failover_safe dataset_path")
+               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset")
         identifier(j["id"])
         check(j["kind"] in ("train", "eval", "prepare", "analysis"), "invalid job kind")
         check(isinstance(j.get("name"), str) and j["name"].strip(), "job name required")
@@ -147,13 +151,18 @@ def experiment_spec(raw):
         absolute(j["cwd"])
         for k, v in dict(env={}, config={}, depends_on=[], priority=0, labels={}, hosts=[],
                          assets={}, input_files=[], outputs=[], max_attempts=1, metadata={}, purpose="",
-                         failover_safe=False, dataset_path="").items():
+                         failover_safe=False, dataset_path="", dataset="").items():
             j.setdefault(k, v)
         number(j["priority"], "job priority", 0, True)
         number(j["max_attempts"], "max_attempts", 1, True)
         check(isinstance(j["failover_safe"], bool), "failover_safe must be boolean")
         if j["failover_safe"]:
             check(j["outputs"], "failover-safe jobs must declare attempt-local outputs")
+        check(isinstance(j["dataset"], str) and isinstance(j["dataset_path"], str),
+              "dataset and dataset_path must be strings")
+        check(not (j["dataset"] and j["dataset_path"]), "choose dataset OR dataset_path, not both")
+        if j["dataset"]:
+            identifier(j["dataset"])
         if j["dataset_path"]:
             absolute(j["dataset_path"])
         check(isinstance(j["env"], dict) and all(isinstance(v, str) for v in j["env"].values()), "env values must be strings")

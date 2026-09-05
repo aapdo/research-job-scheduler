@@ -197,12 +197,19 @@ class Controller:
         node = s.specs("nodes")[placement["node"]]
         job = next(j for j in s.jobs() if j["id"] == placement["job"])
         spec = job["spec"]
+        dataset = spec.get("dataset", "")
+        if dataset:
+            dataset_path = node.get("datasets", {}).get(dataset)
+            if not dataset_path:
+                raise ValueError("dataset path not registered on node: " + dataset)
+        else:
+            dataset_path = spec.get("dataset_path", "")
         attempt_id = job["id"] + "." + uuid.uuid4().hex
         directory = str(Path(node["work_root"], "attempts", attempt_id))
         successful = {a["job"]: a for a in s.attempts() if a["status"] == "succeeded"}
         substitutions = {"{attempt_dir}": directory, "{config_path}": directory + "/config.json",
                          "{gpu_count}": str(len(placement["gpus"])), "{gpus}": ",".join(placement["gpus"]),
-                         "{dataset_path}": spec["dataset_path"]}
+                         "{dataset_path}": dataset_path}
         inputs = list(spec["input_files"])
         for dep in spec["depends_on"]:
             a = successful[dep]
@@ -213,7 +220,7 @@ class Controller:
         inputs.extend(node["assets"][key] for key in spec["assets"])
 
         def expand(value):
-            if "{dataset_path}" in value and not spec["dataset_path"]:
+            if "{dataset_path}" in value and not dataset_path:
                 raise ValueError("dataset_path placeholder used without a registered path")
             for key, replacement in substitutions.items():
                 value = value.replace(key, replacement)
@@ -235,7 +242,7 @@ class Controller:
                        job_spec=spec, node_spec=node, attempt_dir=directory,
                        argv=[expand(v) for v in spec["argv"]], cwd=expand(spec["cwd"]),
                        env={k: expand(v) for k, v in spec["env"].items()}, config=expand_config(spec["config"]),
-                       dataset_path=spec["dataset_path"],
+                       dataset=dataset, dataset_path=dataset_path,
                        input_files=[dict(f, path=expand(f["path"])) for f in inputs],
                        outputs=spec["outputs"], resources=spec["resources"],
                        startup_group=node["startup_group"], gpus=placement["gpus"])

@@ -1,0 +1,20 @@
+{
+  "id": "named-dataset-example-v1",
+  "project": "my-research",
+  "name": "Training with server-specific dataset paths",
+  "rq": "Can the same frozen training configuration run on different dataset replicas?",
+  "jobs": [
+    {
+      "id": "named-dataset-train",
+      "name": "Baseline training",
+      "kind": "train",
+      "purpose": "Use the selected server's replica without changing the experiment command.",
+      "dataset": "vehicle-v1",
+      "cwd": "/srv/research/immutable-release-v1",
+      "argv": ["/srv/env/bin/python", "train.py", "--config", "{config_path}", "--output", "{attempt_dir}/model.pt"],
+      "config": {"epochs": 5, "seed": 42, "data_root": "{dataset_path}"},
+      "resources": {"gpu_count": 1, "vram_mib": 10000, "cpu": 4, "ram_mib": 8192},
+      "outputs": ["model.pt"]
+    }
+  ]
+}

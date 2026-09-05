@@ -53,3 +53,14 @@ This is an MVP, not a production cluster migration. Existing research queues are
 Real multi-host CUDA/DDP execution, long-running outage fault injection, cgroup isolation,
 multi-user security, MIG/MPS, and production fleet rollout remain unverified/unimplemented
 as described in the README.
+
+## Server-specific dataset paths update (0.1.1)
+
+The expanded suite passes **56 tests** (45 existing + 11 new). Added coverage includes
+per-node logical-name/path registration, missing and inaccessible paths, stale mapping
+observations, different roots for the same experiment, immutable live-attempt bindings,
+CLI registration, and old-database/direct-path compatibility. A real detached CPU job
+verified the resolved path in argv, nested JSON config and environment variables.
+A pre-start disappearance test confirmed that the scientific child is not launched.
+These tests use temporary local datasets and synthetic machine telemetry; no real
+research dataset was copied, modified, registered or trained on during this update.
