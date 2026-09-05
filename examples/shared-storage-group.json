@@ -1,0 +1,5 @@
+{
+  "id": "shared-storage-a",
+  "min_start_interval_s": 60,
+  "require_ready_marker": true
+}

@@ -1,0 +1,45 @@
+{
+  "id": "context-study-v1",
+  "project": "my-research",
+  "name": "Context contribution and threshold sensitivity",
+  "rq": "Does the proposed context improve the baseline, and at which threshold?",
+  "priority": 100,
+  "tags": ["example-only", "replace-paths-before-use"],
+  "jobs": [
+    {
+      "id": "study-baseline",
+      "name": "Baseline training",
+      "kind": "train",
+      "purpose": "Create the common checkpoint used by every threshold evaluation.",
+      "cwd": "/srv/research/immutable-release-v1",
+      "dataset_path": "/datasets/vehicle-v1",
+      "argv": ["/srv/env/bin/python", "train.py", "--config", "{config_path}", "--output", "{attempt_dir}/model.pt"],
+      "config": {"epochs": 5, "seed": 42, "data_root": "{dataset_path}"},
+      "resources": {"gpu_count": 1, "vram_mib": 10000, "cpu": 4, "ram_mib": 8192, "parameter_count": 5000000},
+      "labels": {"environment": "torch-research-v1"},
+      "outputs": ["model.pt"]
+    },
+    {
+      "id": "study-threshold-02",
+      "name": "Evaluate threshold 0.2",
+      "kind": "eval",
+      "purpose": "Measure sensitivity at threshold 0.2 against the same trained baseline.",
+      "depends_on": ["study-baseline"],
+      "cwd": "/srv/research/immutable-release-v1",
+      "argv": ["/srv/env/bin/python", "evaluate.py", "--checkpoint", "{dep:study-baseline}/model.pt", "--threshold", "0.2", "--output", "{attempt_dir}/metrics.json"],
+      "resources": {"gpu_count": 1, "vram_mib": 6000, "cpu": 2, "ram_mib": 4096},
+      "outputs": ["metrics.json"]
+    },
+    {
+      "id": "study-independent-baseline",
+      "name": "Independent alternative baseline",
+      "kind": "train",
+      "purpose": "Compare a different baseline without waiting for the first baseline.",
+      "cwd": "/srv/research/immutable-release-v1",
+      "argv": ["/srv/env/bin/python", "-m", "torch.distributed.run", "--nproc-per-node", "{gpu_count}", "train.py", "--config", "{config_path}", "--output", "{attempt_dir}/model.pt"],
+      "config": {"epochs": 5, "method": "alternative", "seed": 42},
+      "resources": {"gpu_count": 2, "vram_mib": 10000, "cpu": 8, "ram_mib": 16384},
+      "outputs": ["model.pt"]
+    }
+  ]
+}
