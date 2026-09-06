@@ -4,6 +4,7 @@
   "target": "research-node-a",
   "python": "/usr/bin/python3",
   "work_root": "/srv/research/scheduler-runs",
+  "filesystem": "local",
   "storage_domain": "",
   "enabled": false,
   "max_jobs": 2,

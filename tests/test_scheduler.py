@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from research_scheduler.controller import Controller, Transport
 from research_scheduler.agent import process_tree_rss_mib
 from research_scheduler.planner import placements
-from research_scheduler.schema import experiment_spec, node_spec
+from research_scheduler.schema import experiment_spec, job_filesystem, node_filesystem, node_spec
 from research_scheduler.store import Store, dumps
 from research_scheduler.states import observe_health, recovery_due, transition
 
@@ -109,6 +109,30 @@ class SchemaAndStoreTests(unittest.TestCase):
         n = node_spec(dict(id="server", work_root="/tmp/dedicated", target="my-server"))
         self.assertFalse(n["enabled"])
 
+    def test_filesystem_defaults_inheritance_override_and_validation(self):
+        self.assertEqual(node()["filesystem"], "local")
+        self.assertEqual(node(root="/tmp/nfs", group="shared")["filesystem"], "nfs")
+        explicit = node_spec(dict(id="explicit", transport="local", work_root="/tmp/explicit",
+                                  filesystem="nfs"))
+        self.assertEqual(explicit["filesystem"], "nfs")
+        first, second = job("first"), job("second")
+        second["filesystem"] = "local"
+        e = experiment_spec(dict(id="fs", name="Filesystem", rq="Does routing work?",
+                                 filesystem="nfs", jobs=[first, second]))
+        self.assertEqual([j["filesystem"] for j in e["jobs"]], ["nfs", "local"])
+        self.assertEqual(experiment([job()])["jobs"][0]["filesystem"], "any")
+        with self.assertRaises(ValueError):
+            node_spec(dict(id="bad", work_root="/tmp/bad", target="bad", filesystem="network"))
+        bad = job()
+        bad["filesystem"] = "network"
+        with self.assertRaises(ValueError):
+            experiment([bad])
+
+    def test_legacy_filesystem_helpers_preserve_old_specs(self):
+        self.assertEqual(node_filesystem({"startup_group": "shared"}), "nfs")
+        self.assertEqual(node_filesystem({"startup_group": ""}), "local")
+        self.assertEqual(job_filesystem({}), "any")
+
     def test_duplicate_gpu_uuid_rejected(self):
         first = node()
         second = node(key="b")
@@ -183,6 +207,23 @@ class SchemaAndStoreTests(unittest.TestCase):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_filesystem_request_filters_nodes_and_reports_effective_value(self):
+        local = node(key="local")
+        nfs = node(key="nfs")
+        nfs["filesystem"] = "nfs"
+        nodes = {n["id"]: n for n in (local, nfs)}
+        snaps = {n["id"]: snapshot(n) for n in (local, nfs)}
+        for requested, expected in (("local", "local"), ("nfs", "nfs")):
+            j = job()
+            j["filesystem"] = requested
+            placement = plan([j], nodes=nodes, snaps=snaps)[0]
+            self.assertEqual(placement["node"], expected)
+            self.assertEqual(placement["filesystem_request"], requested)
+            self.assertEqual(placement["filesystem"], expected)
+        placement = plan([job()], nodes=nodes, snaps=snaps)[0]
+        self.assertEqual(placement["filesystem_request"], "any")
+        self.assertIn(placement["filesystem"], {"local", "nfs"})
+
     def test_priority_backfill_skips_infeasible(self):
         p = plan([job("large", 3, priority=100), job("small", 1)])
         self.assertEqual(p[0]["decision"], "waiting")
@@ -490,6 +531,22 @@ class ExecutionTests(unittest.TestCase):
         a = self.store.attempts()[0]
         config = json.loads(Path(a["spec"]["attempt_dir"], "config.json").read_text())
         self.assertEqual(config["train"], "/datasets/symlink-managed-by-user/train")
+
+    def test_filesystem_is_frozen_substituted_and_exported(self):
+        code = ("import json,os,pathlib,sys; "
+                "cfg=json.loads(pathlib.Path(os.environ['RS_CONFIG_PATH']).read_text()); "
+                "pathlib.Path(os.environ['RS_ATTEMPT_DIR'],'result.json').write_text("
+                "json.dumps({'arg':sys.argv[1],'env':os.environ['RS_FILESYSTEM'],'config':cfg['fs']}))")
+        j = self.cpu_job(code=code)
+        j.update(filesystem="any", config={"fs": "{filesystem}"})
+        j["argv"].append("{filesystem}")
+        self.store.register_experiment(experiment([j]))
+        self.finish()
+        a = self.store.attempts()[0]
+        result = json.loads(Path(a["spec"]["attempt_dir"], "result.json").read_text())
+        self.assertEqual(result, {"arg": "local", "env": "local", "config": "local"})
+        self.assertEqual(a["spec"]["filesystem_request"], "any")
+        self.assertEqual(a["spec"]["filesystem"], "local")
 
     def test_safe_failover_invalidates_old_attempt_and_rejects_late_success(self):
         j = self.cpu_job(code="import time,os,pathlib; time.sleep(1); pathlib.Path(os.environ['RS_ATTEMPT_DIR'],'result.json').write_text('old')")

@@ -5,6 +5,20 @@ import re
 from pathlib import PurePosixPath
 
 
+FILESYSTEMS = ("local", "nfs")
+FILESYSTEM_REQUESTS = ("any", *FILESYSTEMS)
+
+
+def node_filesystem(node):
+    """Return a node's storage class, including legacy-spec compatibility."""
+    return node.get("filesystem", "nfs" if node.get("startup_group") else "local")
+
+
+def job_filesystem(job):
+    """Return a job's requested storage class, including legacy specs."""
+    return job.get("filesystem", "any")
+
+
 def check(value, message):
     if not value:
         raise ValueError(message)
@@ -41,7 +55,7 @@ def file_contract(value):
 def node_spec(raw):
     n = copy.deepcopy(raw)
     fields(n, "id transport target python work_root storage_domain labels gpus enabled max_jobs "
-           "cpu_limit ram_limit_mib policy assets startup_group recovery datasets")
+           "cpu_limit ram_limit_mib policy assets startup_group recovery datasets filesystem")
     identifier(n["id"])
     n.setdefault("transport", "ssh")
     check(n["transport"] in ("local", "ssh"), "transport must be local or ssh")
@@ -54,6 +68,10 @@ def node_spec(raw):
     for k, v in dict(enabled=False, max_jobs=1, labels={}, gpus=[], assets={},
                      policy={}, recovery={}, datasets={}, storage_domain="", startup_group="").items():
         n.setdefault(k, v)
+    # Before filesystem was explicit, startup_group was used only for NFS cold
+    # starts. Preserve that interpretation when normalizing legacy node JSON.
+    n.setdefault("filesystem", "nfs" if n["startup_group"] else "local")
+    check(n["filesystem"] in FILESYSTEMS, "node filesystem must be local or nfs")
     check(isinstance(n["enabled"], bool), "enabled must be boolean")
     number(n["max_jobs"], "max_jobs", 1, True)
     for k in ("cpu_limit", "ram_limit_mib"):
@@ -129,7 +147,7 @@ def group_spec(raw):
 
 def experiment_spec(raw):
     e = copy.deepcopy(raw)
-    fields(e, "id project name rq priority tags jobs")
+    fields(e, "id project name rq priority tags jobs filesystem")
     identifier(e["id"])
     e.setdefault("project", "general")
     identifier(e["project"])
@@ -138,11 +156,14 @@ def experiment_spec(raw):
     e.setdefault("priority", 0)
     number(e["priority"], "priority", 0, True)
     e.setdefault("tags", [])
+    e.setdefault("filesystem", "any")
+    check(e["filesystem"] in FILESYSTEM_REQUESTS,
+          "experiment filesystem must be any, local or nfs")
     check(isinstance(e["tags"], list) and all(isinstance(t, str) for t in e["tags"]), "tags must be strings")
     check(isinstance(e["jobs"], list) and e["jobs"], "at least one job required")
     for j in e["jobs"]:
         fields(j, "id name kind purpose argv cwd env config resources depends_on priority labels hosts "
-               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset")
+               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem")
         identifier(j["id"])
         check(j["kind"] in ("train", "eval", "prepare", "analysis"), "invalid job kind")
         check(isinstance(j.get("name"), str) and j["name"].strip(), "job name required")
@@ -151,8 +172,11 @@ def experiment_spec(raw):
         absolute(j["cwd"])
         for k, v in dict(env={}, config={}, depends_on=[], priority=0, labels={}, hosts=[],
                          assets={}, input_files=[], outputs=[], max_attempts=1, metadata={}, purpose="",
-                         failover_safe=False, dataset_path="", dataset="").items():
+                         failover_safe=False, dataset_path="", dataset="",
+                         filesystem=e["filesystem"]).items():
             j.setdefault(k, v)
+        check(j["filesystem"] in FILESYSTEM_REQUESTS,
+              "job filesystem must be any, local or nfs")
         number(j["priority"], "job priority", 0, True)
         number(j["max_attempts"], "max_attempts", 1, True)
         check(isinstance(j["failover_safe"], bool), "failover_safe must be boolean")

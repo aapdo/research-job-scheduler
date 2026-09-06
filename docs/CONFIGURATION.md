@@ -16,6 +16,7 @@ RAM·VRAM 단위는 MiB, 시간 단위는 초입니다. 지원하지 않는 필�
 | `target` | SSH일 때 필수 | SSH alias. port·key·사용자는 `~/.ssh/config`에 설정 |
 | `python` | `python3` | 원격 조회·실행 도우미용 Python 3.10+ |
 | `work_root` | 필수 | 실행별 로그·설정·결과를 저장할 전용 절대 경로 |
+| `filesystem` | `local` | node의 실행 스토리지 종류: `local` 또는 `nfs` |
 | `enabled` | `false` | 신규 작업 배치 허용 여부 |
 | `max_jobs` | `1` | 서버당 active/unknown attempt 수 상한 |
 | `cpu_limit` | 생략 | 관측 CPU 용량에 적용할 추가 상한 |
@@ -133,6 +134,7 @@ telemetry는 `/proc`, affinity와 `nvidia-smi` 기준입니다. cgroup v2 CPU/RA
 | `project` | `general` | 연구 그룹 이름 |
 | `priority` | `0` | 실험 공통 우선순위 |
 | `tags` | `[]` | 사용자 분류용 문자열 목록 |
+| `filesystem` | `any` | 모든 job의 기본 파일시스템 요청: `any`, `local`, `nfs` |
 
 ID는 1~96자의 영문·숫자·`_`·`.`·`-`로 구성하고 첫 글자는 영문 또는 숫자여야 합니다.
 job ID는 DB 전체에서 고유해야 합니다. 모든 dependency가 기존 DB 또는 같은 등록 payload
@@ -148,6 +150,7 @@ job ID는 DB 전체에서 고유해야 합니다. 모든 dependency가 기존 DB
 | `config` | `{}` | 실행별 `config.json`에 저장할 값 |
 | `env` | `{}` | 연구 명령에 전달할 문자열 환경 변수 |
 | `dataset` / `dataset_path` | `""` | 서버별 경로를 사용할 이름 또는 직접 경로. 하나만 지정 |
+| `filesystem` | experiment 값 | 이 job의 파일시스템 요청: `any`, `local`, `nfs` |
 | `depends_on` | `[]` | 성공해야 하는 선행 job ID 목록 |
 | `priority` | `0` | 실험 우선순위에 더할 job 우선순위 |
 | `hosts` | `[]` | 실행 가능한 node ID 목록. 빈 목록이면 이 제한 없음 |
@@ -188,6 +191,7 @@ job ID는 DB 전체에서 고유해야 합니다. 모든 dependency가 기존 DB
 | `{attempt_dir}` | 이번 실행만의 출력 폴더 |
 | `{config_path}` | 이번 실행의 `config.json` |
 | `{dataset_path}` | 서버별로 해석한 데이터 경로 또는 직접 경로 |
+| `{filesystem}` | 선택된 node의 실제 종류: `local` 또는 `nfs` |
 | `{gpus}` | 할당된 GPU UUID들을 쉼표로 연결한 문자열 |
 | `{gpu_count}` | 할당 GPU 수 |
 | `{dep:job-id}` | 성공한 선행 job의 attempt 폴더 |
@@ -196,6 +200,7 @@ job ID는 DB 전체에서 고유해야 합니다. 모든 dependency가 기존 DB
 
 - `RS_ATTEMPT_ID`, `RS_ATTEMPT_DIR`: 실행 ID·출력 폴더.
 - `RS_CONFIG_PATH`, `RS_DATASET_PATH`: 설정 JSON·선택한 데이터 경로.
+- `RS_FILESYSTEM`: 선택된 node의 실제 파일시스템 종류(`local` 또는 `nfs`).
 - `RS_READY_PATH`: 공유 스토리지 시작 gate에 준비 완료를 알릴 파일 경로.
 
 사용자 `env`로 `CUDA_VISIBLE_DEVICES` 또는 `RS_*`를 덮어쓸 수 없습니다.
@@ -203,12 +208,19 @@ job ID는 DB 전체에서 고유해야 합니다. 모든 dependency가 기존 DB
 
 ## 공유 스토리지 설정
 
-`storage_domain`과 `startup_group`은 서로 다른 기능입니다.
+`filesystem`, `storage_domain`, `startup_group`은 서로 다른 기능입니다.
 
 | 설정 | 답하는 질문 |
 |---|---|
+| `filesystem` | 이 node가 local/NFS 중 무엇이며, 이 job이 어느 종류에서 실행되어야 하는가? |
 | `storage_domain` | 다른 서버의 dependency 결과를 같은 절대 경로로 읽을 수 있는가? |
 | `startup_group` | 새 작업의 초기 데이터 읽기를 서버 간에 순서대로 시작해야 하는가? |
+
+node에는 `filesystem: "local"` 또는 `"nfs"`를 등록합니다. experiment/job에는 `"any"`,
+`"local"`, `"nfs"`를 지정합니다. `any`이면 두 node 종류 모두 후보가 되며 실제 선택값은
+attempt 명세와 `RS_FILESYSTEM`에 고정됩니다. experiment 값은 job의 기본값이고 job 값이 이를
+덮어씁니다. 이 분류는 mount 상태를 자동 탐지하거나 NFS를 연결하지 않으므로 운영자가 node
+등록값을 실제 환경과 일치시켜야 합니다.
 
 ### Dependency 결과 공유
 

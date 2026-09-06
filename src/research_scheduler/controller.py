@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import agent
 from .planner import base_health, gpu_healthy, placements
+from .schema import job_filesystem, node_filesystem
 from .store import ACTIVE, dumps
 from .states import observe_health, recovery_due, transition
 
@@ -204,12 +205,16 @@ class Controller:
                 raise ValueError("dataset path not registered on node: " + dataset)
         else:
             dataset_path = spec.get("dataset_path", "")
+        filesystem_request = job_filesystem(spec)
+        filesystem = node_filesystem(node)
+        if filesystem_request != "any" and filesystem_request != filesystem:
+            raise ValueError("placement filesystem no longer satisfies job request")
         attempt_id = job["id"] + "." + uuid.uuid4().hex
         directory = str(Path(node["work_root"], "attempts", attempt_id))
         successful = {a["job"]: a for a in s.attempts() if a["status"] == "succeeded"}
         substitutions = {"{attempt_dir}": directory, "{config_path}": directory + "/config.json",
                          "{gpu_count}": str(len(placement["gpus"])), "{gpus}": ",".join(placement["gpus"]),
-                         "{dataset_path}": dataset_path}
+                         "{dataset_path}": dataset_path, "{filesystem}": filesystem}
         inputs = list(spec["input_files"])
         for dep in spec["depends_on"]:
             a = successful[dep]
@@ -243,6 +248,7 @@ class Controller:
                        argv=[expand(v) for v in spec["argv"]], cwd=expand(spec["cwd"]),
                        env={k: expand(v) for k, v in spec["env"].items()}, config=expand_config(spec["config"]),
                        dataset=dataset, dataset_path=dataset_path,
+                       filesystem_request=filesystem_request, filesystem=filesystem,
                        input_files=[dict(f, path=expand(f["path"])) for f in inputs],
                        outputs=spec["outputs"], resources=spec["resources"],
                        startup_group=node["startup_group"], gpus=placement["gpus"])

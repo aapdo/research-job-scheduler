@@ -89,3 +89,11 @@ double-count scheduler-owned memory: only the difference between declared RAM an
 observed descendant-tree RSS is retained as future growth headroom, including
 framework launchers that create nested process groups. When RSS cannot
 be attributed, the full reservation remains in force as a fail-closed fallback.
+
+## Filesystem-aware placement (0.4.0)
+
+The suite passes **72 tests**. New coverage verifies node `local`/`nfs` registration,
+experiment-level defaults, per-job overrides, invalid-value rejection, legacy-spec
+compatibility, placement filtering, and the frozen effective value in argv, nested
+config and `RS_FILESYSTEM`. These tests use synthetic node telemetry and a real local
+CPU child; they do not mount, copy, or modify NFS storage.

@@ -19,7 +19,7 @@ def main():
     root = Path(args.directory).resolve()
     store = Store(root / "state.db")
     n = dict(id="local-demo", transport="local", python=sys.executable,
-             work_root=str(root / "runs"), enabled=True, max_jobs=2, gpus=[],
+             work_root=str(root / "runs"), filesystem="local", enabled=True, max_jobs=2, gpus=[],
              policy=dict(stable_polls=1, max_cpu_percent=100, min_free_ram_mib=128, min_free_disk_mib=10))
     if not store.specs("nodes"):
         store.register_node(n)
@@ -39,7 +39,8 @@ def main():
                          resources=dict(gpu_count=0, cpu=1, ram_mib=64),
                          argv=[sys.executable, "-c", evaluation, "{dep:demo-baseline}/result.json", threshold]))
     store.register_experiment(dict(id="local-demo-v1", project="scheduler-validation", name="Local CPU DAG smoke",
-                                   rq="Do registration, placement, real execution and dependent evaluation work?", jobs=jobs))
+                                   rq="Do registration, placement, real execution and dependent evaluation work?",
+                                   filesystem="local", jobs=jobs))
     controller = Controller(store)
     deadline = time.time() + args.timeout
     while time.time() < deadline:

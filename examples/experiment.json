@@ -3,6 +3,7 @@
   "project": "my-research",
   "name": "Context contribution and threshold sensitivity",
   "rq": "Does the proposed context improve the baseline, and at which threshold?",
+  "filesystem": "any",
   "priority": 100,
   "tags": ["example-only", "replace-paths-before-use"],
   "jobs": [

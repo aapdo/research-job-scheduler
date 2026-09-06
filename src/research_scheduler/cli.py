@@ -78,6 +78,10 @@ def status_text(store):
             location = (a["node"] + " " + ",".join(a["spec"]["gpus"])) if a else "unassigned"
             lines.append(f"  {j['id']} | {j['spec']['kind']} | {j['status']} | {location}")
             lines.append("    확인할 질문: " + (j["spec"]["purpose"] or experiment["rq"]))
+            requested = j["spec"].get("filesystem", experiment.get("filesystem", "any"))
+            effective = a["spec"].get("filesystem") if a else None
+            lines.append("    filesystem: " + requested
+                         + ((" -> " + effective) if effective else " (resolved at placement)"))
             if j["spec"].get("dataset"):
                 path = a["spec"].get("dataset_path", "") if a else "resolved at placement"
                 lines.append("    dataset: " + j["spec"]["dataset"] + " -> " + path)

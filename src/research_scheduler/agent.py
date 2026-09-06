@@ -275,10 +275,13 @@ def run(request):
             atomic_json(directory / "config.json", request["config"])
             env = os.environ.copy()
             env.update(request["env"])
+            filesystem = request.get(
+                "filesystem", "nfs" if request.get("node_spec", {}).get("startup_group") else "local")
             env.update(CUDA_VISIBLE_DEVICES=",".join(request["gpus"]),
                        RS_ATTEMPT_ID=request["id"], RS_ATTEMPT_DIR=str(directory),
                        RS_CONFIG_PATH=str(directory / "config.json"), RS_READY_PATH=str(directory / "startup.ready"),
-                       RS_DATASET_PATH=request.get("dataset_path", ""))
+                       RS_DATASET_PATH=request.get("dataset_path", ""),
+                       RS_FILESYSTEM=filesystem)
             with (directory / "stdout.log").open("xb") as out, (directory / "stderr.log").open("xb") as err:
                 child = subprocess.Popen(request["argv"], cwd=request["cwd"], env=env,
                                          stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)

@@ -3,6 +3,7 @@
   "project": "my-research",
   "name": "Training with server-specific dataset paths",
   "rq": "Can the same frozen training configuration run on different dataset replicas?",
+  "filesystem": "any",
   "jobs": [
     {
       "id": "named-dataset-train",

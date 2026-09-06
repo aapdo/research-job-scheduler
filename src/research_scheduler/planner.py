@@ -1,6 +1,7 @@
 """Pure admission planning: priority backfill, DAG, fresh health and reservations."""
 import time
 
+from .schema import job_filesystem, node_filesystem
 from .store import ACTIVE
 
 
@@ -66,7 +67,9 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
             plan.append({"job": j["id"], "decision": "waiting", "reasons": failures or {"inventory": "no nodes registered"}})
             continue
         _, node_id, chosen = min(candidates)
-        placement = {"job": j["id"], "decision": "ready", "node": node_id, "gpus": chosen}
+        placement = {"job": j["id"], "decision": "ready", "node": node_id, "gpus": chosen,
+                     "filesystem_request": job_filesystem(spec),
+                     "filesystem": node_filesystem(nodes[node_id])}
         if spec.get("dataset"):
             placement.update(dataset=spec["dataset"], dataset_path=nodes[node_id]["datasets"][spec["dataset"]])
         elif spec.get("dataset_path"):
@@ -85,6 +88,11 @@ def fit(job, node, snap, held, history, successful, groups, now):
         return "node disabled/drained", []
     if job["hosts"] and node["id"] not in job["hosts"]:
         return "host constraint", []
+    requested_filesystem = job_filesystem(job)
+    actual_filesystem = node_filesystem(node)
+    if requested_filesystem != "any" and requested_filesystem != actual_filesystem:
+        return ("filesystem constraint: requires " + requested_filesystem
+                + ", node is " + actual_filesystem), []
     if any(node["labels"].get(k) != v for k, v in job["labels"].items()):
         return "label constraint", []
     dataset = job.get("dataset", "")

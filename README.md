@@ -24,6 +24,7 @@
 - 서버와 GPU 등록: SSH/local 실행, GPU UUID·모델·VRAM 조회, 장치별 사용 허용.
 - 실험 관리: 이름·RQ·job별 목적, 설정값, 예상 자원량, 우선순위, 학습→평가 의존성.
 - 자원 기반 배치: GPU 사용률·VRAM·compute PID, CPU·RAM·디스크·D-state와 선택적 스토리지 읽기 점검.
+- 파일시스템 제약: 실험/job을 `nfs`, `local`, `any`로 지정해 맞는 서버에만 배치.
 - 서버별 데이터셋 경로: 같은 데이터셋 이름을 서버마다 다른 실제 경로로 연결.
 - 실행 기록: 실행별 설정·로그·종료 코드·결과 파일 SHA256, 장애 재시도와 결과 유효성 관리.
 
@@ -103,6 +104,7 @@ export SCHEDULER_DB="$PWD/runtime/state.db"
 | `target` | 사용자의 `~/.ssh/config`에 등록한 SSH alias |
 | `python` | 원격 조회·실행 도우미용 Python 3.10+ 경로 |
 | `work_root` | **실행 서버 기준** 로그·설정·결과를 저장할 전용 폴더 |
+| `filesystem` | 서버의 실행 스토리지 종류. `local` 또는 `nfs` |
 | `max_jobs` | 서버에 동시에 배치할 job 수 상한 |
 
 SSH port·사용자·key·ProxyJump는 `~/.ssh/config`에서 관리합니다. 비밀번호나 private key를
@@ -184,6 +186,11 @@ research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20 --max-lau
 실험 JSON은 `name`, `rq`, `jobs`를 포함합니다. job의 `purpose`에는 “이 작업으로 무엇을
 확인하는가”를 적습니다. 실험 ID와 job ID는 각각 DB 전체에서 고유해야 합니다.
 등록된 실험 설정을 바꾸려면 새 ID를 사용합니다. 동일 설정 재등록은 완료 상태를 초기화하지 않습니다.
+
+실험의 `filesystem`에는 `any`(기본값), `local`, `nfs`를 지정할 수 있습니다. 모든 job이 이를
+상속하며, 개별 job에서 덮어쓸 수 있습니다. 선택된 실제 종류는 `{filesystem}` 치환값과
+`RS_FILESYSTEM` 환경 변수로 전달됩니다. 이 설정은 배치 대상을 제한할 뿐 mount·복사·동기화를
+수행하지 않습니다.
 
 ### 학습과 평가의 의존 관계
 
