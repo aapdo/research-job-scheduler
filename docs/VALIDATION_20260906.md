@@ -84,7 +84,8 @@ update is also validated independently from active attempt state.
 
 ## RSS-aware host RAM admission (0.3.0)
 
-The suite passes **67 tests**. The new case verifies that `MemAvailable` does not
+The suite passes **68 tests**. The new cases verify that `MemAvailable` does not
 double-count scheduler-owned memory: only the difference between declared RAM and
-observed process-group RSS is retained as future growth headroom. When RSS cannot
+observed descendant-tree RSS is retained as future growth headroom, including
+framework launchers that create nested process groups. When RSS cannot
 be attributed, the full reservation remains in force as a fail-closed fallback.

@@ -39,7 +39,7 @@ def process(pid):
     try:
         text = Path("/proc", str(pid), "stat").read_text()
         parts = text[text.rfind(")") + 2:].split()
-        return {"state": parts[0], "pgrp": int(parts[2]), "start": parts[19]}
+        return {"state": parts[0], "ppid": int(parts[1]), "pgrp": int(parts[2]), "start": parts[19]}
     except (OSError, ValueError, IndexError):
         return None
 
@@ -49,17 +49,25 @@ def group_alive(pgid):
                for x in Path("/proc").iterdir() if x.name.isdigit())
 
 
-def group_rss_mib(pgid):
-    """Resident memory of the scheduler-owned scientific process group."""
-    total_kib = 0
+def process_tree_rss_mib(root_pid):
+    """RSS of a scheduler-owned child and descendants across nested groups."""
+    infos = {}
     for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        info = process(entry.name)
-        if not info or info["pgrp"] != pgid or info["state"] == "Z":
+        if entry.name.isdigit() and (info := process(entry.name)):
+            infos[int(entry.name)] = info
+    tree = {root_pid}
+    changed = True
+    while changed:
+        before = len(tree)
+        tree.update(pid for pid, info in infos.items() if info["ppid"] in tree)
+        changed = len(tree) != before
+    total_kib = 0
+    for pid in tree:
+        info = infos.get(pid)
+        if not info or info["state"] == "Z":
             continue
         try:
-            for line in (entry / "status").read_text().splitlines():
+            for line in Path("/proc", str(pid), "status").read_text().splitlines():
                 if line.startswith("VmRSS:"):
                     total_kib += int(line.split()[1])
                     break
@@ -212,7 +220,7 @@ def read_status(request):
         boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         if (runner and runner["start"] == state.get("runner_start") and runner["state"] != "Z"
                 and boot == state.get("boot_id")):
-            rss = group_rss_mib(state.get("child_pgid", 0))
+            rss = process_tree_rss_mib(state.get("child_pid", 0))
             return dict(state, **({"rss_mib": rss} if rss is not None else {}))
         return dict(state, status="unknown", reason="runner absent/rebooted; preserve reservation for reconciliation")
     except (OSError, ValueError, KeyError) as exc:

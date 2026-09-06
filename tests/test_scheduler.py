@@ -1,6 +1,7 @@
 """No GPU/server needed: fake resource telemetry + real detached CPU processes."""
 import copy
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from research_scheduler.controller import Controller, Transport
+from research_scheduler.agent import process_tree_rss_mib
 from research_scheduler.planner import placements
 from research_scheduler.schema import experiment_spec, node_spec
 from research_scheduler.store import Store, dumps
@@ -130,6 +132,9 @@ class SchemaAndStoreTests(unittest.TestCase):
         self.store.prioritize("j", 99)
         self.assertEqual(self.store.jobs()[0]["spec"]["priority"], 99)
         self.assertEqual(self.store.db.execute("SELECT kind FROM events ORDER BY seq DESC LIMIT 1").fetchone()[0], "priority_changed")
+
+    def test_process_tree_rss_includes_current_process(self):
+        self.assertGreater(process_tree_rss_mib(os.getpid()), 0)
 
     def test_gpu_enablement_can_change_for_future_jobs_while_attempt_is_active(self):
         n = node()

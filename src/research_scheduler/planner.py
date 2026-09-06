@@ -118,7 +118,7 @@ def fit(job, node, snap, held, history, successful, groups, now):
         return "unknown attempt requires reconciliation", []
     used_cpu = sum(a["spec"]["resources"]["cpu"] for a in own)
     # MemAvailable already reflects current RSS. Reserve only each active job's
-    # unrealized growth to its declared peak; without a fresh process-group RSS,
+    # unrealized growth to its declared peak; without a fresh process-tree RSS,
     # fall back to the full reservation.
     def remaining_ram(a):
         requested = a["spec"]["resources"]["ram_mib"]

@@ -83,7 +83,8 @@ child 실행 직전 다시 확인합니다. 같은 이름이 내용 동일성을
 | `read_probe_timeout_s` | 10 | 읽기 점검 timeout |
 
 예약은 배치 기준이며 cgroup 등의 강제 제한이 아닙니다. host `MemAvailable`에는 실행 중 RSS가
-이미 반영되므로, scheduler-owned process group의 RSS를 확인할 수 있으면 선언한 RAM peak까지
+이미 반영되므로, scheduler-owned child와 전체 자손 process tree의 RSS를 확인할 수 있으면
+선언한 RAM peak까지
 남은 성장분만 추가 예약합니다. RSS 측정이 없으면 전체 예약량을 차감해 보수적으로 대기합니다.
 GPU sharing의 VRAM은 PID namespace 때문에 attempt별 attribution이 어려워 관측 사용량과
 예약량을 더 보수적으로 함께 반영합니다.

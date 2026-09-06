@@ -304,7 +304,7 @@ MIG/MPS·선점·자동 checkpoint resume·VRAM peak 자동 profiling은 지원�
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | 서버·job 필드, 기본값, 치환 값, GPU 공유 및 NFS 설정 |
 | [STATE_MACHINE.md](docs/STATE_MACHINE.md) | job/attempt/node 상태와 재시도·invalid 처리 |
 | [OPEN_SOURCE_REVIEW.md](docs/OPEN_SOURCE_REVIEW.md) | Slurm·ClearML·Ray 검토와 구현 선택 근거 |
-| [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 67개 테스트와 실제/모의 검증 범위, 미검증 항목 |
+| [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 68개 테스트와 실제/모의 검증 범위, 미검증 항목 |
 | [node.ssh.json](examples/node.ssh.json) | 서버 등록 예제 |
 | [experiment.named-dataset.json](examples/experiment.named-dataset.json) | 서버별 데이터 경로를 사용하는 단일 학습 예제 |
 | [experiment.json](examples/experiment.json) | baseline 학습→평가와 독립 학습을 묶는 DAG 예제 |
