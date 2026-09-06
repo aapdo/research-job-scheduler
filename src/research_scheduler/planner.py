@@ -122,7 +122,9 @@ def fit(job, node, snap, held, history, successful, groups, now):
             continue
         if a["node"] != node["id"] and not (node["storage_domain"] and
                 a["spec"]["node_spec"]["storage_domain"] == node["storage_domain"]):
-            return "dependency artifacts on another local filesystem: " + dep, []
+            if node['id'] not in a.get('artifact_locations', {}):
+                suffix = ' (HF download pending)' if a.get('report', {}).get('hf_artifact') else ''
+                return "dependency artifacts on another local filesystem: " + dep + suffix, []
     own = [a for a in held if a["node"] == node["id"]]
     registered = {g["uuid"]: g for g in node["gpus"] if g["enabled"]}
     if req["gpu_count"]:

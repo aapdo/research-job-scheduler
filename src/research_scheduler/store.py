@@ -51,6 +51,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS snapshots(node TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS node_health(node TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY, time REAL, kind TEXT, subject TEXT, data TEXT);
+            CREATE TABLE IF NOT EXISTS artifact_transfers(
+                id TEXT PRIMARY KEY, attempt TEXT NOT NULL, node TEXT NOT NULL,
+                direction TEXT NOT NULL, status TEXT NOT NULL, spec TEXT NOT NULL,
+                report TEXT NOT NULL DEFAULT '{}', created REAL NOT NULL);
         """)
         os.chmod(self.path, 0o600)
 
@@ -308,7 +312,18 @@ class Store:
 
     def attempts(self, active=False):
         query = "SELECT * FROM attempts" + (" WHERE status IN ('starting','running','unknown')" if active else "")
-        return [dict(r, spec=json.loads(r["spec"]), report=json.loads(r["report"])) for r in self.db.execute(query)]
+        result = [dict(r, spec=json.loads(r["spec"]), report=json.loads(r["report"])) for r in self.db.execute(query)]
+        by_id = {a['id']: a for a in result}
+        for row in self.db.execute("SELECT * FROM artifact_transfers WHERE status='succeeded' ORDER BY created"):
+            attempt = by_id.get(row['attempt'])
+            receipt = json.loads(row['report']).get('artifact')
+            if attempt is None or not receipt or attempt['status'] != 'succeeded':
+                continue
+            if row['direction'] == 'upload':
+                attempt['report']['hf_artifact'] = receipt
+            else:
+                attempt.setdefault('artifact_locations', {})[row['node']] = receipt
+        return result
 
     def prioritize(self, job_id, priority):
         from .schema import number

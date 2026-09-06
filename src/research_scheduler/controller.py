@@ -96,6 +96,7 @@ class Controller:
         return results
 
     def plan(self):
+        from .artifacts import reservations
         nodes, snapshots = self.store.specs("nodes"), self.snapshots()
         health = self.node_health()
         for key, state in health.items():
@@ -115,7 +116,7 @@ class Controller:
             if n["startup_group"] in blocked_groups and key in snapshots:
                 snapshots[key] = dict(snapshots[key], error="shared backend unhealthy/unreachable: " + blocked_groups[n["startup_group"]])
         return placements(self.store.jobs(), self.store.specs("experiments"), nodes,
-                          snapshots, self.store.attempts(), self.store.specs("groups_"), now)
+                          snapshots, self.store.attempts() + reservations(self.store), self.store.specs("groups_"), now)
 
     def invalidate_unavailable(self):
         health = self.node_health()
@@ -220,6 +221,15 @@ class Controller:
             a = successful[dep]
             if dep in spec.get("order_only_dependencies", []):
                 continue
+            cached = a.get('artifact_locations', {}).get(node['id'])
+            local = a['node'] == node['id'] or (node['storage_domain'] and
+                    a['spec']['node_spec']['storage_domain'] == node['storage_domain'])
+            if not local and cached:
+                substitutions['{dep:' + dep + '}'] = cached['root']
+                inputs.extend(dict(path=f['path'], sha256=f['sha256']) for f in cached['files'].values())
+                continue
+            if not local:
+                raise ValueError('dependency has no verified destination artifacts: ' + dep)
             substitutions["{dep:" + dep + "}"] = a["spec"]["attempt_dir"]
             # Rehash declared predecessor artifacts on the destination before launch.
             inputs.extend({"path": out["path"], "sha256": out["sha256"]}
@@ -289,6 +299,8 @@ class Controller:
                 self.refresh()
             self.invalidate_unavailable()
             self.reconcile()
+            from .artifacts import tick as artifact_tick
+            artifact_tick(self, execute=execute)
             plan = self.plan()
             if not execute:
                 return {"mode": "dry-run", "plan": plan, "launches": []}

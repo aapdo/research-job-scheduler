@@ -1,0 +1,12 @@
+{
+  "id": "weather-context-v1",
+  "name": "Weather context comparison",
+  "rq": "Which context mechanism improves detection under weather degradation?",
+  "projects": ["weather-context"],
+  "hf": {
+    "repo_id": "YOUR_ACCOUNT/experiment-results",
+    "repo_type": "model",
+    "revision": "main",
+    "path_prefix": "scheduler-artifacts"
+  }
+}

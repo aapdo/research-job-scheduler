@@ -1,0 +1,4 @@
+{
+  "python": "/srv/venvs/hf/bin/python",
+  "token_file": "/home/researcher/.config/research-scheduler/hf-token"
+}

@@ -78,6 +78,13 @@ def parser():
     retry.add_argument("--additional-attempts", type=int, default=1)
     sub.add_parser("events")
     sub.add_parser("campaign-status", help="show campaign state and notification outbox without secrets")
+    sub.add_parser('artifact-status', help='show HF publication and download state, revisions and links')
+    hf = sub.add_parser('set-node-hf', help='register node-local HF Python/token paths; credentials are never arguments')
+    hf.add_argument('node')
+    hf.add_argument('file', help='JSON with python and optional token_file path')
+    outputs = sub.add_parser('set-job-hf-artifacts', help='declare export file globs and relocatable result JSON')
+    outputs.add_argument('job')
+    outputs.add_argument('file', help='JSON with hf_artifacts and hf_relocate_json lists')
     c = sub.add_parser("cancel-pending", help="cancel an unstarted job only; never kills a process")
     c.add_argument("job")
     t = sub.add_parser("tick", help="one scheduling cycle (dry-run unless --execute)")
@@ -202,6 +209,33 @@ def main(argv=None):
             result = [dict(r, data=json.loads(r["data"])) for r in store.db.execute("SELECT * FROM events ORDER BY seq")]
         elif cmd == "campaign-status":
             result = campaign_status(store)
+        elif cmd == 'artifact-status':
+            from .artifacts import status, publication_summary
+            result = dict(transfers=status(store), publication=publication_summary(store))
+        elif cmd == 'set-node-hf':
+            from .schema import node_spec
+            config = load(args.file)
+            with store.lock(), store.db:
+                n = store.specs('nodes')[args.node]
+                n['hf'] = config
+                n = node_spec(n)
+                store.db.execute('UPDATE nodes SET spec=? WHERE id=?', (dumps(n), args.node))
+                store.event('node_hf_changed', args.node, config)
+            result = dict(node=args.node, hf=config)
+        elif cmd == 'set-job-hf-artifacts':
+            from .schema import fields, experiment_spec
+            config = load(args.file)
+            fields(config, 'hf_artifacts hf_relocate_json')
+            with store.lock(), store.db:
+                j = next(j for j in store.jobs() if j['id'] == args.job)
+                if store.db.execute('SELECT 1 FROM artifact_transfers WHERE attempt IN '
+                                    '(SELECT id FROM attempts WHERE job=?)', (args.job,)).fetchone():
+                    raise ValueError('artifact contract already frozen by a transfer')
+                j['spec'].update(config)
+                experiment_spec(dict(id='check', name='check', rq='check', jobs=[j['spec']]))
+                store.db.execute('UPDATE jobs SET spec=? WHERE id=?', (dumps(j['spec']), args.job))
+                store.event('job_hf_artifacts_changed', args.job, config)
+            result = dict(job=args.job, **config)
         elif cmd == "tick":
             result = controller.tick(execute=args.execute, max_launches=args.max_launches_per_cycle)
             result["notifications"] = poll_campaigns(store)

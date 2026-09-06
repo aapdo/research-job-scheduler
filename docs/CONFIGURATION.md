@@ -28,6 +28,7 @@ RAM·VRAM 단위는 MiB, 시간 단위는 초입니다. 지원하지 않는 필�
 | `storage_domain` | `""` | dependency 출력에 같은 절대 경로로 접근할 수 있는 공통 저장소 이름 |
 | `startup_group` | `""` | 초기 읽기 부하·시작 간격을 공유할 등록된 그룹 ID |
 | `policy`, `recovery` | 아래 기본값 | 자원·health 기준과 장애 처리 설정 |
+| `hf` | 생략 | HF 전송용 `{python, token_file?}`. 서버 기준 Python/token **파일 경로** |
 
 GPU 항목에는 `uuid`, `index`, `memory_mib`를 포함하고 `name`, `enabled`를 지정할 수 있습니다.
 `enabled` 기본값은 false입니다. 전체 NVIDIA GPU UUID를 사용하며 MIG 장치는 지원하지 않습니다.
@@ -149,11 +150,14 @@ Campaign은 여러 실험의 실행 설정을 복제하는 계층이 아니라 �
 | `experiments` | `[]` | project와 무관하게 명시적으로 포함할 experiment ID |
 | `external` | `false` | scheduler 밖 legacy queue 상태를 controller가 공급하는 campaign 여부 |
 | `enabled` | `true` | 상태 관찰·새 알림 생성을 수행할지 여부 |
+| `hf` | 생략 | `{repo_id, repo_type?, revision?, path_prefix?}` 결과 업로드 설정 |
 
 일반 campaign은 `projects` 또는 `experiments` 중 하나 이상을 지정합니다. 두 목록은 합집합으로
 해석하며 job을 중복 집계하지 않습니다. 명시적인 experiment ID는 등록 시 존재해야 하지만,
 project selector는 같은 project로 나중에 등록되는 experiment도 자동으로 포함합니다.
 `external: true`는 scheduler job 대신 통합 controller가 제공하는 관찰값을 사용합니다.
+자동 HF 전송은 scheduler가 관리하는 experiment/attempt에만 적용됩니다. 자세한 export contract와
+서버별 인증 설정은 [HF_ARTIFACTS.md](HF_ARTIFACTS.md)를 참고하세요.
 
 상태는 `pending`, `running`, `complete`, `error`입니다. `failed` 또는 `blocked` job이 하나라도
 있으면 `error`를 우선하며, `queued`/`starting`/`running`/`unknown`이 있으면 `running`입니다.
@@ -197,6 +201,8 @@ job ID는 DB 전체에서 고유해야 합니다. 모든 dependency가 기존 DB
 | `labels` | `{}` | node label에 정확하게 일치해야 하는 key/value |
 | `resources` | 아래 기본값 | GPU·CPU·RAM 요청 |
 | `outputs` | `[]` | attempt 폴더 안에 생성해야 할 상대 파일 경로 |
+| `hf_artifacts` | 생략 | `outputs` 외에 HF로 내보낼 attempt 내부 파일/glob 목록 |
+| `hf_relocate_json` | 생략 | 다운로드 뒤 attempt 경로를 바꿀 exported JSON 파일/glob 목록 |
 | `input_files` | `[]` | 실행 전 SHA256을 확인할 `{path, sha256}` 목록 |
 | `assets` | `{}` | 사용할 node asset의 `{이름: 기대 SHA256}` |
 | `max_attempts` | `1` | 최초 시도·확인된 실패 재시도·node failover를 포함한 전체 시도 상한 |
@@ -277,7 +283,8 @@ attempt 명세와 `RS_FILESYSTEM`에 고정됩니다. experiment 값은 job의 �
 실제로 같은 NFS namespace를 공유하고 **같은 절대 경로로 결과에 접근하는 서버에만**
 같은 `storage_domain`을 지정합니다. 이 값은 mount나 경로 변환을 수행하지 않습니다.
 기본값 `""`이면 다른 서버의 local 결과를 사용할 수 있다고 가정하지 않습니다.
-데이터셋 경로를 등록했다고 checkpoint도 자동으로 전달되는 것은 아닙니다.
+데이터셋 경로 등록만으로 checkpoint가 전달되지는 않습니다. HF campaign과 node 설정, 필요한
+export 파일을 등록하면 다른 local 서버에서 HF를 통한 검증된 dependency staging을 사용할 수 있습니다.
 
 ### 초기 읽기 부하 제한
 

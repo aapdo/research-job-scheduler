@@ -1,0 +1,4 @@
+{
+  "hf_artifacts": ["run/epochs/*/model.pdparams", "run/TRAIN_CONFIG.yml"],
+  "hf_relocate_json": ["TRAIN_RESULT.json"]
+}

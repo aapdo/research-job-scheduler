@@ -56,7 +56,7 @@ def file_contract(value):
 def node_spec(raw):
     n = copy.deepcopy(raw)
     fields(n, "id transport target python work_root storage_domain labels gpus enabled max_jobs "
-           "cpu_limit ram_limit_mib policy assets startup_group recovery datasets filesystem")
+           "cpu_limit ram_limit_mib policy assets startup_group recovery datasets filesystem hf")
     identifier(n["id"])
     n.setdefault("transport", "ssh")
     check(n["transport"] in ("local", "ssh"), "transport must be local or ssh")
@@ -65,6 +65,11 @@ def node_spec(raw):
               "target must be a safe SSH alias; use ~/.ssh/config for ports/keys")
     n.setdefault("python", "python3")
     absolute(n["work_root"])
+    if "hf" in n:
+        fields(n["hf"], "python token_file")
+        absolute(n["hf"]["python"])
+        if n["hf"].get("token_file"):
+            absolute(n["hf"]["token_file"])
     check(n["work_root"] not in ("/", "/home", "/tmp"), "use a dedicated work_root")
     for k, v in dict(enabled=False, max_jobs=1, labels={}, gpus=[], assets={},
                      policy={}, recovery={}, datasets={}, storage_domain="", startup_group="").items():
@@ -171,7 +176,7 @@ def experiment_spec(raw):
     check(isinstance(e["jobs"], list) and e["jobs"], "at least one job required")
     for j in e["jobs"]:
         fields(j, "id name kind purpose argv cwd env config resources depends_on order_only_dependencies priority labels hosts "
-               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem")
+               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem hf_artifacts hf_relocate_json")
         identifier(j["id"])
         check(j["kind"] in ("train", "eval", "prepare", "analysis"), "invalid job kind")
         check(isinstance(j.get("name"), str) and j["name"].strip(), "job name required")
@@ -223,6 +228,13 @@ def experiment_spec(raw):
         for out in j["outputs"]:
             check(isinstance(out, str) and out and not PurePosixPath(out).is_absolute()
                   and ".." not in PurePosixPath(out).parts, "outputs must be relative files inside attempt_dir")
+        for key in ("hf_artifacts", "hf_relocate_json"):
+            if key in j:
+                check(isinstance(j[key], list), key + " must be a list")
+                for path in j[key]:
+                    check(isinstance(path, str) and path and not PurePosixPath(path).is_absolute()
+                          and ".." not in PurePosixPath(path).parts and "\\" not in path,
+                          key + " must contain relative paths/globs inside attempt_dir")
         r = j.setdefault("resources", {})
         fields(r, "gpu_count vram_mib cpu ram_mib gpu_mode parameter_count")
         for k, v in dict(gpu_count=0, vram_mib=0, cpu=1, ram_mib=512, gpu_mode="exclusive").items():

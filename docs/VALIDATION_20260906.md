@@ -139,3 +139,14 @@ registration/status flow was also exercised against a temporary local database.
 All Slack sends in automated tests use an injected in-memory sender; the test suite
 does not contact Slack. A real webhook may be enabled only through
 `RS_SLACK_WEBHOOK_FILE`, and its URL is not part of campaign JSON, events or outbox rows.
+
+## Campaign HF artifact publication (0.7.0)
+
+The expanded suite contains **98 tests**, including nine focused HF tests. Offline Hub
+fixtures exercise commit-pinned publication, full hash verification, relocatable JSON
+descriptors, missing referenced checkpoints, mutated outputs, path escapes and symlinks,
+destination staging, scheduler restart idempotence and finite publication retries.
+An end-to-end control-plane test publishes source files and stages them into a separate
+destination directory, then verifies the consumer command points to the downloaded bytes.
+GPU admission stays blocked until the destination receipt exists. Failed publication never
+changes the successful training state. No real HF repository is written by automated tests.

@@ -24,6 +24,7 @@
 - 서버와 GPU 등록: SSH/local 실행, GPU UUID·모델·VRAM 조회, 장치별 사용 허용.
 - 실험 관리: 이름·RQ·job별 목적, 설정값, 예상 자원량, 우선순위, 학습→평가 의존성.
 - 실험 그룹 알림: 여러 실험/project를 하나의 campaign으로 묶어 그룹 완료·오류 전이만 통지.
+- HF 결과 공유: campaign별 저장소에 결과를 올리고 다른 서버의 후속 작업이 revision·hash 검증 후 사용.
 - 자원 기반 배치: GPU 사용률·VRAM·compute PID, CPU·RAM·디스크·D-state와 선택적 스토리지 읽기 점검.
 - VRAM packing과 온도 보호: 저사용률 GPU에 bounded shared job을 배치하고 80/85°C 단계별 launch 제한.
 - 파일시스템 제약: 실험/job을 `nfs`, `local`, `any`로 지정해 맞는 서버에만 배치.
@@ -42,7 +43,8 @@
 `depends_on`은 기본적으로 선행 artifact의 같은 filesystem 접근과 해시 검증까지 요구합니다.
 완료 순서만 기다리는 dependency는 해당 ID를 `order_only_dependencies`에도 적을 수 있습니다.
 이 경우 서로 다른 local node에서도 후속을 배치할 수 있지만 `{dep:ID}` 경로 참조는 금지됩니다.
-원격 artifact가 필요하면 workflow의 명시적인 수집·전송 단계가 별도로 검증해야 합니다.
+원격 artifact가 필요하면 [HF 결과 공유](docs/HF_ARTIFACTS.md)를 등록하거나 workflow의 명시적인
+수집·전송 단계를 사용합니다. HF download가 검증되기 전에는 다른 local 서버에 후속 job을 배치하지 않습니다.
 `cluster`는 실행 서버 집합과 혼동될 수 있어 알림 단위의 코드 명칭은 `campaign`, 화면 표현은
 “실험 그룹”을 사용합니다.
 
@@ -288,6 +290,9 @@ daemon은 전이와 전송 결과를 durable outbox와 event log에 기록하므
 | `events` | 등록·설정 변경·장애·실행 상태 전이 이력 확인 |
 | `register-campaign FILE` | project/experiment들을 완료·오류 알림 단위로 등록 |
 | `campaign-status` | campaign 상태와 비밀값을 제외한 알림 outbox 확인 |
+| `artifact-status` | HF upload/download 상태와 완료 revision·링크 확인 |
+| `set-node-hf NODE FILE` | node의 HF Python과 비밀 token 파일 경로 등록 |
+| `set-job-hf-artifacts JOB FILE` | 첫 전송 전에 export 파일 glob 및 JSON 경로 변환 계약 등록 |
 | `priority JOB_ID VALUE` | 대기 중인 job 우선순위 변경 |
 | `set-dataset NODE NAME PATH` | 앞으로 실행할 job의 서버별 데이터 경로 등록·변경 |
 | `set-storage-profile NODE FILE` | active attempt는 유지하고 향후 local/NFS 경로·admission을 원자적으로 전환 |
@@ -356,7 +361,7 @@ research-scheduler --db "$SCHEDULER_DB" readmit-node research-node-a --ack-old-a
 | GPU 사용률이 0인데 배치되지 않음 | compute PID, VRAM, 장치 enabled, 자원 예약을 함께 확인. 기본값은 exclusive |
 | `waiting for stable health polls` | 한 번의 조회로는 부족할 수 있음. daemon으로 정상 poll이 누적되는지 확인 |
 | `dataset path not registered` / `unavailable` | 선택 서버의 이름→경로 등록과 원격 읽기 권한 확인 |
-| `dependency artifacts on another local filesystem` | 선행 결과가 다른 서버의 local disk에 있음. 자동 복사하지 않음 |
+| `dependency artifacts on another local filesystem` | 선행 결과가 다른 local disk에 있음. HF campaign/node 설정 및 upload/download 상태 확인 |
 | `shared-storage cold-start slot occupied` | 준비 완료 marker와 그룹 health 확인. [공유 스토리지 설정](docs/CONFIGURATION.md#공유-스토리지-설정) 참고 |
 | `unknown` / `blocked` | 단순 성공·실패로 해석하지 말고 node 상태, attempt 로그와 재시도 예산 확인 |
 | `another controller/registry operation holds the scheduler lock` | 같은 DB의 진행 중 조회·배치가 끝난 뒤 재시도. DB를 새로 만들어 중복 실행하지 않음 |
@@ -372,8 +377,9 @@ MIG/MPS·선점·자동 checkpoint resume·VRAM peak 자동 profiling은 지원�
 |---|---|
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | 서버·job 필드, 기본값, 치환 값, GPU 공유 및 NFS 설정 |
 | [STATE_MACHINE.md](docs/STATE_MACHINE.md) | job/attempt/node 상태와 재시도·invalid 처리 |
+| [HF_ARTIFACTS.md](docs/HF_ARTIFACTS.md) | campaign HF 저장소, 자동 upload/download와 checkpoint 경로 변환 |
 | [OPEN_SOURCE_REVIEW.md](docs/OPEN_SOURCE_REVIEW.md) | Slurm·ClearML·Ray 검토와 구현 선택 근거 |
-| [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 89개 테스트와 실제/모의 검증 범위, 미검증 항목 |
+| [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 98개 테스트와 실제/모의 검증 범위, 미검증 항목 |
 | [node.ssh.json](examples/node.ssh.json) | 서버 등록 예제 |
 | [experiment.named-dataset.json](examples/experiment.named-dataset.json) | 서버별 데이터 경로를 사용하는 단일 학습 예제 |
 | [experiment.json](examples/experiment.json) | baseline 학습→평가와 독립 학습을 묶는 DAG 예제 |

@@ -91,6 +91,10 @@ D-state가 계속 있으면 지속 상태입니다.
 
 ## Campaign (실험 그룹)
 
+HF를 등록하면 computation 성공 뒤 `publishing` 단계를 논리적으로 포함합니다. job/attempt의
+성공은 유지하며 artifact transfer를 별도로 추적합니다. publication이 남아 있으면 campaign은
+running이고, 완료되면 complete로 전이합니다. 전송 재시도 소진·node HF 설정 누락은 error입니다.
+
 ```mermaid
 stateDiagram-v2
     [*] --> pending: 포함 job 없음 또는 아직 시작 조건 없음

@@ -32,7 +32,10 @@ def ensure_tables(store):
 
 def campaign_spec(raw):
     value = json.loads(dumps(raw))
-    fields(value, "id name rq projects experiments external enabled")
+    fields(value, "id name rq projects experiments external enabled hf")
+    if value.get("hf") is not None:
+        from .artifacts import hf_spec
+        value["hf"] = hf_spec(value["hf"])
     identifier(value["id"])
     for key in ("name", "rq"):
         check(isinstance(value.get(key), str) and value[key].strip(), key + " is required")
@@ -48,6 +51,7 @@ def campaign_spec(raw):
     if value["external"]:
         check(not value["projects"] and not value["experiments"],
               "external campaign cannot also select scheduler experiments")
+        check(not value.get('hf'), 'external campaign must import its jobs before enabling automatic HF publication')
     else:
         check(value["projects"] or value["experiments"],
               "campaign needs a project or experiment")
@@ -60,9 +64,23 @@ def register_campaign(store, raw):
         ensure_tables(store)
         known = set(store.specs("experiments"))
         check(set(value["experiments"]) <= known, "unknown explicit experiment")
+        if value.get('hf'):
+            experiments = store.specs('experiments')
+            def selected(c):
+                return set(c['experiments']) | {k for k,e in experiments.items() if e['project'] in c['projects']}
+            for other in campaign_specs(store).values():
+                if other['id'] != value['id'] and other.get('hf') and other['enabled']:
+                    check(not (set(other['projects']) & set(value['projects']) or selected(other) & selected(value)),
+                          'overlapping HF campaigns are not allowed')
         row = store.db.execute("SELECT spec FROM campaigns WHERE id=?", (value["id"],)).fetchone()
         if row is not None:
-            check(json.loads(row[0]) == value, "campaign already exists with another specification")
+            old = json.loads(row[0])
+            check({k:v for k,v in old.items() if k != "hf"} ==
+                  {k:v for k,v in value.items() if k != "hf"},
+                  "campaign already exists with another specification")
+            store.db.execute("UPDATE campaigns SET spec=? WHERE id=?", (dumps(value), value["id"]))
+            if old != value:
+                store.event("campaign_hf_changed", value["id"], {"hf": value.get("hf")})
             return value
         store.db.execute("INSERT INTO campaigns VALUES(?,?,?)",
                          (value["id"], dumps(value), time.time()))
@@ -97,8 +115,17 @@ def _job_observation(store, spec):
         state = "complete"
     else:
         state = "pending"
+    publication = None
+    if spec.get('hf'):
+        from .artifacts import publication_summary
+        publication = publication_summary(store, spec)
+        if publication['errors']:
+            errors.extend(publication['errors'])
+            state = 'error'
+        elif publication['counts']['pending'] and state == 'complete':
+            state = 'running'
     return {"state": state, "counts": counts, "jobs": len(jobs),
-            "experiments": len(selected), "errors": errors[:8]}
+            "experiments": len(selected), "errors": errors[:8], 'publication': publication}
 
 
 def _message(spec, observation):
@@ -107,6 +134,10 @@ def _message(spec, observation):
     counts = ", ".join(f"{key}={value}" for key, value in sorted(observation.get("counts", {}).items()))
     lines = [f"{icon} Research campaign {title}", f"{spec['name']} (`{spec['id']}`)",
              "RQ: " + spec["rq"], "Counts: " + (counts or "external campaign")]
+    if spec.get('hf'):
+        h = spec['hf']
+        lines.append('HF: https://huggingface.co/' + ('datasets/' if h['repo_type']=='dataset' else '') + h['repo_id'])
+        lines.append('Artifact publication: ' + dumps(observation.get('publication', {})))
     for error in observation.get("errors", [])[:5]:
         reason = (error.get("reason") or "no reason recorded").replace("\n", " ")[:240]
         lines.append(f"- {error.get('job', 'external')}: {error.get('status', 'error')} — {reason}")
