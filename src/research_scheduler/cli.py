@@ -40,6 +40,9 @@ def parser():
                          help="allow/disallow future placement beside visible external GPU processes")
     ext.add_argument("node")
     ext.add_argument("state", choices=["enabled", "disabled"])
+    margin = sub.add_parser("set-gpu-margin", help="set per-GPU VRAM safety margin for future placement")
+    margin.add_argument("node")
+    margin.add_argument("mib", type=int)
     sub.add_parser("inventory")
     sub.add_parser("probe", help="read-only server/GPU resource and health probes")
     sub.add_parser("plan", help="refresh resources and show hypothetical placements; no launches")
@@ -118,6 +121,8 @@ def main(argv=None):
             result = store.set_dataset(args.node, args.dataset, args.path)
         elif cmd == "set-external-gpu-processes":
             result = store.set_external_gpu_processes_allowed(args.node, args.state == "enabled")
+        elif cmd == "set-gpu-margin":
+            result = store.set_gpu_margin_mib(args.node, args.mib)
         elif cmd == "readmit-node":
             with store.lock(), store.db:
                 if controller.node_health().get(args.node, {}).get("phase") != "unavailable":

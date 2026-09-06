@@ -143,6 +143,22 @@ class Store:
             self.event("external_gpu_process_admission_changed", node_id, data)
         return {"node": node_id, "changed": True, **data}
 
+    def set_gpu_margin_mib(self, node_id, margin_mib):
+        """Change future per-GPU safety headroom without touching active attempts."""
+        from .schema import number
+        number(margin_mib, "gpu_margin_mib")
+        with self.lock(), self.db:
+            n = self.specs("nodes").get(node_id)
+            check(n is not None, "unknown node: " + node_id)
+            if n["policy"]["gpu_margin_mib"] == margin_mib:
+                return {"node": node_id, "gpu_margin_mib": margin_mib, "changed": False}
+            n["policy"]["gpu_margin_mib"] = margin_mib
+            self.db.execute("UPDATE nodes SET spec=? WHERE id=?", (dumps(node_spec(n)), node_id))
+            self.db.execute("DELETE FROM snapshots WHERE node=?", (node_id,))
+            data = {"gpu_margin_mib": margin_mib, "active_attempts_unchanged": True}
+            self.event("gpu_margin_changed", node_id, data)
+        return {"node": node_id, "changed": True, **data}
+
     def register_experiment(self, raw):
         e = experiment_spec(raw)
         with self.lock(), self.db:

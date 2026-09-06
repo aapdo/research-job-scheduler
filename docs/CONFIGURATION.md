@@ -90,6 +90,8 @@ child 실행 직전 다시 확인합니다. 같은 이름이 내용 동일성을
 `max_gpu_percent` 이하이고 관측 free VRAM이 `vram_mib + gpu_margin_mib`를 충족하면 배치할 수
 있습니다. `exclusive` job끼리는 여전히 GPU 하나당 scheduler reservation 하나만 허용합니다.
 CLI에서는 `set-external-gpu-processes NODE enabled|disabled`로 향후 admission을 바꿀 수 있습니다.
+GPU 안전 여유는 `set-gpu-margin NODE MIB`로 변경할 수 있으며 이미 생성된 attempt에는
+영향을 주지 않습니다. 외부 프로세스가 VRAM을 더 사용할 수 있으므로 0보다는 보수적인 값을 권장합니다.
 
 여러 scheduler job 자체를 같은 GPU에 두려면 추가로 node의 `policy.allow_gpu_sharing: true`와
 job의 `resources.gpu_mode: "shared"`를 함께 지정합니다. PID namespace가 다를 수 있어 외부

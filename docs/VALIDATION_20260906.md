@@ -75,8 +75,9 @@ VRAM, D-state, dataset or startup-group gates.
 
 ## Explicit external-process headroom update (0.2.1)
 
-The suite passes **65 tests**. New cases verify that an opted-in node can admit an
+The suite passes **66 tests**. New cases verify that an opted-in node can admit an
 exclusive scheduler job beside an already-visible external process only when GPU
 utilization and per-device VRAM headroom pass, while a second scheduler reservation
 on the same GPU remains prohibited. Changing this node policy affects future
-placement and does not mutate active attempt snapshots.
+placement and does not mutate active attempt snapshots. A future-only GPU margin
+update is also validated independently from active attempt state.

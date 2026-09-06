@@ -165,6 +165,17 @@ class SchemaAndStoreTests(unittest.TestCase):
         self.assertTrue(self.store.specs("nodes")["a"]["policy"]["allow_external_gpu_processes"])
         self.assertFalse(self.store.attempts()[0]["spec"]["node_spec"]["policy"]["allow_external_gpu_processes"])
 
+    def test_gpu_margin_change_is_future_only_and_validated(self):
+        n = node()
+        self.store.register_node(n)
+        result = self.store.set_gpu_margin_mib("a", 512)
+        self.assertTrue(result["changed"])
+        self.assertEqual(self.store.specs("nodes")["a"]["policy"]["gpu_margin_mib"], 512)
+        self.assertFalse(self.store.set_gpu_margin_mib("a", 512)["changed"])
+        for value in (-1, float("nan"), True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.store.set_gpu_margin_mib("a", value)
+
 
 class PlannerTests(unittest.TestCase):
     def test_priority_backfill_skips_infeasible(self):
