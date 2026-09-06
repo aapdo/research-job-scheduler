@@ -347,6 +347,18 @@ class Store:
             self.event('pending_resources_changed', job_id, dict(before=before, after=spec['resources']))
         return dict(job=job_id, before=before, after=spec['resources'])
 
+    def set_pending_resource_variants(self, job_id, variants):
+        """Explicit opt-in only; the research worker must preserve its batch contract."""
+        with self.lock(), self.db:
+            job = next((j for j in self.jobs() if j['id'] == job_id), None)
+            check(job is not None and job['status'] == 'queued', 'only queued jobs can gain resource variants')
+            spec = dict(job['spec'], resource_variants=variants)
+            spec = experiment_spec(dict(id='variant-check', name='variant-check', rq='variant-check', jobs=[spec]))['jobs'][0]
+            self.db.execute('UPDATE jobs SET spec=? WHERE id=?', (dumps(spec), job_id))
+            self.event('pending_resource_variants_changed', job_id,
+                       dict(before=job['spec'].get('resource_variants', []), after=spec['resource_variants']))
+        return dict(job=job_id, resource_variants=spec['resource_variants'])
+
     def add_pending_order_dependency(self, job_id, dependency):
         """Add an explicit cross-storage validation gate to an unstarted job."""
         with self.lock(), self.db:

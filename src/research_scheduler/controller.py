@@ -199,6 +199,11 @@ class Controller:
         node = s.specs("nodes")[placement["node"]]
         job = next(j for j in s.jobs() if j["id"] == placement["job"])
         spec = job["spec"]
+        resources = placement.get('resources', spec['resources'])
+        if resources not in [spec['resources'], *spec.get('resource_variants', [])]:
+            raise ValueError('placement resources are not a registered variant')
+        if spec.get('resource_variants') and len(placement['gpus']) != resources['gpu_count']:
+            raise ValueError('GPU assignment differs from selected resource variant')
         dataset = spec.get("dataset", "")
         if dataset:
             dataset_path = node.get("datasets", {}).get(dataset)
@@ -262,7 +267,7 @@ class Controller:
                        dataset=dataset, dataset_path=dataset_path,
                        filesystem_request=filesystem_request, filesystem=filesystem,
                        input_files=[dict(f, path=expand(f["path"])) for f in inputs],
-                       outputs=spec["outputs"], resources=spec["resources"],
+                       outputs=spec["outputs"], resources=resources,
                        startup_group=node["startup_group"], gpus=placement["gpus"])
         request["runner_sha256"] = hashlib.sha256(Path(agent.__file__).read_bytes()).hexdigest()
         request["spec_sha256"] = hashlib.sha256(dumps(request).encode()).hexdigest()

@@ -160,10 +160,11 @@ def tick(controller, execute):
                 for d in j['spec']['depends_on']:
                     if hypothetical[d]['report'].get('hf_artifact'):
                         hypothetical[d].setdefault('artifact_locations', {})[n['id']] = {}
-                reason, _ = fit(j['spec'], n, snapshots[n['id']],
-                                [a for a in attempts if a['status'] in ACTIVE] + reservations(store),
-                                attempts, hypothetical, store.specs('groups_'), time.time())
-                if not reason:
+                fits = [fit(dict(j['spec'], resources=resources), n, snapshots[n['id']],
+                            [a for a in attempts if a['status'] in ACTIVE] + reservations(store),
+                            attempts, hypothetical, store.specs('groups_'), time.time())[0]
+                        for resources in [j['spec']['resources'], *j['spec'].get('resource_variants', [])]]
+                if any(not reason for reason in fits):
                     start(controller, a, n, 'download', dict(receipt=receipt))
                     return
     # Prioritize publications that unblock successors; successful computation stays successful.

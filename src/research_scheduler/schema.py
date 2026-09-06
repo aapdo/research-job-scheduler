@@ -176,7 +176,7 @@ def experiment_spec(raw):
     check(isinstance(e["jobs"], list) and e["jobs"], "at least one job required")
     for j in e["jobs"]:
         fields(j, "id name kind purpose argv cwd env config resources depends_on order_only_dependencies priority labels hosts "
-               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem hf_artifacts hf_relocate_json")
+               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem hf_artifacts hf_relocate_json resource_variants")
         identifier(j["id"])
         check(j["kind"] in ("train", "eval", "prepare", "analysis"), "invalid job kind")
         check(isinstance(j.get("name"), str) and j["name"].strip(), "job name required")
@@ -245,6 +245,19 @@ def experiment_spec(raw):
         check(r["gpu_mode"] in ("exclusive", "shared"), "invalid gpu_mode")
         if "parameter_count" in r:
             number(r["parameter_count"], "parameter_count", 0, True)
+        if 'resource_variants' in j:
+            check(isinstance(j['resource_variants'], list) and len(j['resource_variants']) <= 8,
+                  'resource_variants must contain at most 8 alternatives')
+            variants = []
+            for alternative in j['resource_variants']:
+                fields(alternative, 'gpu_count vram_mib cpu ram_mib gpu_mode parameter_count')
+                child = dict(j, resources=dict(r, **alternative))
+                child.pop('resource_variants')
+                normalized = experiment_spec(dict(id='variant', name='variant', rq='variant', jobs=[child]))['jobs'][0]['resources']
+                check(normalized['gpu_count'] > 0 and r['gpu_count'] > 0, 'variants require GPU jobs')
+                check(normalized not in [r, *variants], 'duplicate resource variant')
+                variants.append(normalized)
+            j['resource_variants'] = variants
     check(len({j["id"] for j in e["jobs"]}) == len(e["jobs"]), "duplicate job ID")
     return e
 

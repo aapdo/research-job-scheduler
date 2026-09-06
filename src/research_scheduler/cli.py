@@ -79,6 +79,9 @@ def parser():
     sub.add_parser("events")
     sub.add_parser("campaign-status", help="show campaign state and notification outbox without secrets")
     sub.add_parser('artifact-status', help='show HF publication and download state, revisions and links')
+    variants = sub.add_parser('set-job-resource-variants', help='register prevalidated alternative GPU/VRAM resource profiles')
+    variants.add_argument('job')
+    variants.add_argument('file', help='JSON array of resource overrides')
     hf = sub.add_parser('set-node-hf', help='register node-local HF Python/token paths; credentials are never arguments')
     hf.add_argument('node')
     hf.add_argument('file', help='JSON with python and optional token_file path')
@@ -212,6 +215,8 @@ def main(argv=None):
         elif cmd == 'artifact-status':
             from .artifacts import status, publication_summary
             result = dict(transfers=status(store), publication=publication_summary(store))
+        elif cmd == 'set-job-resource-variants':
+            result = store.set_pending_resource_variants(args.job, load(args.file))
         elif cmd == 'set-node-hf':
             from .schema import node_spec
             config = load(args.file)

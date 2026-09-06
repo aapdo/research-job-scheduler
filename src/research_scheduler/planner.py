@@ -39,6 +39,29 @@ def gpu_healthy(gpu, node, mode):
     return p["allow_gpu_sharing"]
 
 
+def dependency_priorities(jobs, experiments):
+    """Inherit pending descendants' priority; use their count to break ties."""
+    by_id = {j['id']: j for j in jobs}
+    successors = {key: set() for key in by_id}
+    for j in jobs:
+        if j['status'] != 'queued':
+            continue
+        frontier = list(j['spec']['depends_on'])
+        seen = set()
+        while frontier:
+            key = frontier.pop()
+            if key in seen or key not in by_id:
+                continue
+            seen.add(key)
+            if by_id[key]['status'] == 'succeeded':
+                continue
+            successors[key].add(j['id'])
+            frontier.extend(by_id[key]['spec']['depends_on'])
+    priority = {j['id']: experiments[j['experiment']]['priority'] + j['spec']['priority'] for j in jobs}
+    return {key: (max([priority[key], *[priority[d] for d in downstream]]), len(downstream))
+            for key, downstream in successors.items()}
+
+
 def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
     """Return simulated placements with reasons; never mutate runtime or launch jobs."""
     now = time.time() if now is None else now
@@ -47,8 +70,9 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
     successful = {a["job"]: a for a in attempts if a["status"] == "succeeded"}
     held = list(active)
     plan = []
+    scores = dependency_priorities(jobs, experiments)
     queued = sorted((j for j in jobs if j["status"] == "queued"),
-                    key=lambda j: (-(experiments[j["experiment"]]["priority"] + j["spec"]["priority"]),
+                    key=lambda j: (-scores[j['id']][0], -scores[j['id']][1],
                                    j["created"], j["id"]))
     for j in queued:
         spec, failures = j["spec"], {}
@@ -58,20 +82,27 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
             continue
         candidates = []
         for node_id, node in sorted(nodes.items()):
-            reason, chosen = fit(spec, node, snapshots.get(node_id), held, attempts,
-                                 successful, groups, now)
-            if reason:
-                failures[node_id] = reason
-            else:
-                count = sum(a["node"] == node_id for a in held)
-                candidates.append((count, node_id, chosen))
+            reasons = []
+            for index, resources in enumerate([spec['resources'], *spec.get('resource_variants', [])]):
+                reason, chosen = fit(dict(spec, resources=resources), node, snapshots.get(node_id), held, attempts,
+                                     successful, groups, now)
+                if reason:
+                    reasons.append(reason)
+                else:
+                    count = sum(a["node"] == node_id for a in held)
+                    candidates.append((count, index, node_id, chosen, resources))
+                    break
+            if reasons and len(reasons) == 1 + len(spec.get('resource_variants', [])):
+                failures[node_id] = '; '.join(dict.fromkeys(reasons))
         if not candidates:
             plan.append({"job": j["id"], "decision": "waiting", "reasons": failures or {"inventory": "no nodes registered"}})
             continue
-        _, node_id, chosen = min(candidates)
+        _, _, node_id, chosen, resources = min(candidates, key=lambda c: c[:4])
         placement = {"job": j["id"], "decision": "ready", "node": node_id, "gpus": chosen,
                      "filesystem_request": job_filesystem(spec),
                      "filesystem": node_filesystem(nodes[node_id])}
+        if spec.get('resource_variants'):
+            placement['resources'] = resources
         if spec.get("dataset"):
             placement.update(dataset=spec["dataset"], dataset_path=nodes[node_id]["datasets"][spec["dataset"]])
         elif spec.get("dataset_path"):
@@ -79,8 +110,10 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
         plan.append(placement)
         held.append({"id": "planned:" + j["id"], "job": j["id"], "node": node_id,
                      "created": now, "released": False, "status": "starting",
-                     "spec": {"resources": spec["resources"], "gpus": chosen,
+                     "spec": {"resources": resources, "gpus": chosen,
                               "startup_group": nodes[node_id]["startup_group"]}})
+    for row in plan:
+        row['effective_priority'], row['pending_descendants'] = scores[row['job']]
     return plan
 
 

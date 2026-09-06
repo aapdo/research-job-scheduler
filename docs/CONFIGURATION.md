@@ -200,6 +200,7 @@ job ID는 DB 전체에서 고유해야 합니다. 모든 dependency가 기존 DB
 | `hosts` | `[]` | 실행 가능한 node ID 목록. 빈 목록이면 이 제한 없음 |
 | `labels` | `{}` | node label에 정확하게 일치해야 하는 key/value |
 | `resources` | 아래 기본값 | GPU·CPU·RAM 요청 |
+| `resource_variants` | 생략 | 운영자가 검증한 대체 resource 객체 목록. 아래 DDP 예시 참조 |
 | `outputs` | `[]` | attempt 폴더 안에 생성해야 할 상대 파일 경로 |
 | `hf_artifacts` | 생략 | `outputs` 외에 HF로 내보낼 attempt 내부 파일/glob 목록 |
 | `hf_relocate_json` | 생략 | 다운로드 뒤 attempt 경로를 바꿀 exported JSON 파일/glob 목록 |
@@ -238,6 +239,21 @@ worker 자체도 child 시작 직전에 VRAM·사용률·온도를 다시 확인
 경우 `replace-job-path-prefix`로 queued job만 새 immutable release에 연결합니다.
 
 ### 치환 값과 환경 변수
+
+`resource_variants`는 기본 요청이 맞지 않는 서버에서 시도할 명시적인 대안입니다. 예를 들어
+기본 DDP4에 `{ "gpu_count": 2, "vram_mib": 18000 }` 대안을 등록하면 나머지 자원 필드는 기본값을
+상속합니다. 최대 8개이며 등록하지 않은 GPU 수는 선택하지 않습니다. 같은 node 부하에서는
+기본 구성을 우선하고, 실제 선택 자원과 GPU UUID를 attempt에 고정합니다.
+
+학습 wrapper가 전체 batch와 LR을 유지하도록 GPU 수를 처리해야 합니다. 스케줄러는 과학적
+동등성을 추정하거나 학습 인수를 자동 변경하지 않습니다. 실행 중 attempt의 GPU 수는 변경하지
+않습니다. `set-job-resource-variants JOB FILE`로 아직 시작하지 않은 job에만 JSON 배열을
+등록할 수 있습니다.
+
+job의 기본 우선순위는 experiment+job priority입니다. 대기 중인 후속 job의 우선순위가 더 높으면
+선행 job이 그 값을 상속하고, 같은 우선순위에서는 대기 중인 후손 수가 많은 job을 먼저 배치합니다.
+`plan`의 `effective_priority`, `pending_descendants`로 이를 확인할 수 있습니다. 의존성 성공 조건과
+자원/스토리지/온도 gate는 그대로 적용됩니다.
 
 치환은 `argv`, `cwd`, `env`의 값, `config` 안의 문자열, `input_files[].path`에서 수행합니다.
 `config`의 중첩 객체·배열도 지원합니다. `outputs`에는 치환 값이 아닌 상대 파일명을 지정합니다.

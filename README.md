@@ -23,6 +23,7 @@
 
 - 서버와 GPU 등록: SSH/local 실행, GPU UUID·모델·VRAM 조회, 장치별 사용 허용.
 - 실험 관리: 이름·RQ·job별 목적, 설정값, 예상 자원량, 우선순위, 학습→평가 의존성.
+- 의존성 우선 배치와 검증된 DDP 대안: 후속을 여는 job을 우선하고 서버에 맞는 등록된 GPU 구성을 선택.
 - 실험 그룹 알림: 여러 실험/project를 하나의 campaign으로 묶어 그룹 완료·오류 전이만 통지.
 - HF 결과 공유: campaign별 저장소에 결과를 올리고 다른 서버의 후속 작업이 revision·hash 검증 후 사용.
 - 자원 기반 배치: GPU 사용률·VRAM·compute PID, CPU·RAM·디스크·D-state와 선택적 스토리지 읽기 점검.
@@ -294,6 +295,7 @@ daemon은 전이와 전송 결과를 durable outbox와 event log에 기록하므
 | `set-node-hf NODE FILE` | node의 HF Python과 비밀 token 파일 경로 등록 |
 | `set-job-hf-artifacts JOB FILE` | 첫 전송 전에 export 파일 glob 및 JSON 경로 변환 계약 등록 |
 | `priority JOB_ID VALUE` | 대기 중인 job 우선순위 변경 |
+| `set-job-resource-variants JOB FILE` | 검증된 대체 GPU/VRAM 구성 배열을 대기 job에 등록 |
 | `set-dataset NODE NAME PATH` | 앞으로 실행할 job의 서버별 데이터 경로 등록·변경 |
 | `set-storage-profile NODE FILE` | active attempt는 유지하고 향후 local/NFS 경로·admission을 원자적으로 전환 |
 | `retry-failed JOB_ID` | 실패 증거를 보존하면서 retry budget 1회를 추가하고 재대기 |
@@ -379,7 +381,7 @@ MIG/MPS·선점·자동 checkpoint resume·VRAM peak 자동 profiling은 지원�
 | [STATE_MACHINE.md](docs/STATE_MACHINE.md) | job/attempt/node 상태와 재시도·invalid 처리 |
 | [HF_ARTIFACTS.md](docs/HF_ARTIFACTS.md) | campaign HF 저장소, 자동 upload/download와 checkpoint 경로 변환 |
 | [OPEN_SOURCE_REVIEW.md](docs/OPEN_SOURCE_REVIEW.md) | Slurm·ClearML·Ray 검토와 구현 선택 근거 |
-| [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 98개 테스트와 실제/모의 검증 범위, 미검증 항목 |
+| [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 배치·전송·의존성 회귀 테스트와 실제/모의 검증 범위 |
 | [node.ssh.json](examples/node.ssh.json) | 서버 등록 예제 |
 | [experiment.named-dataset.json](examples/experiment.named-dataset.json) | 서버별 데이터 경로를 사용하는 단일 학습 예제 |
 | [experiment.json](examples/experiment.json) | baseline 학습→평가와 독립 학습을 묶는 DAG 예제 |
