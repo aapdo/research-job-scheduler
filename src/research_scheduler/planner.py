@@ -181,6 +181,10 @@ def fit(job, node, snap, held, history, successful, groups, now):
             continue
         if any(a["spec"]["resources"]["gpu_mode"] == "exclusive" for a in users):
             continue
+        # Do not stack onto a newly reserved job before it proves scientific
+        # progress. The next cycle then observes its real utilization and VRAM.
+        if users and any(not a.get("report", {}).get("ready", False) for a in users):
+            continue
         if len(users) >= p.get("max_shared_jobs_per_gpu", 2):
             continue
         # A process on a scheduler-reserved GPU is treated as owned for packing.

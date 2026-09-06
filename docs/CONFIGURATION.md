@@ -197,6 +197,10 @@ job ID는 DB 전체에서 고유해야 합니다. 모든 dependency가 기존 DB
 첫 job들은 빈 GPU에 분산되고 그 뒤에만 packing됩니다. 80°C 이상에서는 실행 중인 job을
 종료하지 않지만 node에 이미 한 job이 있으면 추가 배치하지 않으며, 85°C 이상에서는 신규 GPU
 작업을 전혀 시작하지 않습니다. 다음 poll에서 온도가 기준 아래로 내려가면 자동으로 다시 후보가 됩니다.
+동일 GPU에 두 번째 job을 예약하기 전에는 첫 attempt의 ready marker와 실제 낮은 GPU 사용률을
+확인하므로, 같은 scheduling cycle에서 아직 시작하지 않은 두 학습을 성급하게 겹치지 않습니다.
+worker 자체도 child 시작 직전에 VRAM·사용률·온도를 다시 확인해야 하며, worker 변경이 필요한
+경우 `replace-job-path-prefix`로 queued job만 새 immutable release에 연결합니다.
 
 ### 치환 값과 환경 변수
 

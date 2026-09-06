@@ -236,6 +236,38 @@ class Store:
             self.event("pending_gpu_mode_changed", job_id, {"before": old, "after": mode})
         return {"job": job_id, "mode": mode, "changed": True}
 
+    def replace_pending_path_prefix(self, job_id, old_prefix, new_prefix):
+        """Rebind an unstarted job to an equivalent immutable release tree."""
+        absolute(old_prefix)
+        absolute(new_prefix)
+        check(old_prefix != new_prefix, "path prefixes must differ")
+
+        def replace(value):
+            if isinstance(value, str):
+                return new_prefix + value[len(old_prefix):] if (
+                    value == old_prefix or value.startswith(old_prefix + "/")) else value
+            if isinstance(value, list):
+                return [replace(v) for v in value]
+            if isinstance(value, dict):
+                return {k: replace(v) for k, v in value.items()}
+            return value
+
+        with self.lock(), self.db:
+            job = next((j for j in self.jobs() if j["id"] == job_id), None)
+            check(job is not None and job["status"] == "queued", "only queued jobs can change release path")
+            spec = dict(job["spec"])
+            for key in ("argv", "cwd", "env", "config", "input_files"):
+                spec[key] = replace(spec[key])
+            spec = experiment_spec({"id": "path-check", "name": "path-check", "rq": "path-check",
+                                    "jobs": [spec]})["jobs"][0]
+            if spec == job["spec"]:
+                return {"job": job_id, "changed": False, "old_prefix": old_prefix,
+                        "new_prefix": new_prefix}
+            self.db.execute("UPDATE jobs SET spec=? WHERE id=?", (dumps(spec), job_id))
+            data = {"old_prefix": old_prefix, "new_prefix": new_prefix}
+            self.event("pending_path_prefix_changed", job_id, data)
+        return {"job": job_id, "changed": True, **data}
+
     def set_gpu_margin_mib(self, node_id, margin_mib):
         """Change future per-GPU safety headroom without touching active attempts."""
         from .schema import number

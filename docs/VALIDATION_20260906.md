@@ -119,8 +119,10 @@ snapshot. This removes stale NFS-era concurrency limits after switching to local
 
 ## Temperature-aware VRAM packing (0.5.0)
 
-The suite passes **80 tests**. New tests cover the 80°C warm node cap, 85°C hard
+The suite passes **81 tests**. New tests cover the 80°C warm node cap, 85°C hard
 launch stop and automatic recovery below the thresholds. Shared jobs spread across
 idle GPUs before packing, count observed scheduler use only once, retain conservative
-accounting on external-process nodes, and obey a two-job per-GPU ceiling. Active
-attempt specifications remain immutable when future node/job policies change.
+accounting on external-process nodes, and obey a two-job per-GPU ceiling. Packing
+waits for the first job's ready marker before adding a second. Queued jobs can be
+auditedly rebound to an equivalent packing-aware immutable release while active
+attempt specifications remain unchanged.

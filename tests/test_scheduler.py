@@ -264,6 +264,20 @@ class SchemaAndStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.set_temperature_policy("a", 85, 80, 1)
 
+    def test_queued_job_can_move_to_equivalent_immutable_release_prefix(self):
+        j = job()
+        j.update(cwd="/releases/old", argv=["/env/python", "/releases/old/tool.py"],
+                 config={"manifest": "/releases/old/config.json"},
+                 input_files=[{"path": "/releases/old/config.json", "sha256": "0" * 64}])
+        self.store.register_experiment(experiment([j]))
+        result = self.store.replace_pending_path_prefix("j", "/releases/old", "/releases/new")
+        spec = self.store.jobs()[0]["spec"]
+        self.assertTrue(result["changed"])
+        self.assertEqual(spec["cwd"], "/releases/new")
+        self.assertEqual(spec["argv"][1], "/releases/new/tool.py")
+        self.assertEqual(spec["config"]["manifest"], "/releases/new/config.json")
+        self.assertEqual(spec["input_files"][0]["path"], "/releases/new/config.json")
+
 
 class PlannerTests(unittest.TestCase):
     def test_filesystem_request_filters_nodes_and_reports_effective_value(self):
@@ -421,6 +435,7 @@ class PlannerTests(unittest.TestCase):
         n["policy"]["allow_gpu_sharing"] = True
         old = reservation(n)
         old["spec"]["resources"]["gpu_mode"] = "shared"
+        old["report"] = {"ready": True}
         s = snapshot(n)
         s["gpus"][0].update(used_mib=6000, processes=[{"pid": 123}])
         # Observed use and the scheduler reservation describe the same owned
@@ -431,7 +446,7 @@ class PlannerTests(unittest.TestCase):
         # are retained conservatively, so this placement no longer fits.
         self.assertEqual(plan([j], n=n, snap=s, attempts=[old])[0]["decision"], "waiting")
 
-    def test_shared_jobs_spread_before_packing_and_obey_per_gpu_cap(self):
+    def test_shared_jobs_spread_then_pack_only_after_ready_and_obey_cap(self):
         n = node()
         n["policy"].update(allow_gpu_sharing=True, max_shared_jobs_per_gpu=2)
         first, second, third = job("first"), job("second"), job("third")
@@ -439,11 +454,16 @@ class PlannerTests(unittest.TestCase):
             j["resources"].update(gpu_mode="shared", vram_mib=5000)
         placements_ = plan([first, second, third], n=n)
         self.assertEqual([p["gpus"] for p in placements_[:2]], [["GPU-a-0"], ["GPU-a-1"]])
-        self.assertEqual(placements_[2]["gpus"], ["GPU-a-0"])
-        fourth = job("fourth")
-        fourth["resources"].update(gpu_mode="shared", vram_mib=5000)
-        p = plan([first, second, third, fourth], n=n)
-        self.assertEqual(p[3]["gpus"], ["GPU-a-1"])
+        self.assertEqual(placements_[2]["decision"], "waiting")
+        active = [reservation(n, "old-0", gpu=0), reservation(n, "old-1", gpu=1)]
+        for attempt in active:
+            attempt["spec"]["resources"].update(gpu_mode="shared", vram_mib=5000)
+            attempt["report"] = {"ready": True}
+        self.assertEqual(plan([third], n=n, attempts=active)[0]["gpus"], ["GPU-a-0"])
+        active.append(reservation(n, "old-2", gpu=0))
+        active[-1]["spec"]["resources"].update(gpu_mode="shared", vram_mib=5000)
+        active[-1]["report"] = {"ready": True}
+        self.assertEqual(plan([third], n=n, attempts=active)[0]["gpus"], ["GPU-a-1"])
 
 
 class FakeProbeTransport(Transport):

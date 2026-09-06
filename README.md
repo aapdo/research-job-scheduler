@@ -260,6 +260,7 @@ research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20 --max-lau
 | `set-gpu-packing NODE enabled|disabled` | scheduler job 간 VRAM 기반 shared 배치 설정 |
 | `set-temperature-policy NODE` | 기본 80°C warm cap·85°C hard launch limit 설정 |
 | `set-job-gpu-mode JOB shared|exclusive` | 대기 중인 job의 GPU packing 방식 변경 |
+| `replace-job-path-prefix JOB OLD NEW` | 대기 중인 job만 packing-aware immutable release로 재바인딩 |
 | `drain-node NODE` | 기존 작업은 유지하고 해당 서버의 신규 배치 중지 |
 | `cancel-pending JOB_ID` | 아직 시작하지 않은 job 취소. 실행 중 프로세스는 종료하지 않음 |
 

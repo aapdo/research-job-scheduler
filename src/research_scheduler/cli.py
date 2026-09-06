@@ -60,6 +60,10 @@ def parser():
     mode = sub.add_parser("set-job-gpu-mode", help="change exclusive/shared mode on a queued job")
     mode.add_argument("job")
     mode.add_argument("mode", choices=["exclusive", "shared"])
+    release = sub.add_parser("replace-job-path-prefix", help="rebind a queued job to an immutable release tree")
+    release.add_argument("job")
+    release.add_argument("old_prefix")
+    release.add_argument("new_prefix")
     sub.add_parser("inventory")
     sub.add_parser("probe", help="read-only server/GPU resource and health probes")
     sub.add_parser("plan", help="refresh resources and show hypothetical placements; no launches")
@@ -157,6 +161,8 @@ def main(argv=None):
                                                   args.warm_max_jobs)
         elif cmd == "set-job-gpu-mode":
             result = store.set_pending_gpu_mode(args.job, args.mode)
+        elif cmd == "replace-job-path-prefix":
+            result = store.replace_pending_path_prefix(args.job, args.old_prefix, args.new_prefix)
         elif cmd == "readmit-node":
             with store.lock(), store.db:
                 if controller.node_health().get(args.node, {}).get("phase") != "unavailable":
