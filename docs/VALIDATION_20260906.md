@@ -81,3 +81,10 @@ utilization and per-device VRAM headroom pass, while a second scheduler reservat
 on the same GPU remains prohibited. Changing this node policy affects future
 placement and does not mutate active attempt snapshots. A future-only GPU margin
 update is also validated independently from active attempt state.
+
+## RSS-aware host RAM admission (0.3.0)
+
+The suite passes **67 tests**. The new case verifies that `MemAvailable` does not
+double-count scheduler-owned memory: only the difference between declared RAM and
+observed process-group RSS is retained as future growth headroom. When RSS cannot
+be attributed, the full reservation remains in force as a fail-closed fallback.

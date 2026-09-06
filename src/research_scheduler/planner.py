@@ -117,14 +117,21 @@ def fit(job, node, snap, held, history, successful, groups, now):
     if any(a["status"] == "unknown" for a in own):
         return "unknown attempt requires reconciliation", []
     used_cpu = sum(a["spec"]["resources"]["cpu"] for a in own)
-    used_ram = sum(a["spec"]["resources"]["ram_mib"] for a in own)
+    # MemAvailable already reflects current RSS. Reserve only each active job's
+    # unrealized growth to its declared peak; without a fresh process-group RSS,
+    # fall back to the full reservation.
+    def remaining_ram(a):
+        requested = a["spec"]["resources"]["ram_mib"]
+        observed = a.get("report", {}).get("rss_mib")
+        return requested if not isinstance(observed, (int, float)) else max(0, requested - observed)
+    outstanding_ram = sum(remaining_ram(a) for a in own)
     cpu_capacity = min(snap["cpu_count"], node.get("cpu_limit", snap["cpu_count"]))
     if req["cpu"] + used_cpu > cpu_capacity:
         return "CPU reservations exhausted", []
     # Deliberately conservative: live available minus reservations. No inferred
     # PID accounting in containers, and no claim that requests are hard limits.
     ram_available = min(snap["ram_available_mib"], node.get("ram_limit_mib", float("inf")))
-    if req["ram_mib"] + used_ram + p["min_free_ram_mib"] > ram_available:
+    if req["ram_mib"] + outstanding_ram + p["min_free_ram_mib"] > ram_available:
         return "RAM reservations/headroom exhausted", []
     group = node["startup_group"]
     if group:

@@ -49,6 +49,27 @@ def group_alive(pgid):
                for x in Path("/proc").iterdir() if x.name.isdigit())
 
 
+def group_rss_mib(pgid):
+    """Resident memory of the scheduler-owned scientific process group."""
+    total_kib = 0
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        info = process(entry.name)
+        if not info or info["pgrp"] != pgid or info["state"] == "Z":
+            continue
+        try:
+            for line in (entry / "status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    total_kib += int(line.split()[1])
+                    break
+        except (OSError, ValueError, IndexError):
+            # A process may exit between /proc reads. Missing attribution makes
+            # admission more conservative at the controller, never less.
+            return None
+    return total_kib / 1024
+
+
 def cpu_sample():
     ticks = [int(x) for x in Path("/proc/stat").read_text().splitlines()[0].split()[1:9]]
     return sum(ticks), ticks[3] + ticks[4]
@@ -191,7 +212,8 @@ def read_status(request):
         boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         if (runner and runner["start"] == state.get("runner_start") and runner["state"] != "Z"
                 and boot == state.get("boot_id")):
-            return state
+            rss = group_rss_mib(state.get("child_pgid", 0))
+            return dict(state, **({"rss_mib": rss} if rss is not None else {}))
         return dict(state, status="unknown", reason="runner absent/rebooted; preserve reservation for reconciliation")
     except (OSError, ValueError, KeyError) as exc:
         return {"status": "unknown", "reason": "unreadable attempt receipt: " + str(exc)}

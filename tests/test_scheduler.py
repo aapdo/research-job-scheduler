@@ -258,6 +258,29 @@ class PlannerTests(unittest.TestCase):
         j["resources"]["ram_mib"] = 999999
         self.assertEqual(plan([j])[0]["decision"], "waiting")
 
+    def test_ram_reservation_subtracts_only_unrealized_growth_from_memavailable(self):
+        n = node()
+        n["policy"]["min_free_ram_mib"] = 4096
+        s = snapshot(n)
+        n["gpus"] = []
+        s["gpus"] = []
+        s["ram_available_mib"] = 65000
+        active = []
+        for i in range(3):
+            a = dict(id="old-" + str(i), job="old-" + str(i), node="a", created=time.time(),
+                     released=True, status="running",
+                     spec=dict(gpus=[], startup_group="", resources=dict(cpu=1, ram_mib=16000,
+                               gpu_mode="exclusive", vram_mib=0)))
+            a["spec"]["resources"]["ram_mib"] = 16000
+            a["report"] = {"rss_mib": 12000}
+            active.append(a)
+        new = job(gpu_count=0, vram=0)
+        new["resources"]["ram_mib"] = 16000
+        self.assertEqual(plan([new], n=n, snap=s, attempts=active)[0]["decision"], "ready")
+        for a in active:
+            a["report"] = {}  # Missing attribution falls back to full reservations.
+        self.assertEqual(plan([new], n=n, snap=s, attempts=active)[0]["decision"], "waiting")
+
     def test_local_dependency_cannot_silently_cross_host(self):
         a, b = node(), node(key="b")
         successful = reservation(a, key="base")
