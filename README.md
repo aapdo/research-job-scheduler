@@ -24,6 +24,7 @@
 - 서버와 GPU 등록: SSH/local 실행, GPU UUID·모델·VRAM 조회, 장치별 사용 허용.
 - 실험 관리: 이름·RQ·job별 목적, 설정값, 예상 자원량, 우선순위, 학습→평가 의존성.
 - 자원 기반 배치: GPU 사용률·VRAM·compute PID, CPU·RAM·디스크·D-state와 선택적 스토리지 읽기 점검.
+- VRAM packing과 온도 보호: 저사용률 GPU에 bounded shared job을 배치하고 80/85°C 단계별 launch 제한.
 - 파일시스템 제약: 실험/job을 `nfs`, `local`, `any`로 지정해 맞는 서버에만 배치.
 - 서버별 데이터셋 경로: 같은 데이터셋 이름을 서버마다 다른 실제 경로로 연결.
 - 실행 기록: 실행별 설정·로그·종료 코드·결과 파일 SHA256, 장애 재시도와 결과 유효성 관리.
@@ -232,6 +233,8 @@ research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20 --max-lau
   자원이 부족한 높은 우선순위 job은 건너뛰고 실행 가능한 독립 job을 먼저 시작할 수 있습니다.
 - 여러 GPU를 요청해도 학습 명령이 자동으로 DDP로 바뀌지는 않습니다. 연구 코드의 launcher를
   `argv`에 직접 지정하고 출력은 `{attempt_dir}` 아래에 저장하세요.
+- `gpu_mode: "shared"`와 node의 `allow_gpu_sharing`을 함께 켜야 같은 GPU에 여러 job이 배치됩니다.
+  스케줄러는 먼저 빈 GPU에 분산한 뒤, 사용률·VRAM·온도·job 수 제한을 모두 통과할 때만 packing합니다.
 
 전체 필드·치환 값·기본값·NFS 정책은 [설정 레퍼런스](docs/CONFIGURATION.md)에 정리했습니다.
 
@@ -254,6 +257,9 @@ research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20 --max-lau
 | `set-gpu NODE UUID enabled|disabled` | active attempt를 바꾸지 않고 향후 GPU 배치 허용 여부 변경 |
 | `set-external-gpu-processes NODE enabled|disabled` | 특정 node에서 외부 PID와 VRAM headroom 기반 공존 허용 |
 | `set-gpu-margin NODE MIB` | 향후 배치에 적용할 GPU별 VRAM 안전 여유 변경 |
+| `set-gpu-packing NODE enabled|disabled` | scheduler job 간 VRAM 기반 shared 배치 설정 |
+| `set-temperature-policy NODE` | 기본 80°C warm cap·85°C hard launch limit 설정 |
+| `set-job-gpu-mode JOB shared|exclusive` | 대기 중인 job의 GPU packing 방식 변경 |
 | `drain-node NODE` | 기존 작업은 유지하고 해당 서버의 신규 배치 중지 |
 | `cancel-pending JOB_ID` | 아직 시작하지 않은 job 취소. 실행 중 프로세스는 종료하지 않음 |
 

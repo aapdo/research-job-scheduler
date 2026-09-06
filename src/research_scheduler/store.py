@@ -177,6 +177,65 @@ class Store:
             self.event("external_gpu_process_admission_changed", node_id, data)
         return {"node": node_id, "changed": True, **data}
 
+    def set_gpu_packing(self, node_id, enabled, max_shared_jobs_per_gpu=2):
+        """Configure future scheduler-owned sharing; active attempts stay frozen."""
+        from .schema import number
+        check(isinstance(enabled, bool), "enabled must be boolean")
+        number(max_shared_jobs_per_gpu, "max_shared_jobs_per_gpu", 1, True)
+        with self.lock(), self.db:
+            n = self.specs("nodes").get(node_id)
+            check(n is not None, "unknown node: " + node_id)
+            changed = (n["policy"].get("allow_gpu_sharing", False) != enabled
+                       or n["policy"].get("max_shared_jobs_per_gpu", 2) != max_shared_jobs_per_gpu)
+            if not changed:
+                return {"node": node_id, "enabled": enabled,
+                        "max_shared_jobs_per_gpu": max_shared_jobs_per_gpu, "changed": False}
+            n["policy"].update(allow_gpu_sharing=enabled,
+                               max_shared_jobs_per_gpu=max_shared_jobs_per_gpu)
+            self.db.execute("UPDATE nodes SET spec=? WHERE id=?", (dumps(node_spec(n)), node_id))
+            self.db.execute("DELETE FROM snapshots WHERE node=?", (node_id,))
+            data = {"enabled": enabled, "max_shared_jobs_per_gpu": max_shared_jobs_per_gpu,
+                    "active_attempts_unchanged": True}
+            self.event("gpu_packing_changed", node_id, data)
+        return {"node": node_id, "changed": True, **data}
+
+    def set_temperature_policy(self, node_id, warm_c=80, hard_c=85, warm_max_jobs=1):
+        """Set future launch limits; this never stops an active attempt."""
+        from .schema import number
+        for key, value in (("warm_c", warm_c), ("hard_c", hard_c)):
+            number(value, key)
+        number(warm_max_jobs, "warm_max_jobs", 1, True)
+        check(warm_c < hard_c, "warm_c must be below hard_c")
+        with self.lock(), self.db:
+            n = self.specs("nodes").get(node_id)
+            check(n is not None, "unknown node: " + node_id)
+            values = {"warm_gpu_temp_c": warm_c, "max_gpu_temp_c": hard_c,
+                      "warm_max_jobs": warm_max_jobs}
+            changed = any(n["policy"].get(key) != value for key, value in values.items())
+            if not changed:
+                return {"node": node_id, "changed": False, **values}
+            n["policy"].update(values)
+            self.db.execute("UPDATE nodes SET spec=? WHERE id=?", (dumps(node_spec(n)), node_id))
+            self.db.execute("DELETE FROM snapshots WHERE node=?", (node_id,))
+            self.event("temperature_policy_changed", node_id,
+                       {**values, "active_attempts_unchanged": True})
+        return {"node": node_id, "changed": True, **values,
+                "active_attempts_unchanged": True}
+
+    def set_pending_gpu_mode(self, job_id, mode):
+        """Change packing mode only for an unstarted/queued job."""
+        check(mode in ("exclusive", "shared"), "invalid gpu_mode")
+        with self.lock(), self.db:
+            job = next((j for j in self.jobs() if j["id"] == job_id), None)
+            check(job is not None and job["status"] == "queued", "only queued jobs can change gpu_mode")
+            old = job["spec"]["resources"]["gpu_mode"]
+            if old == mode:
+                return {"job": job_id, "mode": mode, "changed": False}
+            job["spec"]["resources"]["gpu_mode"] = mode
+            self.db.execute("UPDATE jobs SET spec=? WHERE id=?", (dumps(job["spec"]), job_id))
+            self.event("pending_gpu_mode_changed", job_id, {"before": old, "after": mode})
+        return {"job": job_id, "mode": mode, "changed": True}
+
     def set_gpu_margin_mib(self, node_id, margin_mib):
         """Change future per-GPU safety headroom without touching active attempts."""
         from .schema import number

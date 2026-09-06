@@ -26,6 +26,8 @@ def base_health(node, snap, now):
 
 def gpu_healthy(gpu, node, mode):
     p = node["policy"]
+    if gpu.get("temperature_c") is None or gpu["temperature_c"] >= p.get("max_gpu_temp_c", 85):
+        return False
     if gpu.get("util_percent") is None or gpu["util_percent"] > p["max_gpu_percent"]:
         return False
     if mode == "exclusive":
@@ -122,6 +124,18 @@ def fit(job, node, snap, held, history, successful, groups, now):
                 a["spec"]["node_spec"]["storage_domain"] == node["storage_domain"]):
             return "dependency artifacts on another local filesystem: " + dep, []
     own = [a for a in held if a["node"] == node["id"]]
+    registered = {g["uuid"]: g for g in node["gpus"] if g["enabled"]}
+    if req["gpu_count"]:
+        if not registered:
+            return "not enough enabled GPUs", []
+        observed = {g["uuid"]: g for g in snap["gpus"] if g["uuid"] in registered}
+        if any(gpu not in observed or observed[gpu].get("temperature_c") is None for gpu in registered):
+            return "GPU temperature telemetry unavailable", []
+        hottest = max(observed[gpu]["temperature_c"] for gpu in registered)
+        if hottest >= p.get("max_gpu_temp_c", 85):
+            return "GPU temperature at or above hard launch limit", []
+        if hottest >= p.get("warm_gpu_temp_c", 80) and len(own) >= p.get("warm_max_jobs", 1):
+            return "warm-node job cap reached", []
     if len(own) >= node["max_jobs"]:
         return "node job slots reserved", []
     if any(a["status"] == "unknown" for a in own):
@@ -154,27 +168,36 @@ def fit(job, node, snap, held, history, successful, groups, now):
         starts = [a["created"] for a in history + held if a["spec"].get("startup_group") == group]
         if starts and now - max(starts) < groups[group]["min_start_interval_s"]:
             return "shared-storage start interval", []
-    chosen = []
-    registered = {g["uuid"]: g for g in node["gpus"] if g["enabled"]}
-    for gpu in sorted(snap["gpus"], key=lambda g: g["index"]):
+    candidates = []
+    for gpu in snap["gpus"]:
         if gpu["uuid"] not in registered:
             continue
-        if gpu.get("stable_polls", 0) < p["stable_polls"] or not gpu_healthy(gpu, node, req["gpu_mode"]):
-            continue
         users = [a for a in own if gpu["uuid"] in a["spec"]["gpus"]]
+        required_polls = (p.get("shared_stable_polls", 1)
+                          if req["gpu_mode"] == "shared" and users else p["stable_polls"])
+        if gpu.get("stable_polls", 0) < required_polls or not gpu_healthy(gpu, node, req["gpu_mode"]):
+            continue
         if req["gpu_mode"] == "exclusive" and users:
             continue
         if any(a["spec"]["resources"]["gpu_mode"] == "exclusive" for a in users):
             continue
-        # External GPU processes cannot be reliably mapped through PID namespaces.
-        # Shared mode requires a deliberate separate approval when any are visible.
-        if gpu.get("processes") and not p["allow_external_gpu_processes"]:
+        if len(users) >= p.get("max_shared_jobs_per_gpu", 2):
+            continue
+        # A process on a scheduler-reserved GPU is treated as owned for packing.
+        # A process with no reservation remains external and needs explicit opt-in.
+        if gpu.get("processes") and not users and not p["allow_external_gpu_processes"]:
             continue
         reserved = sum(a["spec"]["resources"]["vram_mib"] for a in users)
-        free = min(gpu["memory_mib"], registered[gpu["uuid"]]["memory_mib"]) - gpu["used_mib"]
-        if req["vram_mib"] + reserved + p["gpu_margin_mib"] > free:
+        total = min(gpu["memory_mib"], registered[gpu["uuid"]]["memory_mib"])
+        # On nodes that disallow external processes, live use and scheduler
+        # reservations describe the same occupants; use the larger value instead
+        # of double-counting. External-process opt-in retains conservative addition.
+        occupied = (max(gpu["used_mib"], reserved) if users and not p["allow_external_gpu_processes"]
+                    else gpu["used_mib"] + reserved)
+        if req["vram_mib"] + occupied + p["gpu_margin_mib"] > total:
             continue
-        chosen.append(gpu["uuid"])
-    if req["gpu_count"] > len(chosen):
+        candidates.append((len(users), occupied, gpu["temperature_c"], gpu["index"], gpu["uuid"]))
+    candidates.sort()
+    if req["gpu_count"] > len(candidates):
         return "not enough healthy GPUs with requested per-device VRAM/ownership", []
-    return "", chosen[:req["gpu_count"]]
+    return "", [row[-1] for row in candidates[:req["gpu_count"]]]

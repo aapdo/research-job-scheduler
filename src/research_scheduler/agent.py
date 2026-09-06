@@ -158,7 +158,7 @@ def probe(node):
     if memory_cgroup is not None:
         result['memory_cgroup'] = memory_cgroup
     try:
-        query = subprocess.check_output(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu",
+        query = subprocess.check_output(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,temperature.gpu",
                                          "--format=csv,noheader,nounits"], text=True, stderr=subprocess.PIPE, timeout=8)
         apps = subprocess.check_output(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_gpu_memory",
                                         "--format=csv,noheader,nounits"], text=True, stderr=subprocess.PIPE, timeout=8)
@@ -168,7 +168,8 @@ def probe(node):
                 processes.setdefault(row[0], []).append({"pid": int(row[1]), "used_mib": row[2]})
         for row in csv.reader(io.StringIO(query), skipinitialspace=True):
             result["gpus"].append(dict(index=int(row[0]), uuid=row[1], name=row[2], memory_mib=float(row[3]),
-                                       used_mib=float(row[4]), util_percent=float(row[5]), processes=processes.get(row[1], [])))
+                                       used_mib=float(row[4]), util_percent=float(row[5]), temperature_c=float(row[6]),
+                                       processes=processes.get(row[1], [])))
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         result["gpus"] = []  # fail closed for GPU admission, still report CPU health
         result["gpu_error"] = str(exc)

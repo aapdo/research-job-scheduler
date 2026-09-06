@@ -85,6 +85,11 @@ node를 drain한 뒤 local replica로 전환하는 경우에는
 | `max_idle_used_mib` | 256 | exclusive GPU 선택 시 허용 기존 VRAM 사용량 |
 | `allow_gpu_sharing` | false | job의 shared GPU 요청 허용 |
 | `allow_external_gpu_processes` | false | compute PID가 보이는 GPU의 shared 배치 허용 |
+| `max_shared_jobs_per_gpu` | 2 | 한 GPU에 허용할 scheduler-owned shared job 상한 |
+| `shared_stable_polls` | 1 | 이미 예약된 GPU에 추가 packing하기 전 필요한 저사용률 관측 수 |
+| `warm_gpu_temp_c` | 80 | 이 온도부터 node 전체 신규 작업 수를 `warm_max_jobs`로 제한 |
+| `max_gpu_temp_c` | 85 | 이 온도 이상이면 해당 node의 신규 GPU 작업을 전부 중지 |
+| `warm_max_jobs` | 1 | warm 상태에서 허용하는 node 전체 active job 수 |
 | `read_probe_path` | 생략 | 선택적 스토리지 읽기 점검 파일 |
 | `read_probe_bytes` | 67108864 | 읽기 점검 크기, 기본 64 MiB |
 | `read_probe_timeout_s` | 10 | 읽기 점검 timeout |
@@ -186,6 +191,12 @@ job ID는 DB 전체에서 고유해야 합니다. 모든 dependency가 기존 DB
 
 `gpu_count: 2`는 두 GPU 메모리를 합쳐 요구를 만족하는 뜻이 아닙니다. 각 GPU가 VRAM 요구를
 충족해야 합니다. DDP launcher와 per-device/global batch는 사용자 명령에 명시합니다.
+
+`shared`는 VRAM만 보고 무조건 겹쳐 실행하지 않습니다. 현재 GPU 사용률이 node의
+`max_gpu_percent` 이하이고, 온도·VRAM margin·`max_shared_jobs_per_gpu`를 통과해야 합니다.
+첫 job들은 빈 GPU에 분산되고 그 뒤에만 packing됩니다. 80°C 이상에서는 실행 중인 job을
+종료하지 않지만 node에 이미 한 job이 있으면 추가 배치하지 않으며, 85°C 이상에서는 신규 GPU
+작업을 전혀 시작하지 않습니다. 다음 poll에서 온도가 기준 아래로 내려가면 자동으로 다시 후보가 됩니다.
 
 ### 치환 값과 환경 변수
 

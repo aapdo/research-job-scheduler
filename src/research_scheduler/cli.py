@@ -48,6 +48,18 @@ def parser():
     margin = sub.add_parser("set-gpu-margin", help="set per-GPU VRAM safety margin for future placement")
     margin.add_argument("node")
     margin.add_argument("mib", type=int)
+    packing = sub.add_parser("set-gpu-packing", help="configure scheduler-owned VRAM packing")
+    packing.add_argument("node")
+    packing.add_argument("state", choices=["enabled", "disabled"])
+    packing.add_argument("--max-shared-jobs-per-gpu", type=int, default=2)
+    temperature = sub.add_parser("set-temperature-policy", help="configure warm/hard launch temperature limits")
+    temperature.add_argument("node")
+    temperature.add_argument("--warm-c", type=float, default=80)
+    temperature.add_argument("--hard-c", type=float, default=85)
+    temperature.add_argument("--warm-max-jobs", type=int, default=1)
+    mode = sub.add_parser("set-job-gpu-mode", help="change exclusive/shared mode on a queued job")
+    mode.add_argument("job")
+    mode.add_argument("mode", choices=["exclusive", "shared"])
     sub.add_parser("inventory")
     sub.add_parser("probe", help="read-only server/GPU resource and health probes")
     sub.add_parser("plan", help="refresh resources and show hypothetical placements; no launches")
@@ -137,6 +149,14 @@ def main(argv=None):
             result = store.set_external_gpu_processes_allowed(args.node, args.state == "enabled")
         elif cmd == "set-gpu-margin":
             result = store.set_gpu_margin_mib(args.node, args.mib)
+        elif cmd == "set-gpu-packing":
+            result = store.set_gpu_packing(args.node, args.state == "enabled",
+                                           args.max_shared_jobs_per_gpu)
+        elif cmd == "set-temperature-policy":
+            result = store.set_temperature_policy(args.node, args.warm_c, args.hard_c,
+                                                  args.warm_max_jobs)
+        elif cmd == "set-job-gpu-mode":
+            result = store.set_pending_gpu_mode(args.job, args.mode)
         elif cmd == "readmit-node":
             with store.lock(), store.db:
                 if controller.node_health().get(args.node, {}).get("phase") != "unavailable":

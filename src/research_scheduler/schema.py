@@ -88,21 +88,28 @@ def node_spec(raw):
     p = n["policy"]
     fields(p, "stable_polls max_snapshot_age_s max_cpu_percent max_gpu_percent min_free_ram_mib "
            "min_free_disk_mib gpu_margin_mib max_idle_used_mib allow_gpu_sharing "
-           "allow_external_gpu_processes read_probe_path read_probe_bytes read_probe_timeout_s")
+           "allow_external_gpu_processes max_shared_jobs_per_gpu warm_gpu_temp_c max_gpu_temp_c "
+           "warm_max_jobs shared_stable_polls read_probe_path read_probe_bytes read_probe_timeout_s")
     defaults = dict(stable_polls=3, max_snapshot_age_s=60, max_cpu_percent=90,
                     max_gpu_percent=10, min_free_ram_mib=1024, min_free_disk_mib=1024,
                     gpu_margin_mib=1024, max_idle_used_mib=256, allow_gpu_sharing=False,
-                    allow_external_gpu_processes=False, read_probe_bytes=64*1024*1024,
+                    allow_external_gpu_processes=False, max_shared_jobs_per_gpu=2,
+                    warm_gpu_temp_c=80, max_gpu_temp_c=85, warm_max_jobs=1, shared_stable_polls=1,
+                    read_probe_bytes=64*1024*1024,
                     read_probe_timeout_s=10)
     for k, v in defaults.items():
         p.setdefault(k, v)
         if isinstance(v, bool):
             check(isinstance(p[k], bool), k + " must be boolean")
         else:
-            number(p[k], k, 1 if k in ("stable_polls", "max_snapshot_age_s", "read_probe_timeout_s") else 0,
-                   k in ("stable_polls", "read_probe_bytes"))
+            number(p[k], k, 1 if k in ("stable_polls", "max_snapshot_age_s", "read_probe_timeout_s",
+                                       "max_shared_jobs_per_gpu", "warm_max_jobs", "shared_stable_polls") else 0,
+                   k in ("stable_polls", "read_probe_bytes", "max_shared_jobs_per_gpu", "warm_max_jobs",
+                         "shared_stable_polls"))
     for k in ("max_cpu_percent", "max_gpu_percent"):
         check(p[k] <= 100, k + " must be <=100")
+    check(p["warm_gpu_temp_c"] < p["max_gpu_temp_c"],
+          "warm_gpu_temp_c must be below max_gpu_temp_c")
     if "read_probe_path" in p:
         absolute(p["read_probe_path"])
     r = n["recovery"]

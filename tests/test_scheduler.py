@@ -32,7 +32,8 @@ def snapshot(n, now=None):
     return dict(received_at=now or time.time(), stable_polls=3, last_counted_at=time.time(),
                 cpu_percent=10, cpu_count=16, ram_available_mib=64000, disk_free_mib=100000,
                 read_ok=True, d_state=0, assets={},
-                gpus=[dict(g, used_mib=0, util_percent=0, processes=[], stable_polls=3) for g in n["gpus"]])
+                gpus=[dict(g, used_mib=0, util_percent=0, temperature_c=35,
+                           processes=[], stable_polls=3) for g in n["gpus"]])
 
 
 def job(key="j", gpu_count=1, vram=10000, priority=0, deps=None):
@@ -245,6 +246,24 @@ class SchemaAndStoreTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.store.set_gpu_margin_mib("a", value)
 
+    def test_gpu_packing_temperature_policy_and_pending_mode_are_audited(self):
+        n = node()
+        self.store.register_node(n)
+        self.assertTrue(self.store.set_gpu_packing("a", True, 2)["changed"])
+        self.assertFalse(self.store.set_temperature_policy("a", 80, 85, 1)["changed"])
+        self.assertTrue(self.store.set_temperature_policy("a", 79, 85, 1)["changed"])
+        current = self.store.specs("nodes")["a"]["policy"]
+        self.assertTrue(current["allow_gpu_sharing"])
+        self.assertEqual((current["max_shared_jobs_per_gpu"], current["warm_gpu_temp_c"],
+                          current["max_gpu_temp_c"], current["warm_max_jobs"]), (2, 79, 85, 1))
+        self.store.register_experiment(experiment([job()]))
+        self.assertTrue(self.store.set_pending_gpu_mode("j", "shared")["changed"])
+        self.assertEqual(self.store.jobs()[0]["spec"]["resources"]["gpu_mode"], "shared")
+        with self.assertRaises(ValueError):
+            self.store.set_pending_gpu_mode("j", "invalid")
+        with self.assertRaises(ValueError):
+            self.store.set_temperature_policy("a", 85, 80, 1)
+
 
 class PlannerTests(unittest.TestCase):
     def test_filesystem_request_filters_nodes_and_reports_effective_value(self):
@@ -289,6 +308,19 @@ class PlannerTests(unittest.TestCase):
             s = snapshot(n)
             s[key] = value
             self.assertEqual(plan([job()], n=n, snap=s)[0]["decision"], "waiting", key)
+
+    def test_temperature_hard_limit_and_warm_node_cap_recover_automatically(self):
+        n = node()
+        s = snapshot(n)
+        s["gpus"][0]["temperature_c"] = 85
+        self.assertIn("hard launch limit", plan([job()], n=n, snap=s)[0]["reasons"]["a"])
+        s["gpus"][0]["temperature_c"] = 80
+        self.assertEqual(plan([job()], n=n, snap=s)[0]["decision"], "ready")
+        self.assertIn("warm-node job cap", plan([job()], n=n, snap=s,
+                      attempts=[reservation(n)])[0]["reasons"]["a"])
+        s["gpus"][0]["temperature_c"] = 79
+        self.assertEqual(plan([job()], n=n, snap=s,
+                         attempts=[reservation(n)])[0]["decision"], "ready")
 
     def test_vram_per_device_not_sum(self):
         self.assertEqual(plan([job(gpu_count=2, vram=30000)])[0]["decision"], "waiting")
@@ -390,9 +422,28 @@ class PlannerTests(unittest.TestCase):
         old = reservation(n)
         old["spec"]["resources"]["gpu_mode"] = "shared"
         s = snapshot(n)
-        s["gpus"][0]["used_mib"] = 6000
-        # 24k - 6k observed - 10k reserved - 1k margin = 7k < 8k
+        s["gpus"][0].update(used_mib=6000, processes=[{"pid": 123}])
+        # Observed use and the scheduler reservation describe the same owned
+        # process, so 10k reserved + 8k new + 1k margin fits in 24k.
+        self.assertEqual(plan([j], n=n, snap=s, attempts=[old])[0]["decision"], "ready")
+        n["policy"]["allow_external_gpu_processes"] = True
+        # With external-process opt-in, attribution is ambiguous and both values
+        # are retained conservatively, so this placement no longer fits.
         self.assertEqual(plan([j], n=n, snap=s, attempts=[old])[0]["decision"], "waiting")
+
+    def test_shared_jobs_spread_before_packing_and_obey_per_gpu_cap(self):
+        n = node()
+        n["policy"].update(allow_gpu_sharing=True, max_shared_jobs_per_gpu=2)
+        first, second, third = job("first"), job("second"), job("third")
+        for j in (first, second, third):
+            j["resources"].update(gpu_mode="shared", vram_mib=5000)
+        placements_ = plan([first, second, third], n=n)
+        self.assertEqual([p["gpus"] for p in placements_[:2]], [["GPU-a-0"], ["GPU-a-1"]])
+        self.assertEqual(placements_[2]["gpus"], ["GPU-a-0"])
+        fourth = job("fourth")
+        fourth["resources"].update(gpu_mode="shared", vram_mib=5000)
+        p = plan([first, second, third, fourth], n=n)
+        self.assertEqual(p[3]["gpus"], ["GPU-a-1"])
 
 
 class FakeProbeTransport(Transport):

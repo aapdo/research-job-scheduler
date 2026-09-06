@@ -116,3 +116,11 @@ terminal and unchanged. Queued, running and successful jobs are rejected.
 The same 74-test suite now also asserts that `max_jobs` can be changed as part of
 the future-only storage profile while an active attempt keeps its original node
 snapshot. This removes stale NFS-era concurrency limits after switching to local I/O.
+
+## Temperature-aware VRAM packing (0.5.0)
+
+The suite passes **80 tests**. New tests cover the 80°C warm node cap, 85°C hard
+launch stop and automatic recovery below the thresholds. Shared jobs spread across
+idle GPUs before packing, count observed scheduler use only once, retain conservative
+accounting on external-process nodes, and obey a two-job per-GPU ceiling. Active
+attempt specifications remain immutable when future node/job policies change.
