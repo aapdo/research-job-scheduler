@@ -114,13 +114,13 @@ class Store:
     def set_storage_profile(self, node_id, raw):
         """Change only future storage admission while attempts keep frozen specs."""
         fields(raw, "filesystem work_root storage_domain startup_group datasets assets "
-               "read_probe_path read_probe_bytes enabled")
+               "read_probe_path read_probe_bytes enabled max_jobs")
         with self.lock(), self.db:
             current = self.specs("nodes").get(node_id)
             check(current is not None, "unknown node: " + node_id)
             candidate = json.loads(dumps(current))
             for key in ("filesystem", "work_root", "storage_domain", "startup_group",
-                        "datasets", "assets", "enabled"):
+                        "datasets", "assets", "enabled", "max_jobs"):
                 if key in raw:
                     candidate[key] = raw[key]
             policy = dict(candidate["policy"])
@@ -140,7 +140,8 @@ class Store:
             data = {"changed": True, "active_attempts_unchanged": True,
                     "filesystem": candidate["filesystem"], "work_root": candidate["work_root"],
                     "storage_domain": candidate["storage_domain"],
-                    "startup_group": candidate["startup_group"], "enabled": candidate["enabled"]}
+                    "startup_group": candidate["startup_group"], "enabled": candidate["enabled"],
+                    "max_jobs": candidate["max_jobs"]}
             self.event("node_storage_profile_changed", node_id, data)
         return {"node": node_id, **data}
 

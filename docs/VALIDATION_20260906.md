@@ -110,3 +110,9 @@ immutable original filesystem, paths and node snapshot.
 The suite passes **74 tests**. A failed job can be explicitly requeued with an
 audited additional attempt budget while the failed attempt and its evidence remain
 terminal and unchanged. Queued, running and successful jobs are rejected.
+
+## Local-profile capacity transition (0.4.3)
+
+The same 74-test suite now also asserts that `max_jobs` can be changed as part of
+the future-only storage profile while an active attempt keeps its original node
+snapshot. This removes stale NFS-era concurrency limits after switching to local I/O.

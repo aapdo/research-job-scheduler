@@ -208,11 +208,12 @@ class SchemaAndStoreTests(unittest.TestCase):
             "filesystem": "nfs", "work_root": "/tmp/new-runs", "storage_domain": "shared",
             "startup_group": "shared", "datasets": {"data": "/tmp/data"},
             "assets": {}, "read_probe_path": "/tmp/probe", "read_probe_bytes": 1024,
-            "enabled": True})
+            "enabled": True, "max_jobs": 6})
         current = self.store.specs("nodes")["a"]
         frozen = self.store.attempts()[0]["spec"]["node_spec"]
         self.assertTrue(result["changed"])
         self.assertEqual((current["filesystem"], current["work_root"]), ("nfs", "/tmp/new-runs"))
+        self.assertEqual(current["max_jobs"], 6)
         self.assertEqual((frozen["filesystem"], frozen["work_root"]), ("local", n["work_root"]))
         self.assertIsNone(self.store.db.execute("SELECT data FROM snapshots WHERE node='a'").fetchone())
 

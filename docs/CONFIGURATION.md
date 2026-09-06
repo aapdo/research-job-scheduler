@@ -56,7 +56,7 @@ child 실행 직전 다시 확인합니다. 같은 이름이 내용 동일성을
 
 node를 drain한 뒤 local replica로 전환하는 경우에는
 `set-storage-profile NODE PROFILE.json`으로 `filesystem`, `work_root`, `storage_domain`,
-`startup_group`, `datasets`, `assets`, 선택적 read probe와 `enabled`를 한 번에 갱신할 수 있습니다.
+`startup_group`, `datasets`, `assets`, 선택적 read probe, `enabled`, `max_jobs`를 한 번에 갱신할 수 있습니다.
 이미 실행 중인 attempt는 등록 당시의 node/path snapshot을 계속 사용하며, 변경은 신규 attempt에만
 적용됩니다. 변경 직후 이전 resource snapshot은 폐기되고 새 profile로 다시 probe합니다.
 
