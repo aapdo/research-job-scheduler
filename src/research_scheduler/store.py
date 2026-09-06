@@ -111,6 +111,23 @@ class Store:
             self.event("dataset_path_registered", node_id, {"dataset": name, "path": path})
         return {"node": node_id, "dataset": name, "path": path}
 
+    def set_gpu_enabled(self, node_id, gpu_uuid, enabled):
+        """Change future admission without mutating an active attempt snapshot."""
+        check(isinstance(enabled, bool), "enabled must be boolean")
+        with self.lock(), self.db:
+            n = self.specs("nodes").get(node_id)
+            check(n is not None, "unknown node: " + node_id)
+            gpu = next((g for g in n["gpus"] if g["uuid"] == gpu_uuid), None)
+            check(gpu is not None, "unknown GPU UUID on node: " + gpu_uuid)
+            if gpu["enabled"] == enabled:
+                return {"node": node_id, "gpu": gpu_uuid, "enabled": enabled, "changed": False}
+            gpu["enabled"] = enabled
+            self.db.execute("UPDATE nodes SET spec=? WHERE id=?", (dumps(node_spec(n)), node_id))
+            self.db.execute("DELETE FROM snapshots WHERE node=?", (node_id,))
+            data = {"gpu": gpu_uuid, "enabled": enabled, "active_attempts_unchanged": True}
+            self.event("gpu_enabled_changed", node_id, data)
+        return {"node": node_id, "changed": True, **data}
+
     def register_experiment(self, raw):
         e = experiment_spec(raw)
         with self.lock(), self.db:

@@ -166,12 +166,14 @@ research-scheduler --db "$SCHEDULER_DB" status
 ### 6. 실행
 
 ```bash
-research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20
+research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20 --max-launches-per-cycle 8
 ```
 
-20초 대기 간격으로 상태를 확인하고 배치합니다. 한 cycle에는 최대 1개의 신규 job을 시작하고,
-이미 시작된 job들은 병렬 실행됩니다. 조회·재시도 시간만큼 실제 cycle은 길어질 수 있습니다.
-한 번만 배치하려면 `tick --execute`, 실행 없이 반복 확인하려면 `daemon --interval 20`을 사용합니다.
+20초 대기 간격으로 상태를 확인하고 배치합니다. 한 cycle에는 기본 최대 8개의 신규 job을
+순서대로 검증·시작하며, 이미 시작된 job들도 병렬 실행됩니다. 공유 시작 그룹은 이 값과 무관하게
+그룹 규칙을 유지합니다. 조회·재시도 시간만큼 실제 cycle은 길어질 수 있습니다.
+상한은 `--max-launches-per-cycle`로 조절할 수 있습니다. 한 번만 배치하려면 `tick --execute`,
+실행 없이 반복 확인하려면 `daemon --interval 20`을 사용합니다.
 
 터미널을 닫아도 운영하려면 전용 tmux 세션 안에서 설치 환경과 `SCHEDULER_DB`를 설정하고 위 명령을
 실행한 뒤 detach하세요. daemon을 Ctrl+C 또는 SIGTERM으로 종료하면 신규 배치를 멈추지만,
@@ -227,6 +229,7 @@ research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20
 | `events` | 등록·설정 변경·장애·실행 상태 전이 이력 확인 |
 | `priority JOB_ID VALUE` | 대기 중인 job 우선순위 변경 |
 | `set-dataset NODE NAME PATH` | 앞으로 실행할 job의 서버별 데이터 경로 등록·변경 |
+| `set-gpu NODE UUID enabled|disabled` | active attempt를 바꾸지 않고 향후 GPU 배치 허용 여부 변경 |
 | `drain-node NODE` | 기존 작업은 유지하고 해당 서버의 신규 배치 중지 |
 | `cancel-pending JOB_ID` | 아직 시작하지 않은 job 취소. 실행 중 프로세스는 종료하지 않음 |
 
@@ -299,7 +302,7 @@ MIG/MPS·선점·자동 checkpoint resume·VRAM peak 자동 profiling은 지원�
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | 서버·job 필드, 기본값, 치환 값, GPU 공유 및 NFS 설정 |
 | [STATE_MACHINE.md](docs/STATE_MACHINE.md) | job/attempt/node 상태와 재시도·invalid 처리 |
 | [OPEN_SOURCE_REVIEW.md](docs/OPEN_SOURCE_REVIEW.md) | Slurm·ClearML·Ray 검토와 구현 선택 근거 |
-| [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 56개 테스트와 실제/모의 검증 범위, 미검증 항목 |
+| [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 63개 테스트와 실제/모의 검증 범위, 미검증 항목 |
 | [node.ssh.json](examples/node.ssh.json) | 서버 등록 예제 |
 | [experiment.named-dataset.json](examples/experiment.named-dataset.json) | 서버별 데이터 경로를 사용하는 단일 학습 예제 |
 | [experiment.json](examples/experiment.json) | baseline 학습→평가와 독립 학습을 묶는 DAG 예제 |

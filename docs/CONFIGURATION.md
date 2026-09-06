@@ -31,9 +31,9 @@ RAM·VRAM 단위는 MiB, 시간 단위는 초입니다. 지원하지 않는 필�
 GPU 항목에는 `uuid`, `index`, `memory_mib`를 포함하고 `name`, `enabled`를 지정할 수 있습니다.
 `enabled` 기본값은 false입니다. 전체 NVIDIA GPU UUID를 사용하며 MIG 장치는 지원하지 않습니다.
 
-`register-node`로 전체 설정을 교체하거나 `set-gpu`/`discover --apply`로 GPU 등록을 변경하는
-작업은 active/unknown attempt가 없는 시점에 수행합니다. `drain-node`와 `set-dataset`은
-이미 생성된 attempt를 수정하지 않으므로 실행 중에도 사용할 수 있습니다.
+`register-node`로 전체 설정을 교체하거나 `discover --apply`로 GPU 목록을 다시 찾는 작업은
+active/unknown attempt가 없는 시점에 수행합니다. `set-gpu`, `drain-node`, `set-dataset`은
+향후 admission만 바꾸고 이미 생성된 attempt의 서버·GPU·경로 snapshot은 수정하지 않습니다.
 
 ### 서버별 데이터셋 경로
 

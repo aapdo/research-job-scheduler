@@ -64,3 +64,11 @@ verified the resolved path in argv, nested JSON config and environment variables
 A pre-start disappearance test confirmed that the scientific child is not launched.
 These tests use temporary local datasets and synthetic machine telemetry; no real
 research dataset was copied, modified, registered or trained on during this update.
+
+## Admission utilization update (0.2.0)
+
+The expanded suite passes **63 tests**. It also covers bounded multi-launch cycles, preservation of shared-storage
+cold-start serialization while local jobs fill independent slots, and future-only
+GPU enablement changes while another attempt is active. Multi-launch remains
+sequentially revalidated before each reservation; it does not bypass GPU ownership,
+VRAM, D-state, dataset or startup-group gates.

@@ -250,7 +250,32 @@ class Controller:
         request["spec_sha256"] = hashlib.sha256(dumps(request).encode()).hexdigest()
         return request
 
-    def tick(self, execute=False, refresh=True):
+    def _launch(self, chosen):
+        request = self.request(chosen)
+        with self.store.db:
+            self.store.db.execute("INSERT INTO attempts(id,job,node,spec,status,created) VALUES(?,?,?,?,?,?)",
+                                  (request["id"], request["job"], chosen["node"], dumps(request), "starting", time.time()))
+            self.store.db.execute("UPDATE jobs SET status='starting',reason='' WHERE id=?", (request["job"],))
+            self.store.event("attempt_reserved", request["id"], chosen)
+        try:
+            report = self.transport.call(request["node_spec"], "launch", request)
+            # A lost ACK after the remote process starts is reconciled by ID.
+            status = report.get("status", "unknown")
+            if status not in ACTIVE:
+                status = "unknown"
+        except Exception as exc:
+            report, status = {"reason": str(exc)}, "unknown"
+        with self.store.db:
+            self.store.db.execute("UPDATE attempts SET status=?,report=? WHERE id=?",
+                                  (status, dumps(report), request["id"]))
+            self.store.db.execute("UPDATE jobs SET status=?,reason=? WHERE id=?",
+                                  (status, report.get("reason", ""), request["job"]))
+            self.store.event("launch_ack", request["id"], report)
+        return dict(chosen, attempt=request["id"], status=status)
+
+    def tick(self, execute=False, refresh=True, max_launches=1):
+        if not isinstance(max_launches, int) or isinstance(max_launches, bool) or max_launches < 1:
+            raise ValueError("max_launches must be a positive integer")
         with self.store.lock():
             if refresh:
                 self.refresh()
@@ -258,33 +283,25 @@ class Controller:
             self.reconcile()
             plan = self.plan()
             if not execute:
-                return {"mode": "dry-run", "plan": plan}
-            chosen = next((p for p in plan if p["decision"] == "ready"), None)
-            if chosen is None:
-                return {"mode": "execute", "plan": plan, "launched": None}
-            # Last-moment fresh check, before committing a reservation. An external
-            # scheduler can still race us: exclusive fleet ownership is not enforced.
-            self.refresh([chosen["node"]])
-            self.invalidate_unavailable()
-            fresh = next((p for p in self.plan() if p["job"] == chosen["job"]), {})
-            if fresh.get("decision") != "ready" or fresh.get("node") != chosen["node"] or fresh.get("gpus") != chosen["gpus"]:
-                return {"mode": "execute", "plan": self.plan(), "launched": None}
-            request = self.request(chosen)
-            with self.store.db:
-                self.store.db.execute("INSERT INTO attempts(id,job,node,spec,status,created) VALUES(?,?,?,?,?,?)",
-                                      (request["id"], request["job"], chosen["node"], dumps(request), "starting", time.time()))
-                self.store.db.execute("UPDATE jobs SET status='starting',reason='' WHERE id=?", (request["job"],))
-                self.store.event("attempt_reserved", request["id"], chosen)
-            try:
-                report = self.transport.call(request["node_spec"], "launch", request)
-                # A lost ACK after the remote process starts is reconciled by ID.
-                status = report.get("status", "unknown")
-                if status not in ACTIVE:
-                    status = "unknown"
-            except Exception as exc:
-                report, status = {"reason": str(exc)}, "unknown"
-            with self.store.db:
-                self.store.db.execute("UPDATE attempts SET status=?,report=? WHERE id=?", (status, dumps(report), request["id"]))
-                self.store.db.execute("UPDATE jobs SET status=?,reason=? WHERE id=?", (status, report.get("reason", ""), request["job"]))
-                self.store.event("launch_ack", request["id"], report)
-            return {"mode": "execute", "launched": dict(chosen, attempt=request["id"], status=status), "plan": plan}
+                return {"mode": "dry-run", "plan": plan, "launches": []}
+            launches, skipped = [], set()
+            while len(launches) < max_launches:
+                current = self.plan()
+                chosen = next((p for p in current
+                               if p["decision"] == "ready" and p["job"] not in skipped), None)
+                if chosen is None:
+                    break
+                # Revalidate only the selected node immediately before reservation.
+                # Existing reservations make subsequent replans account for every
+                # launch in this cycle; startup groups therefore remain serialized.
+                self.refresh([chosen["node"]])
+                self.invalidate_unavailable()
+                fresh = next((p for p in self.plan() if p["job"] == chosen["job"]), {})
+                if (fresh.get("decision") != "ready" or fresh.get("node") != chosen["node"]
+                        or fresh.get("gpus") != chosen["gpus"]):
+                    skipped.add(chosen["job"])
+                    continue
+                launches.append(self._launch(chosen))
+            final_plan = self.plan()
+            return {"mode": "execute", "launched": launches[0] if launches else None,
+                    "launches": launches, "plan": plan, "final_plan": final_plan}

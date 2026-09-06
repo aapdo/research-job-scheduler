@@ -49,9 +49,11 @@ def parser():
     c.add_argument("job")
     t = sub.add_parser("tick", help="one scheduling cycle (dry-run unless --execute)")
     t.add_argument("--execute", action="store_true")
+    t.add_argument("--max-launches-per-cycle", type=int, default=8)
     d = sub.add_parser("daemon", help="foreground loop; stop controller without stopping children")
     d.add_argument("--execute", action="store_true")
     d.add_argument("--interval", type=float, default=20)
+    d.add_argument("--max-launches-per-cycle", type=int, default=8)
     return p
 
 
@@ -107,10 +109,7 @@ def main(argv=None):
                 store.event(cmd, args.node, {"enabled": node["enabled"]})
             result = node
         elif cmd == "set-gpu":
-            node = store.specs("nodes")[args.node]
-            gpu = next(g for g in node["gpus"] if g["uuid"] == args.uuid)
-            gpu["enabled"] = args.state == "enabled"
-            result = store.register_node(node)
+            result = store.set_gpu_enabled(args.node, args.uuid, args.state == "enabled")
         elif cmd == "set-dataset":
             result = store.set_dataset(args.node, args.dataset, args.path)
         elif cmd == "readmit-node":
@@ -146,16 +145,19 @@ def main(argv=None):
         elif cmd == "events":
             result = [dict(r, data=json.loads(r["data"])) for r in store.db.execute("SELECT * FROM events ORDER BY seq")]
         elif cmd == "tick":
-            result = controller.tick(execute=args.execute)
+            result = controller.tick(execute=args.execute, max_launches=args.max_launches_per_cycle)
         elif cmd == "daemon":
             if args.interval < 2:
                 raise ValueError("minimum interval is 2 seconds")
+            if args.max_launches_per_cycle < 1:
+                raise ValueError("max launches per cycle must be positive")
             stop = threading.Event()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 signal.signal(sig, lambda *_: stop.set())
             while not stop.is_set():
                 try:
-                    print(dumps(controller.tick(execute=args.execute)), flush=True)
+                    print(dumps(controller.tick(execute=args.execute,
+                                                max_launches=args.max_launches_per_cycle)), flush=True)
                 except Exception as exc:
                     print(dumps({"controller_error": str(exc), "action": "no new launch in this cycle"}), flush=True)
                 stop.wait(args.interval)

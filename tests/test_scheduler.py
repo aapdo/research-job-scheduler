@@ -131,6 +131,23 @@ class SchemaAndStoreTests(unittest.TestCase):
         self.assertEqual(self.store.jobs()[0]["spec"]["priority"], 99)
         self.assertEqual(self.store.db.execute("SELECT kind FROM events ORDER BY seq DESC LIMIT 1").fetchone()[0], "priority_changed")
 
+    def test_gpu_enablement_can_change_for_future_jobs_while_attempt_is_active(self):
+        n = node()
+        self.store.register_node(n)
+        request = reservation(n)
+        request["spec"]["node_spec"] = copy.deepcopy(n)
+        with self.store.db:
+            self.store.db.execute("INSERT INTO experiments VALUES(?,?)", ("e", dumps(experiment([job()]))) )
+            self.store.db.execute("INSERT INTO jobs(id,experiment,spec,status,created) VALUES(?,?,?,?,?)",
+                                  ("old", "e", dumps(job("old")), "running", time.time()))
+            self.store.db.execute("INSERT INTO attempts(id,job,node,spec,status,created) VALUES(?,?,?,?,?,?)",
+                                  ("old", "old", "a", dumps(request["spec"]), "running", time.time()))
+        result = self.store.set_gpu_enabled("a", n["gpus"][1]["uuid"], False)
+        self.assertTrue(result["changed"])
+        self.assertFalse(self.store.specs("nodes")["a"]["gpus"][1]["enabled"])
+        self.assertTrue(self.store.attempts()[0]["spec"]["node_spec"]["gpus"][1]["enabled"])
+        self.assertFalse(self.store.set_gpu_enabled("a", n["gpus"][1]["uuid"], False)["changed"])
+
 
 class PlannerTests(unittest.TestCase):
     def test_priority_backfill_skips_infeasible(self):
@@ -293,6 +310,31 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(result["plan"][0]["decision"], "ready")
         self.assertEqual(self.store.attempts(), [])
         self.assertFalse((self.root / "runs with spaces").exists())
+
+    def test_multi_launch_fills_independent_local_slots_in_one_cycle(self):
+        jobs = [self.cpu_job("job-" + str(i)) for i in range(4)]
+        self.store.register_experiment(experiment(jobs))
+        result = self.controller.tick(execute=True, max_launches=3)
+        self.assertEqual(len(result["launches"]), 3)
+        self.assertEqual(len(self.store.attempts()), 3)
+        self.assertEqual(len({a["job"] for a in self.store.attempts()}), 3)
+        self.finish()
+
+    def test_multi_launch_preserves_shared_startup_group_serialization(self):
+        n = copy.deepcopy(self.n)
+        n["startup_group"] = "storage"
+        self.store.register_node(n)
+        self.store.register_group({"id": "storage", "min_start_interval_s": 0})
+        self.store.register_experiment(experiment([self.cpu_job("one"), self.cpu_job("two")]))
+        result = self.controller.tick(execute=True, max_launches=8)
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertEqual(len(self.store.attempts()), 1)
+        self.finish()
+
+    def test_multi_launch_argument_validation(self):
+        for value in (0, -1, 1.5, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.controller.tick(execute=True, max_launches=value)
 
     def test_lost_ack_and_controller_restart_do_not_duplicate(self):
         self.transport.lost_ack = True
