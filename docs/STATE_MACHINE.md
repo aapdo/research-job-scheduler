@@ -1,6 +1,6 @@
 # 상태 머신과 결과 권위
 
-구현: `src/research_scheduler/states.py`, `controller.py`, `store.py`.
+구현: `src/research_scheduler/states.py`, `controller.py`, `store.py`, `notifications.py`.
 Job은 완료해야 할 논리 작업, attempt는 실제 실행 한 번, node는 실행 가능성을 뜻합니다.
 
 ## Job
@@ -88,6 +88,25 @@ D-state가 계속 있으면 지속 상태입니다.
 `unavailable`은 sticky합니다. probe 자동 재시도를 멈추고 기존 attempt를 차단합니다.
 운영자가 서버를 확인한 뒤 `readmit-node`를 사용하면 새 health poll부터 시작합니다.
 이 명령은 어떤 서버 복구나 프로세스 종료도 수행하지 않습니다.
+
+## Campaign (실험 그룹)
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: 포함 job 없음 또는 아직 시작 조건 없음
+    pending --> running: queued/starting/running/unknown job 존재
+    running --> error: failed/blocked job 발생 + 오류 알림 1회
+    error --> running: 운영자가 재시도하여 실패 상태 해소
+    running --> complete: 모든 job succeeded/cancelled + 완료 알림 1회
+    pending --> complete: 이미 끝난 그룹을 처음 등록 + 완료 알림 1회
+    pending --> error: 이미 실패한 그룹을 처음 등록 + 오류 알림 1회
+```
+
+상태 우선순위는 `error`가 `running`보다 높습니다. 같은 error 상태에서 실패 job 수만 바뀌는 것은
+상태 전이가 아니므로 추가 알림을 만들지 않습니다. campaign runtime의 generation과 durable
+outbox ID가 controller 재시작 및 중복 poll에도 같은 전이를 한 번만 전송하게 합니다.
+webhook이 설정되지 않았거나 일시적으로 실패해도 관찰 상태와 pending outbox는 유지됩니다.
+비밀 URL은 campaign 상태 머신의 일부가 아니며 DB에 저장하지 않습니다.
 
 ## 운영상 주의
 

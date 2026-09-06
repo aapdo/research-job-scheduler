@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 
 from .controller import Controller
+from .notifications import poll_campaigns, register_campaign, status as campaign_status
 from .store import Store, dumps
 
 
@@ -18,7 +19,7 @@ def parser():
     p = argparse.ArgumentParser(description="Generic research scheduler (Linux, NVIDIA, SSH/local)")
     p.add_argument("--db", required=True, help="SQLite path on the control machine's LOCAL disk")
     sub = p.add_subparsers(dest="command", required=True)
-    for name in ("register-node", "register-group", "register-experiment"):
+    for name in ("register-node", "register-group", "register-experiment", "register-campaign"):
         sub.add_parser(name).add_argument("file", help="JSON specification")
     d = sub.add_parser("discover", help="read-only live hardware discovery; --apply records GPUs disabled")
     d.add_argument("node")
@@ -76,6 +77,7 @@ def parser():
     retry.add_argument("job")
     retry.add_argument("--additional-attempts", type=int, default=1)
     sub.add_parser("events")
+    sub.add_parser("campaign-status", help="show campaign state and notification outbox without secrets")
     c = sub.add_parser("cancel-pending", help="cancel an unstarted job only; never kills a process")
     c.add_argument("job")
     t = sub.add_parser("tick", help="one scheduling cycle (dry-run unless --execute)")
@@ -122,8 +124,8 @@ def main(argv=None):
         cmd = args.command
         if cmd.startswith("register-"):
             fn = {"register-node": store.register_node, "register-group": store.register_group,
-                  "register-experiment": store.register_experiment}[cmd]
-            result = fn(load(args.file))
+                  "register-experiment": store.register_experiment}.get(cmd)
+            result = register_campaign(store, load(args.file)) if cmd == "register-campaign" else fn(load(args.file))
         elif cmd == "inventory":
             result = {"nodes": store.specs("nodes"), "groups": store.specs("groups_"), "health": controller.node_health()}
         elif cmd == "discover":
@@ -181,7 +183,8 @@ def main(argv=None):
                 print(status_text(store))
                 return
             result = {"experiments": store.specs("experiments"), "jobs": store.jobs(), "attempts": store.attempts(),
-                      "snapshots": controller.snapshots(), "node_health": controller.node_health()}
+                      "snapshots": controller.snapshots(), "node_health": controller.node_health(),
+                      "campaigns": campaign_status(store)}
         elif cmd == "priority":
             store.prioritize(args.job, args.value)
             result = {"job": args.job, "priority": args.value}
@@ -197,8 +200,11 @@ def main(argv=None):
             result = {"job": args.job, "status": "cancelled"}
         elif cmd == "events":
             result = [dict(r, data=json.loads(r["data"])) for r in store.db.execute("SELECT * FROM events ORDER BY seq")]
+        elif cmd == "campaign-status":
+            result = campaign_status(store)
         elif cmd == "tick":
             result = controller.tick(execute=args.execute, max_launches=args.max_launches_per_cycle)
+            result["notifications"] = poll_campaigns(store)
         elif cmd == "daemon":
             if args.interval < 2:
                 raise ValueError("minimum interval is 2 seconds")
@@ -209,8 +215,10 @@ def main(argv=None):
                 signal.signal(sig, lambda *_: stop.set())
             while not stop.is_set():
                 try:
-                    print(dumps(controller.tick(execute=args.execute,
-                                                max_launches=args.max_launches_per_cycle)), flush=True)
+                    result = controller.tick(execute=args.execute,
+                                             max_launches=args.max_launches_per_cycle)
+                    result["notifications"] = poll_campaigns(store)
+                    print(dumps(result), flush=True)
                 except Exception as exc:
                     print(dumps({"controller_error": str(exc), "action": "no new launch in this cycle"}), flush=True)
                 stop.wait(args.interval)

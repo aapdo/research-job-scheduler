@@ -23,6 +23,7 @@
 
 - 서버와 GPU 등록: SSH/local 실행, GPU UUID·모델·VRAM 조회, 장치별 사용 허용.
 - 실험 관리: 이름·RQ·job별 목적, 설정값, 예상 자원량, 우선순위, 학습→평가 의존성.
+- 실험 그룹 알림: 여러 실험/project를 하나의 campaign으로 묶어 그룹 완료·오류 전이만 통지.
 - 자원 기반 배치: GPU 사용률·VRAM·compute PID, CPU·RAM·디스크·D-state와 선택적 스토리지 읽기 점검.
 - VRAM packing과 온도 보호: 저사용률 GPU에 bounded shared job을 배치하고 80/85°C 단계별 launch 제한.
 - 파일시스템 제약: 실험/job을 `nfs`, `local`, `any`로 지정해 맞는 서버에만 배치.
@@ -32,6 +33,7 @@
 | 개념 | 의미 | 예시 |
 |---|---|---|
 | Project | 실험을 묶는 연구 이름. 실험의 `project` 필드 사용 | `context-study` |
+| Campaign (실험 그룹) | 하나 이상의 project/experiment를 묶는 운영·알림 단위 | `spatial-channel-v1`, `n56` |
 | Experiment | 이름·RQ와 관련 job 목록을 묶은 실험 | “Context가 검출 성능을 개선하는가?” |
 | Job | 완료해야 할 논리 작업. `train`, `eval`, `prepare`, `analysis` 중 하나 | baseline 학습, threshold 평가 |
 | Attempt | job을 실제로 실행한 한 번의 시도. 재시도마다 새 ID·출력 폴더 생성 | 최초 실행, 장애 후 재실행 |
@@ -41,6 +43,8 @@
 완료 순서만 기다리는 dependency는 해당 ID를 `order_only_dependencies`에도 적을 수 있습니다.
 이 경우 서로 다른 local node에서도 후속을 배치할 수 있지만 `{dep:ID}` 경로 참조는 금지됩니다.
 원격 artifact가 필요하면 workflow의 명시적인 수집·전송 단계가 별도로 검증해야 합니다.
+`cluster`는 실행 서버 집합과 혼동될 수 있어 알림 단위의 코드 명칭은 `campaign`, 화면 표현은
+“실험 그룹”을 사용합니다.
 
 ## 설치
 
@@ -224,6 +228,38 @@ research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20 --max-lau
 기록하고 downstream 시작 전에 다시 검사합니다. `outputs`를 생략하면 결과 파일 완전성을
 검사할 수 없으므로 checkpoint·metrics 파일을 명시하세요.
 
+### 실험 그룹 완료·오류 알림
+
+[campaign 예제](examples/campaign.json)는 `projects`와 선택적인 개별 `experiments`를 합쳐
+하나의 알림 단위를 만듭니다. 이름과 RQ도 campaign에 보관됩니다.
+
+```bash
+research-scheduler --db "$SCHEDULER_DB" register-campaign examples/campaign.json
+research-scheduler --db "$SCHEDULER_DB" campaign-status
+```
+
+campaign은 개별 job이 끝날 때마다 알리지 않습니다. 그룹이 처음 `complete` 또는 `error`로
+전이할 때 한 번만 알립니다. `failed`/`blocked` job이 하나라도 생기면 `error`, 아직 실행할
+job이 있으면 `running`, 모든 job이 `succeeded`/`cancelled`이면 `complete`입니다. 오류 뒤
+재시도로 `running`에 복귀했다가 완료되면 완료 알림을 추가로 보냅니다. 같은 오류 상태에서
+실패가 더 늘어나는 경우에는 반복 알림하지 않습니다.
+
+Slack Incoming Webhook은 JSON, DB, 명령행 인수나 Git 저장소에 넣지 않고 제어 머신의 별도
+파일에 둡니다. 파일이 없거나 환경 변수를 지정하지 않으면 알림 전송은 자동으로 비활성화되며,
+상태 관찰과 pending outbox는 보존됩니다.
+
+```bash
+install -d -m 700 "$HOME/.config/research-scheduler"
+$EDITOR "$HOME/.config/research-scheduler/slack-webhook"
+chmod 600 "$HOME/.config/research-scheduler/slack-webhook"
+export RS_SLACK_WEBHOOK_FILE="$HOME/.config/research-scheduler/slack-webhook"
+```
+
+daemon은 전이와 전송 결과를 durable outbox와 event log에 기록하므로 재시작해도 같은 전이를
+중복 발송하지 않습니다. 전송 실패 시 webhook 값이나 응답 본문을 기록하지 않고 오류 종류만
+남긴 뒤 제한적으로 재시도합니다. 외부 legacy queue를 campaign으로 관찰하는 통합도 가능하지만,
+그 상태를 scheduler에 전달하는 별도 controller가 필요합니다.
+
 ### 자원량과 경로를 지정할 때
 
 - `resources.gpu_count`는 같은 서버에서 사용할 GPU 수입니다. 0이면 CPU-only입니다.
@@ -250,6 +286,8 @@ research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20 --max-lau
 | `probe` | 서버 자원을 새로 조회하고 DB에 기록. 신규 job 실행 없음 |
 | `plan` | 상태를 갱신하고 배치 예상 및 대기 이유 확인. 신규 job 실행 없음 |
 | `events` | 등록·설정 변경·장애·실행 상태 전이 이력 확인 |
+| `register-campaign FILE` | project/experiment들을 완료·오류 알림 단위로 등록 |
+| `campaign-status` | campaign 상태와 비밀값을 제외한 알림 outbox 확인 |
 | `priority JOB_ID VALUE` | 대기 중인 job 우선순위 변경 |
 | `set-dataset NODE NAME PATH` | 앞으로 실행할 job의 서버별 데이터 경로 등록·변경 |
 | `set-storage-profile NODE FILE` | active attempt는 유지하고 향후 local/NFS 경로·admission을 원자적으로 전환 |
@@ -335,8 +373,9 @@ MIG/MPS·선점·자동 checkpoint resume·VRAM peak 자동 profiling은 지원�
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | 서버·job 필드, 기본값, 치환 값, GPU 공유 및 NFS 설정 |
 | [STATE_MACHINE.md](docs/STATE_MACHINE.md) | job/attempt/node 상태와 재시도·invalid 처리 |
 | [OPEN_SOURCE_REVIEW.md](docs/OPEN_SOURCE_REVIEW.md) | Slurm·ClearML·Ray 검토와 구현 선택 근거 |
-| [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 68개 테스트와 실제/모의 검증 범위, 미검증 항목 |
+| [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 89개 테스트와 실제/모의 검증 범위, 미검증 항목 |
 | [node.ssh.json](examples/node.ssh.json) | 서버 등록 예제 |
 | [experiment.named-dataset.json](examples/experiment.named-dataset.json) | 서버별 데이터 경로를 사용하는 단일 학습 예제 |
 | [experiment.json](examples/experiment.json) | baseline 학습→평가와 독립 학습을 묶는 DAG 예제 |
+| [campaign.json](examples/campaign.json) | 여러 실험을 하나의 완료·오류 알림 단위로 묶는 예제 |
 | [shared-storage-group.json](examples/shared-storage-group.json) | 공유 스토리지 시작 간격 설정 |

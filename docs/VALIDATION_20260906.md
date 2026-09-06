@@ -126,3 +126,16 @@ accounting on external-process nodes, and obey a two-job per-GPU ceiling. Packin
 waits for the first job's ready marker before adding a second. Queued jobs can be
 auditedly rebound to an equivalent packing-aware immutable release while active
 attempt specifications remain unchanged.
+
+## Campaign-level Slack notifications (0.6.0)
+
+The suite passes **89 tests**. Five focused notification tests verify project-selected
+and externally observed campaigns, one alert per complete/error transition, recovery
+from error to running to complete, disabled delivery when no webhook is configured,
+durable pending delivery, strict mode-0600 secret-file admission, idempotent campaign
+registration and absence of webhook bytes from the SQLite database. The CLI campaign
+registration/status flow was also exercised against a temporary local database.
+
+All Slack sends in automated tests use an injected in-memory sender; the test suite
+does not contact Slack. A real webhook may be enabled only through
+`RS_SLACK_WEBHOOK_FILE`, and its URL is not part of campaign JSON, events or outbox rows.

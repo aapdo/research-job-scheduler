@@ -1,0 +1,9 @@
+{
+  "id": "weather-context-v1",
+  "name": "Weather context comparison",
+  "rq": "Which context mechanism improves detection under weather degradation?",
+  "projects": ["weather-context"],
+  "experiments": [],
+  "external": false,
+  "enabled": true
+}

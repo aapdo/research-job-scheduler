@@ -137,6 +137,35 @@ telemetry는 `/proc`, affinity와 `nvidia-smi` 기준입니다. cgroup v2 CPU/RA
 
 ## 실험과 job 설정
 
+### Campaign (실험 그룹)
+
+Campaign은 여러 실험의 실행 설정을 복제하는 계층이 아니라 완료·오류 상태를 함께 관찰하는
+운영 단위입니다. [campaign.json](../examples/campaign.json)을 `register-campaign`으로 등록합니다.
+
+| 필드 | 기본값 | 의미 |
+|---|---|---|
+| `id`, `name`, `rq` | 필수 | 실험 그룹 식별자·표시 이름·확인할 연구 질문 |
+| `projects` | `[]` | 이 project 값을 가진 현재·향후 experiment를 포함 |
+| `experiments` | `[]` | project와 무관하게 명시적으로 포함할 experiment ID |
+| `external` | `false` | scheduler 밖 legacy queue 상태를 controller가 공급하는 campaign 여부 |
+| `enabled` | `true` | 상태 관찰·새 알림 생성을 수행할지 여부 |
+
+일반 campaign은 `projects` 또는 `experiments` 중 하나 이상을 지정합니다. 두 목록은 합집합으로
+해석하며 job을 중복 집계하지 않습니다. 명시적인 experiment ID는 등록 시 존재해야 하지만,
+project selector는 같은 project로 나중에 등록되는 experiment도 자동으로 포함합니다.
+`external: true`는 scheduler job 대신 통합 controller가 제공하는 관찰값을 사용합니다.
+
+상태는 `pending`, `running`, `complete`, `error`입니다. `failed` 또는 `blocked` job이 하나라도
+있으면 `error`를 우선하며, `queued`/`starting`/`running`/`unknown`이 있으면 `running`입니다.
+모든 포함 job이 `succeeded` 또는 `cancelled`이면 `complete`입니다. 알림은 `complete`와
+`error`로 들어가는 전이에만 생성되고 durable outbox가 중복 발송을 막습니다.
+
+Slack 전송을 사용할 때 daemon 환경의 `RS_SLACK_WEBHOOK_FILE`에 제어 머신의 비밀 파일 경로를
+지정합니다. 파일은 daemon 사용자 소유이고 mode `0600`처럼 group/world 접근 비트가 없어야 합니다.
+환경 변수가 없으면 기능은 비활성화됩니다. webhook URL 자체는 DB, event, outbox, campaign JSON에
+저장하지 않습니다. credential을 experiment/job `env`에 넣으면 attempt 명세와 DB에 남으므로
+그 방식은 사용하지 않습니다.
+
 ### Experiment
 
 | 필드 | 기본값 | 의미 |
