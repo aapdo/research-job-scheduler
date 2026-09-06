@@ -28,7 +28,11 @@ def gpu_healthy(gpu, node, mode):
     if gpu.get("util_percent") is None or gpu["util_percent"] > p["max_gpu_percent"]:
         return False
     if mode == "exclusive":
-        return not gpu.get("processes") and gpu["used_mib"] <= p["max_idle_used_mib"]
+        # Exclusive means one scheduler reservation per GPU. A node may opt in to
+        # coexistence with already-visible external processes; actual free VRAM is
+        # still checked later with the configured safety margin.
+        return ((not gpu.get("processes") and gpu["used_mib"] <= p["max_idle_used_mib"])
+                or (bool(gpu.get("processes")) and p["allow_external_gpu_processes"]))
     return p["allow_gpu_sharing"]
 
 

@@ -86,11 +86,15 @@ child 실행 직전 다시 확인합니다. 같은 이름이 내용 동일성을
 보수적으로 함께 반영하므로 실제로 가능할 것보다 적게 배치될 수 있습니다.
 `max_gpu_percent`는 shared mode에도 적용됩니다.
 
-GPU 공유에는 node의 `policy.allow_gpu_sharing: true`와 job의
-`resources.gpu_mode: "shared"`를 함께 지정합니다. compute PID가 보이면 별도로
-`policy.allow_external_gpu_processes: true`도 필요합니다. PID namespace가 다를 수 있어
-해당 프로세스가 누구의 것인지 자동으로 신뢰하지 않습니다. 이 옵션은 다른 프로세스를
-종료하지 않지만 자원 경쟁을 허용하므로 사용 권한·여유 자원을 먼저 확인하세요.
+`policy.allow_external_gpu_processes: true`인 node에서는 compute PID가 보여도 사용률이
+`max_gpu_percent` 이하이고 관측 free VRAM이 `vram_mib + gpu_margin_mib`를 충족하면 배치할 수
+있습니다. `exclusive` job끼리는 여전히 GPU 하나당 scheduler reservation 하나만 허용합니다.
+CLI에서는 `set-external-gpu-processes NODE enabled|disabled`로 향후 admission을 바꿀 수 있습니다.
+
+여러 scheduler job 자체를 같은 GPU에 두려면 추가로 node의 `policy.allow_gpu_sharing: true`와
+job의 `resources.gpu_mode: "shared"`를 함께 지정합니다. PID namespace가 다를 수 있어 외부
+프로세스의 소유자를 자동으로 신뢰하지 않습니다. 두 설정 모두 다른 프로세스를 종료하지 않지만
+자원 경쟁과 외부 프로세스의 VRAM 증가 위험을 허용하므로 특정 node에만 명시적으로 적용하세요.
 
 telemetry는 `/proc`, affinity와 `nvidia-smi` 기준입니다. cgroup v2 CPU/RAM 한도도 가능한
 경우 반영하지만 v1/nested 환경이나 더 작은 사용자 할당량은 `cpu_limit`/`ram_limit_mib`로

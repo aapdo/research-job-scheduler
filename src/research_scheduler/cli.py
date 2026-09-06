@@ -36,6 +36,10 @@ def parser():
     ds.add_argument("node")
     ds.add_argument("dataset")
     ds.add_argument("path")
+    ext = sub.add_parser("set-external-gpu-processes",
+                         help="allow/disallow future placement beside visible external GPU processes")
+    ext.add_argument("node")
+    ext.add_argument("state", choices=["enabled", "disabled"])
     sub.add_parser("inventory")
     sub.add_parser("probe", help="read-only server/GPU resource and health probes")
     sub.add_parser("plan", help="refresh resources and show hypothetical placements; no launches")
@@ -112,6 +116,8 @@ def main(argv=None):
             result = store.set_gpu_enabled(args.node, args.uuid, args.state == "enabled")
         elif cmd == "set-dataset":
             result = store.set_dataset(args.node, args.dataset, args.path)
+        elif cmd == "set-external-gpu-processes":
+            result = store.set_external_gpu_processes_allowed(args.node, args.state == "enabled")
         elif cmd == "readmit-node":
             with store.lock(), store.db:
                 if controller.node_health().get(args.node, {}).get("phase") != "unavailable":

@@ -230,6 +230,7 @@ research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20 --max-lau
 | `priority JOB_ID VALUE` | 대기 중인 job 우선순위 변경 |
 | `set-dataset NODE NAME PATH` | 앞으로 실행할 job의 서버별 데이터 경로 등록·변경 |
 | `set-gpu NODE UUID enabled|disabled` | active attempt를 바꾸지 않고 향후 GPU 배치 허용 여부 변경 |
+| `set-external-gpu-processes NODE enabled|disabled` | 특정 node에서 외부 PID와 VRAM headroom 기반 공존 허용 |
 | `drain-node NODE` | 기존 작업은 유지하고 해당 서버의 신규 배치 중지 |
 | `cancel-pending JOB_ID` | 아직 시작하지 않은 job 취소. 실행 중 프로세스는 종료하지 않음 |
 

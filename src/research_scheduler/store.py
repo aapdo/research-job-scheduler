@@ -128,6 +128,21 @@ class Store:
             self.event("gpu_enabled_changed", node_id, data)
         return {"node": node_id, "changed": True, **data}
 
+    def set_external_gpu_processes_allowed(self, node_id, enabled):
+        """Opt one node into/out of external-process VRAM headroom admission."""
+        check(isinstance(enabled, bool), "enabled must be boolean")
+        with self.lock(), self.db:
+            n = self.specs("nodes").get(node_id)
+            check(n is not None, "unknown node: " + node_id)
+            if n["policy"]["allow_external_gpu_processes"] == enabled:
+                return {"node": node_id, "enabled": enabled, "changed": False}
+            n["policy"]["allow_external_gpu_processes"] = enabled
+            self.db.execute("UPDATE nodes SET spec=? WHERE id=?", (dumps(node_spec(n)), node_id))
+            self.db.execute("DELETE FROM snapshots WHERE node=?", (node_id,))
+            data = {"enabled": enabled, "active_attempts_unchanged": True}
+            self.event("external_gpu_process_admission_changed", node_id, data)
+        return {"node": node_id, "changed": True, **data}
+
     def register_experiment(self, raw):
         e = experiment_spec(raw)
         with self.lock(), self.db:

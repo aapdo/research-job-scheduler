@@ -148,6 +148,23 @@ class SchemaAndStoreTests(unittest.TestCase):
         self.assertTrue(self.store.attempts()[0]["spec"]["node_spec"]["gpus"][1]["enabled"])
         self.assertFalse(self.store.set_gpu_enabled("a", n["gpus"][1]["uuid"], False)["changed"])
 
+    def test_external_process_policy_change_preserves_active_attempt_snapshot(self):
+        n = node()
+        self.store.register_node(n)
+        e = experiment([job("old")])
+        request = reservation(n)
+        request["spec"]["node_spec"] = copy.deepcopy(n)
+        with self.store.db:
+            self.store.db.execute("INSERT INTO experiments VALUES(?,?)", ("e", dumps(e)))
+            self.store.db.execute("INSERT INTO jobs(id,experiment,spec,status,created) VALUES(?,?,?,?,?)",
+                                  ("old", "e", dumps(e["jobs"][0]), "running", time.time()))
+            self.store.db.execute("INSERT INTO attempts(id,job,node,spec,status,created) VALUES(?,?,?,?,?,?)",
+                                  ("old", "old", "a", dumps(request["spec"]), "running", time.time()))
+        changed = self.store.set_external_gpu_processes_allowed("a", True)
+        self.assertTrue(changed["changed"])
+        self.assertTrue(self.store.specs("nodes")["a"]["policy"]["allow_external_gpu_processes"])
+        self.assertFalse(self.store.attempts()[0]["spec"]["node_spec"]["policy"]["allow_external_gpu_processes"])
+
 
 class PlannerTests(unittest.TestCase):
     def test_priority_backfill_skips_infeasible(self):
@@ -185,6 +202,21 @@ class PlannerTests(unittest.TestCase):
         s["gpus"][0]["processes"] = [{"pid": 123}]
         s["gpus"][1]["util_percent"] = 99
         self.assertEqual(plan([job()], n=n, snap=s)[0]["decision"], "waiting")
+
+    def test_opted_in_external_process_uses_vram_headroom_but_remains_scheduler_exclusive(self):
+        n = node()
+        n["policy"]["allow_external_gpu_processes"] = True
+        s = snapshot(n)
+        for gpu in s["gpus"]:
+            gpu.update(used_mib=600, util_percent=0, processes=[{"pid": 123, "used_mib": "600"}])
+        self.assertEqual(plan([job(gpu_count=2, vram=9000)], n=n, snap=s)[0]["decision"], "ready")
+        s["gpus"][1]["used_mib"] = 15000
+        self.assertEqual(plan([job(gpu_count=2, vram=9000)], n=n, snap=s)[0]["decision"], "waiting")
+        s = snapshot(n)
+        for gpu in s["gpus"]:
+            gpu.update(used_mib=600, util_percent=0, processes=[{"pid": 123}])
+        old = reservation(n)
+        self.assertEqual(plan([job()], n=n, snap=s, attempts=[old])[0]["gpus"], ["GPU-a-1"])
 
     def test_disabled_gpu_not_selected(self):
         n = node()

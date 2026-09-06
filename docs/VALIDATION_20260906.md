@@ -72,3 +72,11 @@ cold-start serialization while local jobs fill independent slots, and future-onl
 GPU enablement changes while another attempt is active. Multi-launch remains
 sequentially revalidated before each reservation; it does not bypass GPU ownership,
 VRAM, D-state, dataset or startup-group gates.
+
+## Explicit external-process headroom update (0.2.1)
+
+The suite passes **65 tests**. New cases verify that an opted-in node can admit an
+exclusive scheduler job beside an already-visible external process only when GPU
+utilization and per-device VRAM headroom pass, while a second scheduler reservation
+on the same GPU remains prohibited. Changing this node policy affects future
+placement and does not mutate active attempt snapshots.
