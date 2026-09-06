@@ -104,3 +104,9 @@ The suite passes **73 tests**. A live-attempt regression test verifies that an
 operator can switch future node admission from NFS to local paths, clear stale
 resource telemetry and re-enable the node while the active attempt retains its
 immutable original filesystem, paths and node snapshot.
+
+## Explicit failed-job retry (0.4.2)
+
+The suite passes **74 tests**. A failed job can be explicitly requeued with an
+audited additional attempt budget while the failed attempt and its evidence remain
+terminal and unchanged. Queued, running and successful jobs are rejected.

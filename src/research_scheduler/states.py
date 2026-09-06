@@ -11,7 +11,7 @@ JOB_TRANSITIONS = {
     "starting": {"running", "unknown", "succeeded", "failed", "queued", "blocked"},
     "running": {"unknown", "succeeded", "failed", "queued", "blocked"},
     "unknown": {"starting", "running", "succeeded", "failed", "queued", "blocked"},
-    "succeeded": set(), "failed": set(), "cancelled": set(), "blocked": set(),
+    "succeeded": set(), "failed": {"queued"}, "cancelled": set(), "blocked": set(),
 }
 
 

@@ -157,6 +157,20 @@ class SchemaAndStoreTests(unittest.TestCase):
         self.assertEqual(self.store.jobs()[0]["spec"]["priority"], 99)
         self.assertEqual(self.store.db.execute("SELECT kind FROM events ORDER BY seq DESC LIMIT 1").fetchone()[0], "priority_changed")
 
+    def test_failed_job_can_be_explicitly_requeued_with_more_attempt_budget(self):
+        self.store.register_experiment(experiment([job()]))
+        with self.store.db:
+            self.store.db.execute("UPDATE jobs SET status='failed',reason='test failure' WHERE id='j'")
+            self.store.db.execute("INSERT INTO attempts(id,job,node,spec,status,created) VALUES(?,?,?,?,?,?)",
+                                  ("old", "j", "a", dumps({}), "failed", time.time()))
+        result = self.store.retry_failed("j")
+        current = self.store.jobs()[0]
+        self.assertEqual((result["status"], current["status"], current["spec"]["max_attempts"]),
+                         ("queued", "queued", 2))
+        self.assertEqual(self.store.attempts()[0]["status"], "failed")
+        with self.assertRaises(ValueError):
+            self.store.retry_failed("j")
+
     def test_process_tree_rss_includes_current_process(self):
         self.assertGreater(process_tree_rss_mib(os.getpid()), 0)
 

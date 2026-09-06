@@ -227,3 +227,21 @@ class Store:
             j["spec"]["priority"] = priority
             self.db.execute("UPDATE jobs SET spec=? WHERE id=?", (dumps(j["spec"]), job_id))
             self.event("priority_changed", job_id, {"priority": priority})
+
+    def retry_failed(self, job_id, additional_attempts=1):
+        """Explicitly add retry budget to a failed job; old attempts stay terminal."""
+        from .schema import number
+        number(additional_attempts, "additional_attempts", 1, True)
+        with self.lock(), self.db:
+            job = next((j for j in self.jobs() if j["id"] == job_id), None)
+            check(job is not None and job["status"] == "failed", "only failed jobs can be retried")
+            attempts = self.db.execute("SELECT COUNT(*) FROM attempts WHERE job=?", (job_id,)).fetchone()[0]
+            old_limit = job["spec"]["max_attempts"]
+            job["spec"]["max_attempts"] = max(old_limit, attempts) + additional_attempts
+            self.db.execute("UPDATE jobs SET spec=?,status='queued',reason='' WHERE id=?",
+                            (dumps(job["spec"]), job_id))
+            data = {"previous_max_attempts": old_limit,
+                    "max_attempts": job["spec"]["max_attempts"],
+                    "previous_attempts": attempts, "additional_attempts": additional_attempts}
+            self.event("failed_job_requeued", job_id, data)
+        return {"job": job_id, "status": "queued", **data}

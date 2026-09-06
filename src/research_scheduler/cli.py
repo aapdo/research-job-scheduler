@@ -56,6 +56,9 @@ def parser():
     pr = sub.add_parser("priority")
     pr.add_argument("job")
     pr.add_argument("value", type=int)
+    retry = sub.add_parser("retry-failed", help="explicitly add bounded retry budget to a failed job")
+    retry.add_argument("job")
+    retry.add_argument("--additional-attempts", type=int, default=1)
     sub.add_parser("events")
     c = sub.add_parser("cancel-pending", help="cancel an unstarted job only; never kills a process")
     c.add_argument("job")
@@ -156,6 +159,8 @@ def main(argv=None):
         elif cmd == "priority":
             store.prioritize(args.job, args.value)
             result = {"job": args.job, "priority": args.value}
+        elif cmd == "retry-failed":
+            result = store.retry_failed(args.job, args.additional_attempts)
         elif cmd == "cancel-pending":
             with store.lock(), store.db:
                 cursor = store.db.execute("UPDATE jobs SET status='cancelled',reason='cancelled by operator' WHERE id=? AND status='queued'",

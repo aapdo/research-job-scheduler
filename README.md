@@ -244,6 +244,8 @@ research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20 --max-lau
 | `events` | 등록·설정 변경·장애·실행 상태 전이 이력 확인 |
 | `priority JOB_ID VALUE` | 대기 중인 job 우선순위 변경 |
 | `set-dataset NODE NAME PATH` | 앞으로 실행할 job의 서버별 데이터 경로 등록·변경 |
+| `set-storage-profile NODE FILE` | active attempt는 유지하고 향후 local/NFS 경로·admission을 원자적으로 전환 |
+| `retry-failed JOB_ID` | 실패 증거를 보존하면서 retry budget 1회를 추가하고 재대기 |
 | `set-gpu NODE UUID enabled|disabled` | active attempt를 바꾸지 않고 향후 GPU 배치 허용 여부 변경 |
 | `set-external-gpu-processes NODE enabled|disabled` | 특정 node에서 외부 PID와 VRAM headroom 기반 공존 허용 |
 | `set-gpu-margin NODE MIB` | 향후 배치에 적용할 GPU별 VRAM 안전 여유 변경 |
@@ -282,7 +284,9 @@ D-state가 해소되거나 관찰 공백이 120초를 넘으면 연속 지속 �
 
 **`invalid`는 원격 프로세스 종료를 뜻하지 않습니다.** 접속 불가 서버의 작업이 계속 실행될 수
 있으므로 자동 재배치는 모든 가변 출력을 attempt별로 분리하고 외부 부작용이 없는 작업에만
-허용해야 합니다. 기본값은 `failover_safe: false`, `max_attempts: 1`입니다.
+허용해야 합니다. 기본값은 `failover_safe: false`, `max_attempts: 1`입니다. 실패 원인을 수정한 뒤
+운영자가 재시도를 결정한 경우에만 `retry-failed`를 사용합니다. 기존 failed attempt는 그대로
+보존되고 job의 `max_attempts`와 상태 전환은 event log에 기록됩니다.
 
 격리된 서버는 자동 재활성화하지 않습니다. 운영자가 상태를 확인한 뒤 아래 명령으로 격리를
 해제하면 새 health poll부터 확인합니다. 기존 invalid 결과는 계속 무효입니다.
