@@ -10,3 +10,17 @@ dist/
 *.sqlite*
 *.log
 *.pid
+
+# Local credentials and machine-specific secrets must never be committed.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.credentials.json
+*.secrets.json
+*.token
