@@ -116,6 +116,8 @@ def fit(job, node, snap, held, history, successful, groups, now):
         a = successful.get(dep)
         if a is None:
             return "missing successful dependency receipt: " + dep, []
+        if dep in job.get("order_only_dependencies", []):
+            continue
         if a["node"] != node["id"] and not (node["storage_domain"] and
                 a["spec"]["node_spec"]["storage_domain"] == node["storage_domain"]):
             return "dependency artifacts on another local filesystem: " + dep, []

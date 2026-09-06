@@ -36,6 +36,11 @@
 | Attempt | job을 실제로 실행한 한 번의 시도. 재시도마다 새 ID·출력 폴더 생성 | 최초 실행, 장애 후 재실행 |
 | Node | 등록된 실행 서버 또는 컨테이너의 접속 대상 | `research-node-a` |
 
+`depends_on`은 기본적으로 선행 artifact의 같은 filesystem 접근과 해시 검증까지 요구합니다.
+완료 순서만 기다리는 dependency는 해당 ID를 `order_only_dependencies`에도 적을 수 있습니다.
+이 경우 서로 다른 local node에서도 후속을 배치할 수 있지만 `{dep:ID}` 경로 참조는 금지됩니다.
+원격 artifact가 필요하면 workflow의 명시적인 수집·전송 단계가 별도로 검증해야 합니다.
+
 ## 설치
 
 ### 준비 사항

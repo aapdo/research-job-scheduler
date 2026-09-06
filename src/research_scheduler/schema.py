@@ -1,5 +1,6 @@
 """Strict JSON registration contracts. Sizes are MiB; GPU memory is per device."""
 import copy
+import json
 import math
 import re
 from pathlib import PurePosixPath
@@ -162,7 +163,7 @@ def experiment_spec(raw):
     check(isinstance(e["tags"], list) and all(isinstance(t, str) for t in e["tags"]), "tags must be strings")
     check(isinstance(e["jobs"], list) and e["jobs"], "at least one job required")
     for j in e["jobs"]:
-        fields(j, "id name kind purpose argv cwd env config resources depends_on priority labels hosts "
+        fields(j, "id name kind purpose argv cwd env config resources depends_on order_only_dependencies priority labels hosts "
                "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem")
         identifier(j["id"])
         check(j["kind"] in ("train", "eval", "prepare", "analysis"), "invalid job kind")
@@ -195,6 +196,16 @@ def experiment_spec(raw):
         for dep in j["depends_on"]:
             identifier(dep)
         check(len(j["depends_on"]) == len(set(j["depends_on"])), "duplicate dependency")
+        order_only = j.get("order_only_dependencies", [])
+        check(isinstance(order_only, list) and all(isinstance(d, str) for d in order_only),
+              "order_only_dependencies must be an array of dependency IDs")
+        check(len(order_only) == len(set(order_only)) and set(order_only) <= set(j["depends_on"]),
+              "order-only dependencies must be unique members of depends_on")
+        # Control dependencies only wait for success. Artifact transfer must be
+        # explicit in the workflow; they never imply remote path accessibility.
+        text = json.dumps({k: j[k] for k in ("argv", "cwd", "env", "config", "input_files")})
+        check(not any("{dep:" + d + "}" in text for d in order_only),
+              "order-only dependency cannot be used as an artifact path")
         for asset_hash in j["assets"].values():
             check(bool(re.fullmatch(r"[0-9a-f]{64}", asset_hash)), "asset must bind a marker SHA256")
         for f in j["input_files"]:

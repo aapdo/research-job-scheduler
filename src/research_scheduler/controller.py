@@ -218,6 +218,8 @@ class Controller:
         inputs = list(spec["input_files"])
         for dep in spec["depends_on"]:
             a = successful[dep]
+            if dep in spec.get("order_only_dependencies", []):
+                continue
             substitutions["{dep:" + dep + "}"] = a["spec"]["attempt_dir"]
             # Rehash declared predecessor artifacts on the destination before launch.
             inputs.extend({"path": out["path"], "sha256": out["sha256"]}
