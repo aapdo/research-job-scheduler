@@ -7,7 +7,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from .schema import absolute, check, experiment_spec, group_spec, identifier, node_spec, validate_dag
+from .schema import absolute, check, experiment_spec, fields, group_spec, identifier, node_spec, validate_dag
 
 ACTIVE = ("starting", "running", "unknown")
 
@@ -110,6 +110,39 @@ class Store:
             self.db.execute("DELETE FROM snapshots WHERE node=?", (node_id,))
             self.event("dataset_path_registered", node_id, {"dataset": name, "path": path})
         return {"node": node_id, "dataset": name, "path": path}
+
+    def set_storage_profile(self, node_id, raw):
+        """Change only future storage admission while attempts keep frozen specs."""
+        fields(raw, "filesystem work_root storage_domain startup_group datasets assets "
+               "read_probe_path read_probe_bytes enabled")
+        with self.lock(), self.db:
+            current = self.specs("nodes").get(node_id)
+            check(current is not None, "unknown node: " + node_id)
+            candidate = json.loads(dumps(current))
+            for key in ("filesystem", "work_root", "storage_domain", "startup_group",
+                        "datasets", "assets", "enabled"):
+                if key in raw:
+                    candidate[key] = raw[key]
+            policy = dict(candidate["policy"])
+            if "read_probe_path" in raw:
+                if raw["read_probe_path"]:
+                    policy["read_probe_path"] = raw["read_probe_path"]
+                else:
+                    policy.pop("read_probe_path", None)
+            if "read_probe_bytes" in raw:
+                policy["read_probe_bytes"] = raw["read_probe_bytes"]
+            candidate["policy"] = policy
+            candidate = node_spec(candidate)
+            if candidate == current:
+                return {"node": node_id, "changed": False, "active_attempts_unchanged": True}
+            self.db.execute("UPDATE nodes SET spec=? WHERE id=?", (dumps(candidate), node_id))
+            self.db.execute("DELETE FROM snapshots WHERE node=?", (node_id,))
+            data = {"changed": True, "active_attempts_unchanged": True,
+                    "filesystem": candidate["filesystem"], "work_root": candidate["work_root"],
+                    "storage_domain": candidate["storage_domain"],
+                    "startup_group": candidate["startup_group"], "enabled": candidate["enabled"]}
+            self.event("node_storage_profile_changed", node_id, data)
+        return {"node": node_id, **data}
 
     def set_gpu_enabled(self, node_id, gpu_uuid, enabled):
         """Change future admission without mutating an active attempt snapshot."""

@@ -97,3 +97,10 @@ experiment-level defaults, per-job overrides, invalid-value rejection, legacy-sp
 compatibility, placement filtering, and the frozen effective value in argv, nested
 config and `RS_FILESYSTEM`. These tests use synthetic node telemetry and a real local
 CPU child; they do not mount, copy, or modify NFS storage.
+
+## Future-only storage profile transition (0.4.1)
+
+The suite passes **73 tests**. A live-attempt regression test verifies that an
+operator can switch future node admission from NFS to local paths, clear stale
+resource telemetry and re-enable the node while the active attempt retains its
+immutable original filesystem, paths and node snapshot.

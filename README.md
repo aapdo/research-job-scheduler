@@ -149,6 +149,14 @@ research-scheduler --db "$SCHEDULER_DB" set-dataset research-node-b vehicle-v1 /
 생성은 하지 않으며 같은 이름의 데이터 내용·버전·split 동등성은 사용자가 관리합니다.
 기존 `dataset_path` 직접 지정도 지원하지만 `dataset`과 동시에 지정할 수는 없습니다.
 
+실행 중인 attempt를 유지하면서 node의 **향후** local/NFS 경로를 전환하려면 storage profile을
+사용합니다. 아래 명령은 기존 attempt의 frozen 경로를 바꾸지 않고 신규 배치 설정만 교체합니다.
+
+```bash
+research-scheduler --db "$SCHEDULER_DB" set-storage-profile \
+  research-node-a examples/storage-profile.local.json
+```
+
 ### 5. 실험 등록과 모의 배치
 
 [서버별 데이터셋을 사용하는 실험 예제](examples/experiment.named-dataset.json)의

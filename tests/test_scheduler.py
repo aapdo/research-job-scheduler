@@ -177,6 +177,31 @@ class SchemaAndStoreTests(unittest.TestCase):
         self.assertTrue(self.store.attempts()[0]["spec"]["node_spec"]["gpus"][1]["enabled"])
         self.assertFalse(self.store.set_gpu_enabled("a", n["gpus"][1]["uuid"], False)["changed"])
 
+    def test_storage_profile_change_is_future_only_with_active_attempt(self):
+        n = node()
+        self.store.register_node(n)
+        e = experiment([job("old")])
+        request = reservation(n)
+        request["spec"]["node_spec"] = copy.deepcopy(n)
+        with self.store.db:
+            self.store.db.execute("INSERT INTO experiments VALUES(?,?)", ("e", dumps(e)))
+            self.store.db.execute("INSERT INTO jobs(id,experiment,spec,status,created) VALUES(?,?,?,?,?)",
+                                  ("old", "e", dumps(e["jobs"][0]), "running", time.time()))
+            self.store.db.execute("INSERT INTO attempts(id,job,node,spec,status,created) VALUES(?,?,?,?,?,?)",
+                                  ("old", "old", "a", dumps(request["spec"]), "running", time.time()))
+            self.store.db.execute("INSERT INTO snapshots VALUES(?,?)", ("a", dumps(snapshot(n))))
+        result = self.store.set_storage_profile("a", {
+            "filesystem": "nfs", "work_root": "/tmp/new-runs", "storage_domain": "shared",
+            "startup_group": "shared", "datasets": {"data": "/tmp/data"},
+            "assets": {}, "read_probe_path": "/tmp/probe", "read_probe_bytes": 1024,
+            "enabled": True})
+        current = self.store.specs("nodes")["a"]
+        frozen = self.store.attempts()[0]["spec"]["node_spec"]
+        self.assertTrue(result["changed"])
+        self.assertEqual((current["filesystem"], current["work_root"]), ("nfs", "/tmp/new-runs"))
+        self.assertEqual((frozen["filesystem"], frozen["work_root"]), ("local", n["work_root"]))
+        self.assertIsNone(self.store.db.execute("SELECT data FROM snapshots WHERE node='a'").fetchone())
+
     def test_external_process_policy_change_preserves_active_attempt_snapshot(self):
         n = node()
         self.store.register_node(n)

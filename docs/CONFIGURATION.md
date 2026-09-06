@@ -54,6 +54,12 @@ job에 `"dataset": "vehicle-v1"`을 넣으면 해당 node의 경로로 해석합
 child 실행 직전 다시 확인합니다. 같은 이름이 내용 동일성을 보증하지는 않습니다.
 변경은 `set-dataset NODE NAME PATH`로 수행할 수 있습니다.
 
+node를 drain한 뒤 local replica로 전환하는 경우에는
+`set-storage-profile NODE PROFILE.json`으로 `filesystem`, `work_root`, `storage_domain`,
+`startup_group`, `datasets`, `assets`, 선택적 read probe와 `enabled`를 한 번에 갱신할 수 있습니다.
+이미 실행 중인 attempt는 등록 당시의 node/path snapshot을 계속 사용하며, 변경은 신규 attempt에만
+적용됩니다. 변경 직후 이전 resource snapshot은 폐기되고 새 profile로 다시 probe합니다.
+
 한 job의 `dataset`은 한 이름을 선택합니다. 여러 split은 같은 root 아래의
 `{dataset_path}/train`, `{dataset_path}/val` 등을 config에 지정할 수 있습니다.
 독립적인 여러 데이터셋 이름을 한 job에서 동시에 해석하는 기능은 아직 없습니다.

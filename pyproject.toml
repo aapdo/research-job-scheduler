@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "research-job-scheduler"
-version = "0.4.0"
+version = "0.4.1"
 description = "Single-operator, resource-aware research DAG scheduler over SSH"
 requires-python = ">=3.10"
 dependencies = []

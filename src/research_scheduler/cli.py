@@ -36,6 +36,11 @@ def parser():
     ds.add_argument("node")
     ds.add_argument("dataset")
     ds.add_argument("path")
+    storage = sub.add_parser(
+        "set-storage-profile",
+        help="change future filesystem/path admission without mutating active attempts")
+    storage.add_argument("node")
+    storage.add_argument("file", help="JSON storage profile")
     ext = sub.add_parser("set-external-gpu-processes",
                          help="allow/disallow future placement beside visible external GPU processes")
     ext.add_argument("node")
@@ -123,6 +128,8 @@ def main(argv=None):
             result = store.set_gpu_enabled(args.node, args.uuid, args.state == "enabled")
         elif cmd == "set-dataset":
             result = store.set_dataset(args.node, args.dataset, args.path)
+        elif cmd == "set-storage-profile":
+            result = store.set_storage_profile(args.node, load(args.file))
         elif cmd == "set-external-gpu-processes":
             result = store.set_external_gpu_processes_allowed(args.node, args.state == "enabled")
         elif cmd == "set-gpu-margin":

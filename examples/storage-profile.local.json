@@ -1,0 +1,9 @@
+{
+  "filesystem": "local",
+  "work_root": "/srv/research/local-scheduler-runs",
+  "storage_domain": "",
+  "startup_group": "",
+  "datasets": {"vehicle-v1": "/srv/local-datasets/vehicle-v1"},
+  "assets": {},
+  "enabled": true
+}
