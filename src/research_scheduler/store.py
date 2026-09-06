@@ -320,6 +320,46 @@ class Store:
             self.db.execute("UPDATE jobs SET spec=? WHERE id=?", (dumps(j["spec"]), job_id))
             self.event("priority_changed", job_id, {"priority": priority})
 
+    def set_pending_resources(self, job_id, resources):
+        """Explicitly amend future placement; active attempt specs never change."""
+        with self.lock(), self.db:
+            job = next((j for j in self.jobs() if j['id'] == job_id), None)
+            check(job is not None and job['status'] == 'queued', 'only queued jobs can change resources')
+            spec = dict(job['spec'], resources=resources)
+            spec = experiment_spec(dict(id='resource-check', name='resource-check', rq='resource-check', jobs=[spec]))['jobs'][0]
+            before = job['spec']['resources']
+            self.db.execute('UPDATE jobs SET spec=? WHERE id=?', (dumps(spec), job_id))
+            self.event('pending_resources_changed', job_id, dict(before=before, after=spec['resources']))
+        return dict(job=job_id, before=before, after=spec['resources'])
+
+    def add_pending_order_dependency(self, job_id, dependency):
+        """Add an explicit cross-storage validation gate to an unstarted job."""
+        with self.lock(), self.db:
+            jobs = {j['id']: j for j in self.jobs()}
+            job = jobs.get(job_id)
+            check(job is not None and job['status']=='queued', 'only queued jobs can gain validation gates')
+            check(dependency in jobs and dependency not in job['spec']['depends_on'], 'missing or existing dependency')
+            spec = dict(job['spec'], depends_on=job['spec']['depends_on']+[dependency],
+                        order_only_dependencies=job['spec'].get('order_only_dependencies',[])+[dependency])
+            spec = experiment_spec(dict(id='gate-check', name='gate-check', rq='gate-check',jobs=[spec]))['jobs'][0]
+            validate_dag({k: spec if k==job_id else j['spec'] for k,j in jobs.items()})
+            self.db.execute('UPDATE jobs SET spec=? WHERE id=?', (dumps(spec),job_id))
+            self.event('pending_validation_gate_added', job_id, dict(dependency=dependency))
+        return dict(job=job_id, dependency=dependency)
+
+    def requeue_dependency_blocked(self, job_id):
+        """Recover only unstarted jobs blocked by the finite driver's failed DAG."""
+        with self.lock(), self.db:
+            jobs = {j['id']: j for j in self.jobs()}
+            job = jobs.get(job_id)
+            check(job is not None and job['status'] == 'blocked', 'job is not blocked')
+            check(job['reason'] == 'upstream failed; no evaluation result', 'not a dependency-only block')
+            check(not self.db.execute('SELECT 1 FROM attempts WHERE job=?', (job_id,)).fetchone(), 'started attempts require separate recovery')
+            check(all(jobs[d]['status'] not in {'failed','blocked','cancelled'} for d in job['spec']['depends_on']), 'upstream failure not recovered')
+            self.db.execute("UPDATE jobs SET status='queued',reason='' WHERE id=?", (job_id,))
+            self.event('dependency_block_requeued', job_id, dict(depends_on=job['spec']['depends_on']))
+        return dict(job=job_id, status='queued')
+
     def retry_failed(self, job_id, additional_attempts=1):
         """Explicitly add retry budget to a failed job; old attempts stay terminal."""
         from .schema import number

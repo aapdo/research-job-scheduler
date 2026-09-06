@@ -158,6 +158,33 @@ class SchemaAndStoreTests(unittest.TestCase):
         self.assertEqual(self.store.jobs()[0]["spec"]["priority"], 99)
         self.assertEqual(self.store.db.execute("SELECT kind FROM events ORDER BY seq DESC LIMIT 1").fetchone()[0], "priority_changed")
 
+    def test_pending_resources_preserve_running_jobs(self):
+        self.store.register_experiment(experiment([job()]))
+        self.store.set_pending_resources('j',dict(gpu_count=4,cpu=8,ram_mib=16000,vram_mib=9000))
+        self.assertEqual(self.store.jobs()[0]['spec']['resources']['gpu_count'],4)
+        with self.store.db:self.store.db.execute("UPDATE jobs SET status='running'")
+        with self.assertRaises(ValueError):self.store.set_pending_resources('j',dict(gpu_count=2))
+
+    def test_only_dependency_block_can_be_requeued(self):
+        self.store.register_experiment(experiment([job('a'),job('b',deps=['a'])]))
+        with self.store.db:
+            self.store.db.execute("UPDATE jobs SET status='failed' WHERE id='a'")
+            self.store.db.execute("UPDATE jobs SET status='blocked',reason='upstream failed; no evaluation result' WHERE id='b'")
+        with self.assertRaises(ValueError):self.store.requeue_dependency_blocked('b')
+        self.store.retry_failed('a')
+        self.store.requeue_dependency_blocked('b')
+        self.assertEqual(next(j for j in self.store.jobs() if j['id']=='b')['status'],'queued')
+        self.assertEqual(self.store.db.execute("SELECT kind FROM events ORDER BY seq DESC LIMIT 1").fetchone()[0], 'dependency_block_requeued')
+
+    def test_pending_validation_gate_checks_cycles_and_running_state(self):
+        self.store.register_experiment(experiment([job('a'),job('b')]))
+        self.store.add_pending_order_dependency('b','a')
+        b=next(j for j in self.store.jobs() if j['id']=='b')['spec']
+        self.assertEqual(b['order_only_dependencies'],['a'])
+        with self.assertRaises(ValueError):self.store.add_pending_order_dependency('a','b')
+        with self.store.db:self.store.db.execute("UPDATE jobs SET status='running' WHERE id='a'")
+        with self.assertRaises(ValueError):self.store.add_pending_order_dependency('a','b')
+
     def test_failed_job_can_be_explicitly_requeued_with_more_attempt_budget(self):
         self.store.register_experiment(experiment([job()]))
         with self.store.db:
