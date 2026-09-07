@@ -71,12 +71,46 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
     successful = {a["job"]: a for a in attempts if a["status"] == "succeeded"}
     held = list(active)
     plan = []
+    latest = {}
+    for attempt in sorted(attempts, key=lambda a: a['created']):
+        # Artifact-transfer reservations occupy resources but are not producer attempts.
+        if 'job' in attempt:
+            latest[attempt['job']] = attempt
+    lineage_cache = {}
+
+    def lineage_error(key):
+        """An early artifact never silently follows a producer into a new retry.
+
+        Check ancestors too, so a completed intermediate evaluation cannot let a
+        final report combine checkpoints from superseded training attempts.
+        """
+        if key in lineage_cache:
+            return lineage_cache[key]
+        spec = by_id[key]['spec']
+        binding = spec.get('metadata', {}).get('epoch_dependency')
+        reason = ''
+        if binding:
+            source = latest.get(binding['source_job'])
+            if source is None or source['id'] != binding['source_attempt']:
+                reason = 'checkpoint lineage superseded or unavailable: ' + binding['source_job']
+            elif source['status'] not in ('running', 'succeeded'):
+                reason = 'checkpoint producer is not running/successful: ' + binding['source_job']
+        if not reason:
+            for dep in spec['depends_on']:
+                reason = lineage_error(dep)
+                if reason: break
+        lineage_cache[key] = reason
+        return reason
     scores = dependency_priorities(jobs, experiments)
     queued = sorted((j for j in jobs if j["status"] == "queued"),
                     key=lambda j: (-scores[j['id']][0], -scores[j['id']][1],
                                    j["created"], j["id"]))
     for j in queued:
         spec, failures = j["spec"], {}
+        invalid_lineage = lineage_error(j['id'])
+        if invalid_lineage:
+            plan.append({'job': j['id'], 'decision': 'blocked', 'reason': invalid_lineage})
+            continue
         waiting = [dep for dep in spec["depends_on"] if by_id[dep]["status"] != "succeeded"]
         if waiting:
             plan.append({"job": j["id"], "decision": "blocked", "reason": "dependencies not successful: " + ", ".join(waiting)})
