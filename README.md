@@ -233,6 +233,12 @@ research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20 --max-lau
 
 ### 실험 그룹 완료·오류 알림
 
+HF 업로드를 사용하는 전체 캠페인과 부분집합 모니터는 목적지 설정이 완전히 같으면
+겹칠 수 있습니다. 작업당 업로드는 하나이며 두 모니터가 같은 영수증을 공유합니다.
+다른 HF 목적지로 겹치는 설정은 계속 거부합니다. 후속 작업이 필요로 하는 산출물은
+의존성 우선순위로 먼저 업로드하고, 다운로드는 고정 commit·checksum으로 검증합니다.
+HF/Xet 캐시는 각 전송 작업의 filesystem에 둡니다.
+
 [campaign 예제](examples/campaign.json)는 `projects`와 선택적인 개별 `experiments`를 합쳐
 하나의 알림 단위를 만듭니다. 이름과 RQ도 campaign에 보관됩니다.
 

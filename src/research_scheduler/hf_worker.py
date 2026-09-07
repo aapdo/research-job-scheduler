@@ -128,7 +128,8 @@ def download(config, fetch=None):
     dest = Path(config['destination'])
     dest.mkdir(parents=True, exist_ok=True)
     common = dict(repo_id=receipt['repo_id'], repo_type=receipt['repo_type'],
-                  revision=receipt['revision'], token=token(config))
+                  revision=receipt['revision'], token=token(config),
+                  cache_dir=str(dest.parent / 'hub-cache'))
     def get(name):
         relative(name)
         return Path(fetch(filename=receipt['path'] + '/' + name, **common))

@@ -42,8 +42,11 @@ def reservations(store):
 def campaign_for(experiment, campaigns):
     matches = [c for c in campaigns.values() if c.get('hf') and c['enabled'] and not c['external']
                and (experiment['id'] in c['experiments'] or experiment['project'] in c['projects'])]
-    check(len(matches) <= 1, 'experiment selected by multiple HF campaigns')
-    return matches[0] if matches else None
+    # A focused upload monitor may overlap its parent scientific campaign. Both
+    # observe the same receipt; only one deterministic owner creates the upload.
+    check(len({dumps(c['hf']) for c in matches}) <= 1,
+          'experiment selected by HF campaigns with different destinations')
+    return min(matches, key=lambda c: c['id']) if matches else None
 
 
 def start(controller, attempt, node, direction, config):
@@ -55,7 +58,10 @@ def start(controller, attempt, node, direction, config):
         config['destination'] = directory + '/payload'
     request = dict(id=key, job=attempt['job'], node_spec=node, attempt_dir=directory,
                    argv=[node['hf']['python'], '-c', Path(hf_worker.__file__).read_text()],
-                   cwd=directory, env={}, config=config, input_files=[], outputs=['HF_RECEIPT.json'],
+                   cwd=directory,
+                   env={'HF_HUB_CACHE': str(Path(directory, 'hub-cache')),
+                        'HF_XET_CACHE': str(Path(directory, 'xet-cache'))},
+                   config=config, input_files=[], outputs=['HF_RECEIPT.json'],
                    resources=dict(gpu_count=0, vram_mib=0, gpu_mode='exclusive', cpu=2, ram_mib=1024),
                    startup_group=node['startup_group'], gpus=[])
     request['runner_sha256'] = hashlib.sha256(Path(agent.__file__).read_bytes()).hexdigest()
@@ -74,7 +80,7 @@ def start(controller, attempt, node, direction, config):
 def tick(controller, execute):
     """Called with scheduler lock. At most two cluster transfers, one per node."""
     from .notifications import campaign_specs
-    from .planner import base_health, fit
+    from .planner import base_health, fit, dependency_priorities
     store = controller.store
     campaigns = campaign_specs(store)
     health = controller.node_health()
@@ -169,7 +175,9 @@ def tick(controller, execute):
                     return
     # Prioritize publications that unblock successors; successful computation stays successful.
     needed = {d for j in queued for d in j['spec']['depends_on']}
-    for a in sorted(successful.values(), key=lambda a: (a['job'] not in needed, a['created'])):
+    priorities = dependency_priorities(list(jobs.values()), experiments)
+    for a in sorted(successful.values(), key=lambda a: (a['job'] not in needed,
+                    -priorities[a['job']][0], -priorities[a['job']][1], a['created'])):
         if a['report'].get('hf_artifact'):
             continue
         campaign = campaign_for(experiments[jobs[a['job']]['experiment']], campaigns)
@@ -179,10 +187,13 @@ def tick(controller, execute):
         spec = jobs[a['job']]['spec']
         if not spec['outputs']:
             continue
+        relocations = list(spec.get('hf_relocate_json', []))
+        if 'TRAIN_RESULT.json' in spec['outputs'] and 'TRAIN_RESULT.json' not in relocations:
+            relocations.append('TRAIN_RESULT.json')
         config = dict(hf=campaign['hf'], campaign=campaign['id'], attempt=a['id'], job=a['job'],
                       source_root=a['spec']['attempt_dir'], outputs=a['report']['outputs'],
                       patterns=list(dict.fromkeys(spec['outputs'] + spec.get('hf_artifacts', []))),
-                      relocate_json=spec.get('hf_relocate_json', []))
+                      relocate_json=relocations)
         start(controller, a, n, 'upload', config)
         return
 

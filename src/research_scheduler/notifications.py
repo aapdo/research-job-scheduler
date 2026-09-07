@@ -71,8 +71,9 @@ def register_campaign(store, raw):
                 return set(c['experiments']) | {k for k,e in experiments.items() if e['project'] in c['projects']}
             for other in campaign_specs(store).values():
                 if other['id'] != value['id'] and other.get('hf') and other['enabled']:
-                    check(not (set(other['projects']) & set(value['projects']) or selected(other) & selected(value)),
-                          'overlapping HF campaigns are not allowed')
+                    overlap = set(other['projects']) & set(value['projects']) or selected(other) & selected(value)
+                    check(not overlap or other['hf'] == value['hf'],
+                          'overlapping HF campaigns require the same destination')
         row = store.db.execute("SELECT spec FROM campaigns WHERE id=?", (value["id"],)).fetchone()
         if row is not None:
             old = json.loads(row[0])

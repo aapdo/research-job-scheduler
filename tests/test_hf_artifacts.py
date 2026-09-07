@@ -194,6 +194,46 @@ class HFIntegrationTests(unittest.TestCase):
             with self.assertRaises(ValueError):hf_spec({'repo_id':'user/study','token':'secret'})
             s.db.close()
 
+    def test_overlapping_monitors_share_one_destination_and_owner(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'db')
+            s.register_experiment(experiment([job('first')]))
+            a=register_campaign(s,dict(id='all',name='All',rq='why',projects=['general'],
+                                      hf={'repo_id':'user/results'}))
+            b=register_campaign(s,dict(id='subset',name='Subset',rq='why',experiments=['e'],
+                                      hf={'repo_id':'user/results'}))
+            self.assertEqual(campaign_for(dict(id='e',project='general'),{'subset':b,'all':a})['id'],'all')
+            with self.assertRaises(ValueError):
+                register_campaign(s,dict(id='conflict',name='Conflict',rq='why',experiments=['e'],
+                                         hf={'repo_id':'user/another'}))
+            s.db.close()
+
+    def test_needed_high_priority_checkpoint_uploads_before_old_archive(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'db');n=node(root=str(Path(root)/'runs'))
+            n['hf']={'python':sys.executable};s.register_node(n)
+            old=job('old',gpu_count=0);old['outputs']=['weights']
+            urgent=job('urgent',gpu_count=0,priority=60000);urgent['outputs']=['weights']
+            children=[job('old-child',deps=['old']),job('new-child',deps=['urgent'])]
+            s.register_experiment(experiment([old,urgent,*children]))
+            register_campaign(s,dict(id='campaign',name='Study',rq='why',projects=['general'],
+                                    hf={'repo_id':'user/results'}))
+            with s.db:
+                s.db.execute("UPDATE jobs SET status='succeeded' WHERE id in ('old','urgent')")
+                for index,key in enumerate(('old','urgent')):
+                    s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',
+                        (key+'.done',key,'a',dumps(dict(attempt_dir='/source/'+key,node_spec=n,startup_group='')),
+                         'succeeded',index,dumps({'outputs':{'weights':{'sha256':'0'*64}}})))
+                s.db.execute('INSERT INTO snapshots VALUES(?,?)',('a',dumps(snapshot(n))))
+            class Capture:
+                def __init__(self):self.launched=[]
+                def call(self,node,action,request):
+                    self.launched.append(request['job']);return {'status':'starting'}
+            transport=Capture()
+            with s.lock():tick(Controller(s,transport),execute=True)
+            self.assertEqual(transport.launched,['urgent'])
+            s.db.close()
+
     def test_failed_publication_never_changes_training_success_and_has_finite_retries(self):
         with tempfile.TemporaryDirectory() as root:
             s=Store(Path(root)/'db');n=node(root=str(Path(root)/'runs'))
