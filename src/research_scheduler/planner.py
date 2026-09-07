@@ -28,7 +28,8 @@ def gpu_healthy(gpu, node, mode):
     p = node["policy"]
     if gpu.get("temperature_c") is None or gpu["temperature_c"] >= p.get("max_gpu_temp_c", 85):
         return False
-    if gpu.get("util_percent") is None or gpu["util_percent"] > p["max_gpu_percent"]:
+    limit = p.get("max_shared_gpu_percent", p["max_gpu_percent"]) if mode == "shared" else p["max_gpu_percent"]
+    if gpu.get("util_percent") is None or gpu["util_percent"] > limit:
         return False
     if mode == "exclusive":
         # Exclusive means one scheduler reservation per GPU. A node may opt in to
@@ -90,14 +91,14 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
                     reasons.append(reason)
                 else:
                     count = sum(a["node"] == node_id for a in held)
-                    candidates.append((count, index, node_id, chosen, resources))
+                    candidates.append((-node.get("admission_priority", 0), count, index, node_id, chosen, resources))
                     break
             if reasons and len(reasons) == 1 + len(spec.get('resource_variants', [])):
                 failures[node_id] = '; '.join(dict.fromkeys(reasons))
         if not candidates:
             plan.append({"job": j["id"], "decision": "waiting", "reasons": failures or {"inventory": "no nodes registered"}})
             continue
-        _, _, node_id, chosen, resources = min(candidates, key=lambda c: c[:4])
+        _, _, _, node_id, chosen, resources = min(candidates, key=lambda c: c[:5])
         placement = {"job": j["id"], "decision": "ready", "node": node_id, "gpus": chosen,
                      "filesystem_request": job_filesystem(spec),
                      "filesystem": node_filesystem(nodes[node_id])}
@@ -159,18 +160,20 @@ def fit(job, node, snap, held, history, successful, groups, now):
                 suffix = ' (HF download pending)' if a.get('report', {}).get('hf_artifact') else ''
                 return "dependency artifacts on another local filesystem: " + dep + suffix, []
     own = [a for a in held if a["node"] == node["id"]]
-    registered = {g["uuid"]: g for g in node["gpus"] if g["enabled"]}
+    registered = {g["uuid"]: g for g in node["gpus"] if g["enabled"]
+                  and g["uuid"] not in p.get("disabled_gpu_uuids", [])}
     if req["gpu_count"]:
         if not registered:
             return "not enough enabled GPUs", []
         observed = {g["uuid"]: g for g in snap["gpus"] if g["uuid"] in registered}
-        if any(gpu not in observed or observed[gpu].get("temperature_c") is None for gpu in registered):
+        if p.get("temperature_scope", "node") == "node" and any(gpu not in observed or observed[gpu].get("temperature_c") is None for gpu in registered):
             return "GPU temperature telemetry unavailable", []
-        hottest = max(observed[gpu]["temperature_c"] for gpu in registered)
-        if hottest >= p.get("max_gpu_temp_c", 85):
-            return "GPU temperature at or above hard launch limit", []
-        if hottest >= p.get("warm_gpu_temp_c", 80) and len(own) >= p.get("warm_max_jobs", 1):
-            return "warm-node job cap reached", []
+        if p.get("temperature_scope", "node") == "node":
+            hottest = max(observed[gpu]["temperature_c"] for gpu in registered)
+            if hottest >= p.get("max_gpu_temp_c", 85):
+                return "GPU temperature at or above hard launch limit", []
+            if hottest >= p.get("warm_gpu_temp_c", 80) and len(own) >= p.get("warm_max_jobs", 1):
+                return "warm-node job cap reached", []
     if len(own) >= node["max_jobs"]:
         return "node job slots reserved", []
     if any(a["status"] == "unknown" for a in own):
@@ -208,6 +211,11 @@ def fit(job, node, snap, held, history, successful, groups, now):
         if gpu["uuid"] not in registered:
             continue
         users = [a for a in own if gpu["uuid"] in a["spec"]["gpus"]]
+        if (p.get("temperature_scope", "node") == "gpu"
+                and gpu.get("temperature_c") is not None
+                and gpu["temperature_c"] >= p.get("warm_gpu_temp_c", 80)
+                and (len(users) >= p.get("warm_max_jobs", 1) or gpu.get("processes"))):
+            continue
         required_polls = (p.get("shared_stable_polls", 1)
                           if req["gpu_mode"] == "shared" and users else p["stable_polls"])
         if gpu.get("stable_polls", 0) < required_polls or not gpu_healthy(gpu, node, req["gpu_mode"]):

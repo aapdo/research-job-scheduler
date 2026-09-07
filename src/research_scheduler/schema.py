@@ -56,7 +56,7 @@ def file_contract(value):
 def node_spec(raw):
     n = copy.deepcopy(raw)
     fields(n, "id transport target python work_root storage_domain labels gpus enabled max_jobs "
-           "cpu_limit ram_limit_mib policy assets startup_group recovery datasets filesystem hf")
+           "cpu_limit ram_limit_mib policy assets startup_group recovery datasets filesystem hf admission_priority")
     identifier(n["id"])
     n.setdefault("transport", "ssh")
     check(n["transport"] in ("local", "ssh"), "transport must be local or ssh")
@@ -80,6 +80,7 @@ def node_spec(raw):
     check(n["filesystem"] in FILESYSTEMS, "node filesystem must be local or nfs")
     check(isinstance(n["enabled"], bool), "enabled must be boolean")
     number(n["max_jobs"], "max_jobs", 1, True)
+    number(n.setdefault("admission_priority", 0), "admission_priority", 0, True)
     for k in ("cpu_limit", "ram_limit_mib"):
         if k in n:
             number(n[k], k, 1)
@@ -94,7 +95,13 @@ def node_spec(raw):
     fields(p, "stable_polls max_snapshot_age_s max_cpu_percent max_gpu_percent min_free_ram_mib "
            "min_free_disk_mib gpu_margin_mib max_idle_used_mib allow_gpu_sharing "
            "allow_external_gpu_processes max_shared_jobs_per_gpu warm_gpu_temp_c max_gpu_temp_c "
-           "warm_max_jobs shared_stable_polls read_probe_path read_probe_bytes read_probe_timeout_s")
+           "warm_max_jobs shared_stable_polls read_probe_path read_probe_bytes read_probe_timeout_s "
+           "temperature_scope max_shared_gpu_percent disabled_gpu_uuids")
+    p.setdefault("temperature_scope", "node")
+    check(p["temperature_scope"] in ("node", "gpu"), "invalid temperature_scope")
+    p.setdefault("disabled_gpu_uuids", [])
+    check(isinstance(p["disabled_gpu_uuids"], list) and all(isinstance(g, str) and g.startswith("GPU-")
+          for g in p["disabled_gpu_uuids"]), "invalid disabled_gpu_uuids")
     defaults = dict(stable_polls=3, max_snapshot_age_s=60, max_cpu_percent=90,
                     max_gpu_percent=10, min_free_ram_mib=1024, min_free_disk_mib=1024,
                     gpu_margin_mib=1024, max_idle_used_mib=256, allow_gpu_sharing=False,
@@ -113,6 +120,9 @@ def node_spec(raw):
                          "shared_stable_polls"))
     for k in ("max_cpu_percent", "max_gpu_percent"):
         check(p[k] <= 100, k + " must be <=100")
+    if "max_shared_gpu_percent" in p:
+        number(p["max_shared_gpu_percent"], "max_shared_gpu_percent", 0)
+        check(p["max_shared_gpu_percent"] <= 100, "max_shared_gpu_percent must be <=100")
     check(p["warm_gpu_temp_c"] < p["max_gpu_temp_c"],
           "warm_gpu_temp_c must be below max_gpu_temp_c")
     if "read_probe_path" in p:
