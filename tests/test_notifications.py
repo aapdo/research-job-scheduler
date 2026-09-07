@@ -2,11 +2,12 @@
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from research_scheduler.notifications import poll_campaigns, register_campaign, status
+from research_scheduler.notifications import poll_campaigns, register_campaign, status, webhook_path
 from research_scheduler.store import Store
 
 
@@ -55,6 +56,23 @@ class CampaignNotificationTests(unittest.TestCase):
 
     def sender(self, url, payload):
         self.sent.append((url, payload))
+
+    def test_default_secret_survives_missing_environment_on_restart(self):
+        secret_dir = self.root / '.config/research-scheduler'
+        secret_dir.mkdir(parents=True)
+        target = secret_dir / 'slack-webhook'
+        target.write_text(self.secret.read_text())
+        target.chmod(0o600)
+        with patch.dict('os.environ', {}, clear=True), patch('pathlib.Path.home', return_value=self.root):
+            self.assertEqual(webhook_path(), str(target))
+            self.assertEqual(webhook_path(''), '')
+            register_campaign(self.store, campaign('external', external=True))
+            result = poll_campaigns(self.store, external_observations={
+                'external': {'state':'complete','counts':{'complete':1}}}, sender=self.sender)
+            self.assertEqual(result['sent'], 1)
+            self.assertTrue(status(self.store)['webhook_configured'])
+            with patch.dict('os.environ', {'RS_SLACK_WEBHOOK_FILE':''}):
+                self.assertEqual(webhook_path(), '')
 
     def test_project_campaign_alerts_once_per_terminal_transition(self):
         self.store.register_experiment(experiment())

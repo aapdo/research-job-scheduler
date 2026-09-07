@@ -248,8 +248,12 @@ job이 있으면 `running`, 모든 job이 `succeeded`/`cancelled`이면 `complet
 실패가 더 늘어나는 경우에는 반복 알림하지 않습니다.
 
 Slack Incoming Webhook은 JSON, DB, 명령행 인수나 Git 저장소에 넣지 않고 제어 머신의 별도
-파일에 둡니다. 파일이 없거나 환경 변수를 지정하지 않으면 알림 전송은 자동으로 비활성화되며,
+파일에 둡니다. 환경 변수를 생략하면 `~/.config/research-scheduler/slack-webhook`을 자동으로
+읽으므로 컨트롤러 재시작에도 설정이 유지됩니다. 해당 파일도 없으면 알림 전송은 비활성화되며,
 상태 관찰과 pending outbox는 보존됩니다.
+
+`RS_SLACK_WEBHOOK_FILE`을 명시하면 그 경로를 우선 사용하고, 빈 문자열로 지정하면 알림을
+명시적으로 끕니다. secret 파일명 `slack-webhook`과 `slack-webhook.*`는 Git에서 제외합니다.
 
 ```bash
 install -d -m 700 "$HOME/.config/research-scheduler"

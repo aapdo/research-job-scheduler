@@ -164,6 +164,16 @@ def _record_observation(store, spec, observation, now):
                     {"state": observation["state"], "generation": generation, "notification": key})
 
 
+def webhook_path(explicit=None):
+    """Persist via the user config directory; explicit empty string disables."""
+    if explicit is not None:
+        return str(explicit)
+    if 'RS_SLACK_WEBHOOK_FILE' in os.environ:
+        return os.environ['RS_SLACK_WEBHOOK_FILE']
+    path = Path.home() / '.config/research-scheduler/slack-webhook'
+    return str(path) if path.is_file() else ''
+
+
 def _webhook(path):
     if not path:
         return None
@@ -208,7 +218,7 @@ def poll_campaigns(store, external_observations=None, webhook_file=None, sender=
             "SELECT * FROM notification_outbox WHERE status IN ('pending','sending') "
             "AND next_attempt<=?", (now,)).fetchall()
     try:
-        url = _webhook(webhook_file or os.environ.get("RS_SLACK_WEBHOOK_FILE", ""))
+        url = _webhook(webhook_path(webhook_file))
     except (OSError, ValueError) as exc:
         return {"enabled": False, "config_error": type(exc).__name__, "queued": len(pending), "sent": 0}
     if not url:
@@ -255,4 +265,4 @@ def status(store):
         "SELECT id,campaign,state,status,attempts,next_attempt,created,sent,error "
         "FROM notification_outbox ORDER BY created")]
     return {"campaigns": specs, "runtime": runtime, "outbox": outbox,
-            "webhook_configured": bool(os.environ.get("RS_SLACK_WEBHOOK_FILE", ""))}
+            "webhook_configured": bool(webhook_path())}

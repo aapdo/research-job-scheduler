@@ -166,7 +166,9 @@ project selector는 같은 project로 나중에 등록되는 experiment도 자�
 
 Slack 전송을 사용할 때 daemon 환경의 `RS_SLACK_WEBHOOK_FILE`에 제어 머신의 비밀 파일 경로를
 지정합니다. 파일은 daemon 사용자 소유이고 mode `0600`처럼 group/world 접근 비트가 없어야 합니다.
-환경 변수가 없으면 기능은 비활성화됩니다. webhook URL 자체는 DB, event, outbox, campaign JSON에
+환경 변수를 생략하면 `~/.config/research-scheduler/slack-webhook`을 사용하며 그 파일도 없으면
+비활성화됩니다. 환경 변수에 빈 문자열을 지정하면 명시적으로 끕니다.
+webhook URL 자체는 DB, event, outbox, campaign JSON에
 저장하지 않습니다. credential을 experiment/job `env`에 넣으면 attempt 명세와 DB에 남으므로
 그 방식은 사용하지 않습니다.
 

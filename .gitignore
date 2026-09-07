@@ -24,3 +24,5 @@ id_ed25519*
 *.credentials.json
 *.secrets.json
 *.token
+slack-webhook
+slack-webhook.*
