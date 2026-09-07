@@ -88,7 +88,9 @@ class CampaignNotificationTests(unittest.TestCase):
         failed = poll_campaigns(self.store, webhook_file=self.secret, sender=self.sender)
         repeated = poll_campaigns(self.store, webhook_file=self.secret, sender=self.sender)
         self.assertEqual((failed["sent"], repeated["sent"], len(self.sent)), (1, 0, 1))
-        self.assertIn("Research campaign error", self.sent[0][1]["text"])
+        self.assertIn("실험 캠페인 오류 발생", self.sent[0][1]["text"])
+        self.assertIn("발생 시각(감지 기준):", self.sent[0][1]["text"])
+        self.assertIn("KST", self.sent[0][1]["text"])
 
         with self.store.db:
             self.store.db.execute("UPDATE jobs SET status='running',reason='' WHERE id='study-train'")
@@ -97,7 +99,7 @@ class CampaignNotificationTests(unittest.TestCase):
             self.store.db.execute("UPDATE jobs SET status='succeeded' WHERE id='study-train'")
         completed = poll_campaigns(self.store, webhook_file=self.secret, sender=self.sender)
         self.assertEqual((completed["sent"], len(self.sent)), (1, 2))
-        self.assertIn("Research campaign complete", self.sent[1][1]["text"])
+        self.assertIn("실험 캠페인 완료", self.sent[1][1]["text"])
 
         outbox = status(self.store)["outbox"]
         self.assertEqual([row["status"] for row in outbox], ["sent", "sent"])

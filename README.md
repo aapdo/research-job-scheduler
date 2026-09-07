@@ -242,6 +242,8 @@ research-scheduler --db "$SCHEDULER_DB" campaign-status
 ```
 
 campaign은 개별 job이 끝날 때마다 알리지 않습니다. 그룹이 처음 `complete` 또는 `error`로
+전이한 감지 시각을 `YYYY-MM-DD HH:MM:SS KST` 형식으로 한국어 알림에 포함합니다. 전송 지연이나
+재시도에도 outbox에 저장된 최초 시각이 유지됩니다. 그룹이 `complete` 또는 `error`로
 전이할 때 한 번만 알립니다. `failed`/`blocked` job이 하나라도 생기면 `error`, 아직 실행할
 job이 있으면 `running`, 모든 job이 `succeeded`/`cancelled`이면 `complete`입니다. 오류 뒤
 재시도로 `running`에 복귀했다가 완료되면 완료 알림을 추가로 보냅니다. 같은 오류 상태에서

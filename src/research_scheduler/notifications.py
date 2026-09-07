@@ -6,6 +6,7 @@ import stat
 import time
 import urllib.request
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 from .schema import check, fields, identifier
 from .store import dumps
@@ -128,19 +129,30 @@ def _job_observation(store, spec):
             "experiments": len(selected), "errors": errors[:8], 'publication': publication}
 
 
-def _message(spec, observation):
+def _message(spec, observation, occurred_at):
     icon = "✅" if observation["state"] == "complete" else "🚨"
-    title = "complete" if observation["state"] == "complete" else "error"
-    counts = ", ".join(f"{key}={value}" for key, value in sorted(observation.get("counts", {}).items()))
-    lines = [f"{icon} Research campaign {title}", f"{spec['name']} (`{spec['id']}`)",
-             "RQ: " + spec["rq"], "Counts: " + (counts or "external campaign")]
+    title = "완료" if observation["state"] == "complete" else "오류 발생"
+    labels = dict(succeeded='성공', complete='완료', failed='실패', blocked='차단',
+                  queued='대기', starting='시작 중', running='실행 중', unknown='상태 불명',
+                  cancelled='취소', artifact_error='결과물 전송 오류', published='업로드 완료',
+                  pending='전송 대기', error='오류')
+    counts = ", ".join(f"{labels.get(key, key)} {value}개" for key, value in sorted(observation.get("counts", {}).items()))
+    timestamp = datetime.fromtimestamp(occurred_at, timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S KST')
+    lines = [f"{icon} 실험 캠페인 {title}", f"캠페인: {spec['name']} (`{spec['id']}`)",
+             '발생 시각(감지 기준): ' + timestamp,
+             "연구 질문: " + spec["rq"], "작업 현황: " + (counts or "외부 캠페인")]
     if spec.get('hf'):
         h = spec['hf']
         lines.append('HF: https://huggingface.co/' + ('datasets/' if h['repo_type']=='dataset' else '') + h['repo_id'])
-        lines.append('Artifact publication: ' + dumps(observation.get('publication', {})))
+        publication = (observation.get('publication') or {}).get('counts', {})
+        lines.append('결과물 업로드: ' + ', '.join(f'{labels.get(k,k)} {v}개' for k,v in publication.items()))
     for error in observation.get("errors", [])[:5]:
-        reason = (error.get("reason") or "no reason recorded").replace("\n", " ")[:240]
-        lines.append(f"- {error.get('job', 'external')}: {error.get('status', 'error')} — {reason}")
+        reason = error.get('reason') or '상세 원인 미기록'
+        reason = {'upstream failed; no evaluation result': '선행 작업 실패로 후속 작업 차단',
+                  'HF Python/auth paths not configured on source node': '원본 서버에 HF 실행 환경·인증 경로가 등록되지 않음',
+                  'HF upload retry budget exhausted; training remains successful': 'HF 업로드 재시도 소진(학습은 성공)'}.get(reason, reason)
+        reason = reason.replace('\n', ' ')[:240]
+        lines.append(f"- {error.get('job', '외부 작업')}: {labels.get(error.get('status'), '오류')} — {reason}")
     return "\n".join(lines)
 
 
@@ -156,7 +168,7 @@ def _record_observation(store, spec, observation, now):
                      (spec["id"], observation["state"], generation, dumps(observation), now))
     if previous != observation["state"] and observation["state"] in ALERT_STATES:
         key = hashlib.sha256(f"{spec['id']}\0{generation}\0{observation['state']}".encode()).hexdigest()
-        payload = {"text": _message(spec, observation)}
+        payload = {"text": _message(spec, observation, now)}
         store.db.execute("INSERT OR IGNORE INTO notification_outbox "
                          "(id,campaign,state,payload,status,next_attempt,created) VALUES(?,?,?,?,?,?,?)",
                          (key, spec["id"], observation["state"], dumps(payload), "pending", now, now))
