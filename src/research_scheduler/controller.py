@@ -304,6 +304,8 @@ class Controller:
                 self.refresh()
             self.invalidate_unavailable()
             self.reconcile()
+            from .datasets import tick as dataset_tick
+            dataset_tick(self, execute=execute)
             from .artifacts import tick as artifact_tick
             artifact_tick(self, execute=execute)
             plan = self.plan()

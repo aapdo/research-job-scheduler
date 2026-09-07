@@ -324,6 +324,13 @@ def main():
             if digest(receipt['path']) != receipt['sha256']:
                 raise ValueError('artifact receipt changed')
             result['artifact'] = json.loads(Path(receipt['path']).read_text())
+    elif action == 'dataset_receipt':
+        result = read_status(request)
+        if result.get('status') == 'succeeded':
+            receipt = result['outputs']['DATASET_READY.json']
+            if digest(receipt['path']) != receipt['sha256']:
+                raise ValueError('dataset receipt changed')
+            result['dataset_receipt'] = json.loads(Path(receipt['path']).read_text())
     elif action == "launch":
         result = launch(request, payload["source"])
     else:

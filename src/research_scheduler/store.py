@@ -51,6 +51,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS snapshots(node TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS node_health(node TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY, time REAL, kind TEXT, subject TEXT, data TEXT);
+            CREATE TABLE IF NOT EXISTS dataset_catalog(id TEXT PRIMARY KEY, spec TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS dataset_preparations(
+                dataset TEXT NOT NULL, node TEXT NOT NULL, job TEXT NOT NULL, state TEXT NOT NULL,
+                receipt TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(dataset,node));
             CREATE TABLE IF NOT EXISTS artifact_transfers(
                 id TEXT PRIMARY KEY, attempt TEXT NOT NULL, node TEXT NOT NULL,
                 direction TEXT NOT NULL, status TEXT NOT NULL, spec TEXT NOT NULL,

@@ -297,6 +297,8 @@ daemon은 전이와 전송 결과를 durable outbox와 event log에 기록하므
 | `events` | 등록·설정 변경·장애·실행 상태 전이 이력 확인 |
 | `register-campaign FILE` | project/experiment들을 완료·오류 알림 단위로 등록 |
 | `campaign-status` | campaign 상태와 비밀값을 제외한 알림 outbox 확인 |
+| `register-dataset FILE` | 데이터 버전·기대 해시·서버별 준비/검증 명령 등록 |
+| `dataset-status` | 자동 CPU 준비 작업과 검증된 데이터 경로 확인 |
 | `artifact-status` | HF upload/download 상태와 완료 revision·링크 확인 |
 | `set-node-hf NODE FILE` | node의 HF Python과 비밀 token 파일 경로 등록 |
 | `set-job-hf-artifacts JOB FILE` | 첫 전송 전에 export 파일 glob 및 JSON 경로 변환 계약 등록 |
@@ -386,6 +388,7 @@ MIG/MPS·선점·자동 checkpoint resume·VRAM peak 자동 profiling은 지원�
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | 서버·job 필드, 기본값, 치환 값, GPU 공유 및 NFS 설정 |
 | [STATE_MACHINE.md](docs/STATE_MACHINE.md) | job/attempt/node 상태와 재시도·invalid 처리 |
 | [HF_ARTIFACTS.md](docs/HF_ARTIFACTS.md) | campaign HF 저장소, 자동 upload/download와 checkpoint 경로 변환 |
+| [DATASET_PREPARATION.md](docs/DATASET_PREPARATION.md) | 미등록 데이터 준비·검증·경로 등록 자동화 |
 | [OPEN_SOURCE_REVIEW.md](docs/OPEN_SOURCE_REVIEW.md) | Slurm·ClearML·Ray 검토와 구현 선택 근거 |
 | [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 배치·전송·의존성 회귀 테스트와 실제/모의 검증 범위 |
 | [node.ssh.json](examples/node.ssh.json) | 서버 등록 예제 |

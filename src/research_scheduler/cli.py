@@ -19,7 +19,7 @@ def parser():
     p = argparse.ArgumentParser(description="Generic research scheduler (Linux, NVIDIA, SSH/local)")
     p.add_argument("--db", required=True, help="SQLite path on the control machine's LOCAL disk")
     sub = p.add_subparsers(dest="command", required=True)
-    for name in ("register-node", "register-group", "register-experiment", "register-campaign"):
+    for name in ("register-node", "register-group", "register-experiment", "register-campaign", "register-dataset"):
         sub.add_parser(name).add_argument("file", help="JSON specification")
     d = sub.add_parser("discover", help="read-only live hardware discovery; --apply records GPUs disabled")
     d.add_argument("node")
@@ -78,6 +78,7 @@ def parser():
     retry.add_argument("--additional-attempts", type=int, default=1)
     sub.add_parser("events")
     sub.add_parser("campaign-status", help="show campaign state and notification outbox without secrets")
+    sub.add_parser('dataset-status', help='show automatic dataset preparation and validated replica registration')
     sub.add_parser('artifact-status', help='show HF publication and download state, revisions and links')
     variants = sub.add_parser('set-job-resource-variants', help='register prevalidated alternative GPU/VRAM resource profiles')
     variants.add_argument('job')
@@ -135,7 +136,14 @@ def main(argv=None):
         if cmd.startswith("register-"):
             fn = {"register-node": store.register_node, "register-group": store.register_group,
                   "register-experiment": store.register_experiment}.get(cmd)
-            result = register_campaign(store, load(args.file)) if cmd == "register-campaign" else fn(load(args.file))
+            if cmd == 'register-dataset':
+                from .datasets import register
+                result = register(store, load(args.file))
+            else:
+                result = register_campaign(store, load(args.file)) if cmd == "register-campaign" else fn(load(args.file))
+        elif cmd == 'dataset-status':
+            from .datasets import status
+            result = status(store)
         elif cmd == "inventory":
             result = {"nodes": store.specs("nodes"), "groups": store.specs("groups_"), "health": controller.node_health()}
         elif cmd == "discover":
