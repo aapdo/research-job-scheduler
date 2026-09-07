@@ -125,13 +125,18 @@ def _job_observation(store, spec):
             state = 'error'
         elif publication['counts']['pending'] and state == 'complete':
             state = 'running'
+    ready = {a['job'] for a in store.attempts()
+             if a['status'] == 'running' and a.get('report', {}).get('ready')}
     return {"state": state, "counts": counts, "jobs": len(jobs),
+            "failed_jobs": [j['id'] for j in jobs if j['status'] == 'failed'],
+            "confirmed_jobs": [j['id'] for j in jobs if j['status'] == 'succeeded'
+                               or (j['status'] == 'running' and j['id'] in ready)],
             "experiments": len(selected), "errors": errors[:8], 'publication': publication}
 
 
 def _message(spec, observation, occurred_at):
-    icon = "✅" if observation["state"] == "complete" else "🚨"
-    title = "완료" if observation["state"] == "complete" else "오류 발생"
+    icon = {"complete": "✅", "recovered": "🔄"}.get(observation['state'], "🚨")
+    title = {"complete": "완료", "recovered": "복구 · 정상 실행 재개"}.get(observation['state'], "오류 발생")
     labels = dict(succeeded='성공', complete='완료', failed='실패', blocked='차단',
                   queued='대기', starting='시작 중', running='실행 중', unknown='상태 불명',
                   cancelled='취소', artifact_error='결과물 전송 오류', published='업로드 완료',
@@ -141,6 +146,8 @@ def _message(spec, observation, occurred_at):
     lines = [f"{icon} 실험 캠페인 {title}", f"캠페인: {spec['name']} (`{spec['id']}`)",
              '발생 시각(감지 기준): ' + timestamp,
              "연구 질문: " + spec["rq"], "작업 현황: " + (counts or "외부 캠페인")]
+    if observation['state'] == 'recovered':
+        lines.append('이전 실패 작업의 실행 준비 완료 또는 성공을 확인했습니다. 전체 실험 완료 알림은 아닙니다.')
     if spec.get('hf'):
         h = spec['hf']
         lines.append('HF: https://huggingface.co/' + ('datasets/' if h['repo_type']=='dataset' else '') + h['repo_id'])
@@ -159,21 +166,40 @@ def _message(spec, observation, occurred_at):
 def _record_observation(store, spec, observation, now):
     check(observation.get("state") in {"pending", "running", "complete", "error"},
           "invalid campaign observation")
-    row = store.db.execute("SELECT state,generation FROM campaign_runtime WHERE id=?",
+    row = store.db.execute("SELECT state,generation,details FROM campaign_runtime WHERE id=?",
                            (spec["id"],)).fetchone()
     previous, generation = (row[0], row[1]) if row else (None, 0)
+    old = json.loads(row[2]) if row else {}
+    observation = dict(observation)
+    recovery = old.get('_pending_recovery')
+    if observation['state'] == 'error':
+        targets = set((recovery or {}).get('jobs', [])) | set(observation.get('failed_jobs', []))
+        recovery = dict(jobs=sorted(targets), generation=generation + int(previous != 'error'))
+    elif previous == 'error' and recovery is None:
+        # Upgrade an existing runtime without inventing a recovery from normal startup.
+        recovery = dict(jobs=[e['job'] for e in old.get('errors', [])
+                              if e.get('status') == 'failed' and e.get('job')], generation=generation)
+    recovered = bool(recovery and observation['state'] == 'running' and
+                     ((recovery['jobs'] and set(recovery['jobs']) <= set(observation.get('confirmed_jobs', [])))
+                      or (not recovery['jobs'] and observation.get('recovery_ready') is True)))
+    recovery_generation = recovery['generation'] if recovery else None
+    if recovered or observation['state'] == 'complete':
+        recovery = None
+    observation['_pending_recovery'] = recovery
     if previous != observation["state"]:
         generation += 1
     store.db.execute("INSERT OR REPLACE INTO campaign_runtime VALUES(?,?,?,?,?)",
                      (spec["id"], observation["state"], generation, dumps(observation), now))
-    if previous != observation["state"] and observation["state"] in ALERT_STATES:
-        key = hashlib.sha256(f"{spec['id']}\0{generation}\0{observation['state']}".encode()).hexdigest()
-        payload = {"text": _message(spec, observation, now)}
+    alert = 'recovered' if recovered else observation['state']
+    if recovered or (previous != observation["state"] and observation["state"] in ALERT_STATES):
+        token = recovery_generation if recovered else generation
+        key = hashlib.sha256(f"{spec['id']}\0{token}\0{alert}".encode()).hexdigest()
+        payload = {"text": _message(spec, dict(observation, state=alert), now)}
         store.db.execute("INSERT OR IGNORE INTO notification_outbox "
                          "(id,campaign,state,payload,status,next_attempt,created) VALUES(?,?,?,?,?,?,?)",
-                         (key, spec["id"], observation["state"], dumps(payload), "pending", now, now))
+                         (key, spec["id"], alert, dumps(payload), "pending", now, now))
         store.event("campaign_alert_queued", spec["id"],
-                    {"state": observation["state"], "generation": generation, "notification": key})
+                    {"state": alert, "generation": generation, "notification": key})
 
 
 def webhook_path(explicit=None):

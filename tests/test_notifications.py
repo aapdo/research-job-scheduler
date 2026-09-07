@@ -155,6 +155,50 @@ class CampaignNotificationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             register_campaign(self.store, dict(spec, experiments=["missing"]))
 
+    def test_recovery_waits_for_failed_job_ready_and_survives_restart(self):
+        self.store.register_experiment(experiment())
+        self.store.register_experiment(experiment('unrelated'))
+        register_campaign(self.store, campaign())
+        def poll():
+            return poll_campaigns(self.store, webhook_file=self.secret, sender=self.sender)
+        with self.store.db:
+            self.store.db.execute("UPDATE jobs SET status='failed' WHERE id='study-train'")
+            self.store.db.execute("UPDATE jobs SET status='running' WHERE id='unrelated-train'")
+        poll()
+        with self.store.db:
+            self.store.db.execute("UPDATE jobs SET status='queued' WHERE id='study-train'")
+        with patch.object(self.store, 'attempts', return_value=[
+                {'job':'unrelated-train','status':'running','report':{'ready':True}}]):
+            self.assertEqual(poll()['sent'], 0)
+        self.store.db.close()
+        self.store = Store(self.root / 'state.db')
+        with self.store.db:
+            self.store.db.execute("UPDATE jobs SET status='running' WHERE id='study-train'")
+        self.assertEqual(poll()['sent'], 0)
+        with patch.object(self.store, 'attempts', return_value=[
+                {'job':'study-train','status':'running','report':{'ready':True}}]):
+            self.assertEqual(poll()['sent'], 1)
+            self.assertEqual(poll()['sent'], 0)
+        self.assertIn('복구 · 정상 실행 재개', self.sent[-1][1]['text'])
+        self.assertIn('KST', self.sent[-1][1]['text'])
+        with self.store.db:
+            self.store.db.execute("UPDATE jobs SET status='failed' WHERE id='study-train'")
+        self.assertEqual(poll()['sent'], 1)
+        with self.store.db:
+            self.store.db.execute("UPDATE jobs SET status='running' WHERE id='study-train'")
+        with patch.object(self.store, 'attempts', return_value=[
+                {'job':'study-train','status':'running','report':{'ready':True}}]):
+            self.assertEqual(poll()['sent'], 1)
+
+    def test_direct_completion_sends_completion_not_recovery(self):
+        self.store.register_experiment(experiment())
+        register_campaign(self.store, campaign())
+        with self.store.db: self.store.db.execute("UPDATE jobs SET status='failed'")
+        poll_campaigns(self.store, webhook_file='', sender=self.sender)
+        with self.store.db: self.store.db.execute("UPDATE jobs SET status='succeeded'")
+        poll_campaigns(self.store, webhook_file='', sender=self.sender)
+        self.assertEqual([r['state'] for r in status(self.store)['outbox']], ['error', 'complete'])
+
 
 if __name__ == "__main__":
     unittest.main()
