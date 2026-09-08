@@ -63,12 +63,27 @@ class Store:
         os.chmod(self.path, 0o600)
 
     @contextlib.contextmanager
-    def lock(self):
+    def lock(self, timeout=0, poll_interval=0.1):
+        """Exclusive registry lock; dispatchers fail fast, control jobs may wait.
+
+        The timeout covers lock acquisition only. Never wait while holding a
+        SQLite transaction: callers use ``with store.lock(...), store.db``.
+        """
+        from .schema import number
+        number(timeout, 'lock timeout', 0)
+        number(poll_interval, 'lock poll interval', 0)
+        check(poll_interval > 0, 'lock poll interval must be positive')
+        deadline = time.monotonic() + timeout
         with self.path.with_suffix(self.path.suffix + ".lock").open("a") as f:
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise RuntimeError("another controller/registry operation holds the scheduler lock") from exc
+            while True:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError("another controller/registry operation holds the scheduler lock") from exc
+                    time.sleep(min(poll_interval, remaining))
             yield
 
     def event(self, kind, subject, data):
