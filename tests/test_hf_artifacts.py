@@ -1,10 +1,13 @@
 """Offline HF transfers: immutable revisions, hashes, paths and admission gates."""
 import copy
 import hashlib
+import io
 import json
 import shutil
+import sqlite3
 import sys
 import tempfile
+import tarfile
 import types
 import unittest
 from pathlib import Path
@@ -17,6 +20,22 @@ from research_scheduler.notifications import register_campaign
 from research_scheduler.controller import Controller
 from research_scheduler.store import Store, dumps
 from test_scheduler import node, snapshot, job, experiment, plan, reservation
+
+
+class ReservationReadTests(unittest.TestCase):
+    def test_terminal_transfer_requests_are_not_decoded(self):
+        db=sqlite3.connect(':memory:');db.row_factory=sqlite3.Row
+        try:
+            db.execute('CREATE TABLE artifact_transfers(id TEXT,status TEXT,spec TEXT,report TEXT,created REAL)')
+            db.executemany('INSERT INTO artifact_transfers VALUES(?,?,?,?,?)',[
+                ('old','succeeded','not decoded','not decoded',1),
+                ('live','running','{}','{}',2)])
+            rows=reservations(types.SimpleNamespace(db=db))
+            self.assertEqual([r['id'] for r in rows],['live'])
+            self.assertFalse(rows[0]['released'])
+            self.assertEqual(db.execute('SELECT count(*) FROM artifact_transfers').fetchone()[0],2)
+        finally:
+            db.close()
 
 
 class FakeAdd:
@@ -80,10 +99,106 @@ class HFWorkerTests(unittest.TestCase):
         self.assertEqual(hf_worker.digest(self.source/'result.json'),
                          self.config['outputs']['result.json']['sha256'])
 
+    def test_archive_roundtrip_preserves_all_files_and_uses_two_hub_entries(self):
+        receipt=hf_worker.upload(dict(self.config,archive_payload=True),self.hub)
+        self.assertEqual(len(self.hub.calls),1)
+        self.assertEqual(len(self.hub.calls[0]['operations']),2)
+        self.assertIn('archive',receipt)
+        restored=hf_worker.download(dict(receipt=receipt,destination=str(self.root/'packed')),self.hub.download)
+        self.assertEqual((self.root/'packed/weights.bin').read_bytes(),b'checkpoint')
+        self.assertEqual(set(restored['files']),set(receipt['files']))
+        self.assertEqual(restored['derived']['result.json']['original_sha256'],self.config['outputs']['result.json']['sha256'])
+        archive=self.hub.root/receipt['path']/receipt['archive']['file']
+        archive.write_bytes(b'corrupt')
+        with self.assertRaisesRegex(ValueError,'archive hash mismatch'):
+            hf_worker.download(dict(receipt=receipt,destination=str(self.root/'corrupt')),self.hub.download)
+
+    def test_campaign_policy_archives_future_transfers_without_one_off_flag(self):
+        cfg=dict(self.config,hf=dict(self.config['hf'],archive_payload=True))
+        receipt=hf_worker.upload(cfg,self.hub)
+        self.assertIn('archive',receipt)
+        self.assertEqual(len(self.hub.calls[0]['operations']),2)
+
+    def test_archive_rejects_unsafe_duplicate_missing_or_changed_members(self):
+        for case in ('escape','symlink','duplicate','missing','hash','size'):
+            with self.subTest(case=case):
+                path=self.root/(case+'.tar.gz');entries={'ok':dict(bytes=1,sha256=hashlib.sha256(b'x').hexdigest())}
+                with tarfile.open(path,'w:gz') as bundle:
+                    if case!='missing':
+                        info=tarfile.TarInfo('../escape' if case=='escape' else 'ok');info.size=1
+                        if case=='symlink':info.type=tarfile.SYMTYPE;info.linkname='/tmp/unsafe';info.size=0
+                        if case=='size':info.size=2
+                        bundle.addfile(info,io.BytesIO(b'zz' if case=='size' else b'z' if case=='hash' else b'x'))
+                        if case=='duplicate':bundle.addfile(info,io.BytesIO(b'x'))
+                with self.assertRaises(ValueError):hf_worker.unpack_archive(path,self.root/case,entries)
+
+    def test_repository_total_file_limit_does_not_retry_smaller_commits(self):
+        e=RuntimeError('too many files. Your git repo would contain 20043 files')
+        e.response=types.SimpleNamespace(status_code=400)
+        with patch.object(self.hub,'create_commit',side_effect=e) as call:
+            with self.assertRaises(RuntimeError):hf_worker.upload(self.config,self.hub)
+            self.assertEqual(call.call_count,1)
+
     def test_missing_checkpoint_in_descriptor_fails_before_remote_write(self):
         config = dict(self.config,patterns=['result.json'])
         with self.assertRaises(ValueError):hf_worker.upload(config,self.hub)
         self.assertEqual(self.hub.calls,[])
+
+    def test_batched_upload_pins_last_commit_and_manifest_is_last(self):
+        for i in range(101):(self.source/('extra%d.bin'%i)).write_bytes(b'data')
+        cfg=dict(self.config,patterns=['result.json','*.bin'])
+        original=self.hub.create_commit
+        def commit(**kwargs):
+            original(**kwargs)
+            return types.SimpleNamespace(oid=('%040x'%len(self.hub.calls)))
+        self.hub.create_commit=commit
+        receipt=hf_worker.upload(cfg,self.hub)
+        self.assertEqual([len(c['operations']) for c in self.hub.calls],[50,50,4])
+        self.assertEqual(receipt['revision'],'%040x'%3)
+        self.assertTrue(self.hub.calls[-1]['operations'][-1].path.endswith('/HF_MANIFEST.json'))
+        self.assertFalse(any(o.path.endswith('/HF_MANIFEST.json') for c in self.hub.calls[:-1] for o in c['operations']))
+
+    def test_batched_failure_or_mutation_does_not_publish_manifest(self):
+        for mode in ('failure','mutation'):
+            with self.subTest(mode=mode):
+                for i in range(51):(self.source/('part%d.bin'%i)).write_bytes(b'data')
+                cfg=dict(self.config,patterns=['result.json','weights.bin','part*.bin'])
+                calls=[]
+                def commit(**kwargs):
+                    calls.append(kwargs)
+                    if mode=='failure':raise RuntimeError('upload failed')
+                    (self.source/'part0.bin').write_bytes(b'changed')
+                    return types.SimpleNamespace(oid='a'*40)
+                with patch.object(self.hub,'create_commit',side_effect=commit):
+                    with self.assertRaises((RuntimeError,ValueError)):hf_worker.upload(cfg,self.hub)
+                self.assertEqual(len(calls),1)
+                self.assertFalse(any(o.path.endswith('/HF_MANIFEST.json') for o in calls[0]['operations']))
+
+    def test_explicit_file_limit_shrinks_but_other_errors_do_not_retry(self):
+        for i in range(51):(self.source/('part%d.bin'%i)).write_bytes(b'data')
+        cfg=dict(self.config,patterns=['result.json','weights.bin','part*.bin'])
+        original=self.hub.create_commit;attempted=[]
+        def commit(**kwargs):
+            size=len(kwargs['operations']);attempted.append(size)
+            if size>20:
+                e=RuntimeError('Too many files (limit 20 files)');e.response=types.SimpleNamespace(status_code=400);raise e
+            return original(**kwargs)
+        with patch.object(self.hub,'create_commit',side_effect=commit):
+            receipt=hf_worker.upload(cfg,self.hub)
+        self.assertEqual(attempted[:3],[50,25,12])
+        self.assertTrue(all(len(c['operations'])<=20 for c in self.hub.calls))
+        self.assertEqual(len(receipt['files']),53)
+        for message,status in [('Too many files',429),('bad configuration',400)]:
+            e=RuntimeError(message);e.response=types.SimpleNamespace(status_code=status)
+            with patch.object(self.hub,'create_commit',side_effect=e) as call, patch.object(hf_worker.time,'sleep'):
+                with self.assertRaises(RuntimeError):hf_worker.upload(cfg,self.hub)
+                self.assertEqual(call.call_count,1)
+
+    def test_file_limit_retry_stops_at_one_file(self):
+        e=RuntimeError('Too many files');e.response=types.SimpleNamespace(status_code=400)
+        with patch.object(self.hub,'create_commit',side_effect=e) as call:
+            with self.assertRaises(RuntimeError):hf_worker.upload(self.config,self.hub)
+            self.assertEqual(call.call_count,2)
 
     def test_tampered_download_and_mutable_revision_are_rejected(self):
         receipt=hf_worker.upload(self.config,self.hub)
@@ -101,6 +216,15 @@ class HFWorkerTests(unittest.TestCase):
         with self.assertRaises(ValueError):hf_worker.relative('../escape')
 
     def test_detached_transfer_lifecycle_unblocks_real_destination_paths(self):
+        self._detached_transfer_lifecycle(archive=False)
+
+    def test_archived_transfer_unblocks_consumer_with_pinned_branch_and_hashes(self):
+        self._detached_transfer_lifecycle(archive=True)
+
+    def test_scheduler_consumes_explicit_repair_queue(self):
+        self._detached_transfer_lifecycle(archive=True, repair=True)
+
+    def _detached_transfer_lifecycle(self, archive, repair=False):
         s=Store(self.root/'state.db')
         a,b=node(root=str(self.root/'a')),node(root=str(self.root/'b'),key='b')
         a['hf']=b['hf']={'python':sys.executable}
@@ -110,19 +234,28 @@ class HFWorkerTests(unittest.TestCase):
                                                  hf_relocate_json=['result.json'])
         child=job('child',gpu_count=0,deps=['first']);child.update(hosts=['b'],argv=['cat','{dep:first}/weights.bin'])
         s.register_experiment(experiment([first,child]))
-        register_campaign(s,dict(id='study',name='Study',rq='why',projects=['general'],hf={'repo_id':'test/results'}))
+        register_campaign(s,dict(id='study',name='Study',rq='why',projects=['general'],hf={'repo_id':'test/results',
+            'revision':'codex/archive-test' if archive else 'main'}))
         with s.db:
             s.db.execute("UPDATE jobs SET status='succeeded' WHERE id='first'")
             s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',
                 ('first.123','first','a',dumps(dict(attempt_dir=str(self.source),node_spec=a,startup_group='')),
                  'succeeded',0,dumps({'outputs':self.config['outputs']})))
             for n in (a,b):s.db.execute('INSERT INTO snapshots VALUES(?,?)',(n['id'],dumps(snapshot(n))))
+        if repair:
+            with s.db:
+                s.db.execute('CREATE TABLE artifact_repair_queue(attempt TEXT PRIMARY KEY,config TEXT,state TEXT,created REAL,expires REAL)')
+                cfg=dict(self.config,archive_payload=True,repair_revision='test-repair',hf=dict(self.config['hf'],revision='codex/archive-test'))
+                s.db.execute('INSERT INTO artifact_repair_queue VALUES(?,?,?,?,?)',('first.123',dumps(cfg),'pending',0,__import__('time').time()+1000))
         parent=self
         class Transfers:
             def __init__(self):self.reports={}
             def call(self,n,action,request):
                 if action=='launch':
                     cfg=request['config']
+                    if cfg['direction']=='upload':
+                        parent.assertTrue(cfg['archive_payload'])
+                        if not archive:cfg=dict(cfg,archive_payload=False)
                     artifact=(hf_worker.upload(cfg,parent.hub) if cfg['direction']=='upload'
                               else hf_worker.download(cfg,parent.hub.download))
                     self.reports[request['id']]=dict(status='succeeded',artifact=artifact)
@@ -134,6 +267,7 @@ class HFWorkerTests(unittest.TestCase):
         with s.lock():tick(c,execute=False)
         self.assertEqual(transport.reports,{})
         with s.lock():tick(c,execute=True)
+        if repair:self.assertEqual(s.db.execute('SELECT state FROM artifact_repair_queue').fetchone()[0],'submitted')
         self.assertEqual(len(reservations(s)),1)
         self.assertEqual(c.plan()[0]['decision'],'waiting')
         with s.lock():tick(c,execute=True)
@@ -143,7 +277,14 @@ class HFWorkerTests(unittest.TestCase):
         self.assertEqual(c.plan()[0]['decision'],'ready')
         request=c.request(c.plan()[0])
         self.assertEqual(Path(request['argv'][1]).read_bytes(),b'checkpoint')
+        for item in request['input_files']:
+            self.assertEqual(hf_worker.digest(item['path']),item['sha256'])
         self.assertIn('hf_artifact',s.attempts()[0]['report'])
+        if archive:
+            receipt=s.attempts()[0]['report']['hf_artifact']
+            self.assertIn('archive',receipt)
+            self.assertEqual(receipt['revision'],'a'*40)
+            self.assertEqual(self.hub.calls[0]['revision'],'codex/archive-test')
         # Restarting/extra cycles preserve completed transfer receipts.
         with s.lock():tick(Controller(s,transport),execute=True)
         self.assertEqual(len(transport.reports),2)

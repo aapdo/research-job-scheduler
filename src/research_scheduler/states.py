@@ -22,6 +22,8 @@ def transition(kind, before, after):
 
 
 def recovery_due(health, now):
+    if health.get('phase') == 'unavailable' and health.get('reason') == 'continuous D-state exceeded timeout':
+        return True  # Re-evaluate legacy D-only holds using scoped evidence.
     return health.get("phase") != "unavailable" and now >= health.get("next_retry_at", 0)
 
 
@@ -33,7 +35,8 @@ def observe_health(old, observation, policy, now):
     Unavailable is sticky until explicit operator readmission.
     """
     old = dict(old)
-    if old.get("phase") == "unavailable":
+    scoped = observation.get('d_state_policy') == 'registered-process-180s-v1'
+    if old.get("phase") == "unavailable" and not (scoped and old.get('reason') == 'continuous D-state exceeded timeout'):
         return old
     if observation.get("error"):
         if old.get("phase") != "ssh_retrying":
@@ -49,6 +52,11 @@ def observe_health(old, observation, policy, now):
             round_index = count // per_round
             old["next_retry_at"] = max(now, old["first_failure_at"] + offsets[round_index])
         return old
+    if scoped:
+        if observation.get('d_state', 0):
+            return dict(phase='d_state_wait', reason='registered process D-state persisted for at least 180 seconds',
+                        last_d_observation=now)
+        return dict(phase='healthy', last_success_at=now)
     if observation.get("d_state", 0):
         since = old.get("d_since", now) if old.get("phase") == "d_state_wait" else now
         # An unobserved gap is not evidence of continuously persistent D-state.

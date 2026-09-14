@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import os
 import re
 import time
 import uuid
@@ -10,11 +11,16 @@ from pathlib import Path, PurePosixPath
 from . import agent, hf_worker
 from .schema import check, fields
 from .store import ACTIVE, dumps
+from .draining import source_upload_allowed
 
 
 def hf_spec(raw):
     h = dict(raw)
-    fields(h, 'repo_id repo_type revision path_prefix')
+    fields(h, 'repo_id repo_type revision path_prefix archive_payload commit_interval_s')
+    if 'archive_payload' in h:
+        check(type(h['archive_payload']) is bool, 'archive_payload must be boolean')
+    if 'commit_interval_s' in h:
+        check(type(h['commit_interval_s']) is int and 0 <= h['commit_interval_s'] <= 3600, 'invalid commit interval')
     check(bool(re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', h.get('repo_id', ''))),
           'HF repo_id must be namespace/repository')
     h.setdefault('repo_type', 'model')
@@ -36,7 +42,12 @@ def rows(store):
 
 
 def reservations(store):
-    return [dict(r, released=False) for r in rows(store) if r['status'] in ACTIVE]
+    # Completed transfers cannot reserve resources. Avoid decoding their large
+    # frozen requests merely to discard them on every read-only dashboard plan.
+    states=sorted(ACTIVE)
+    query='SELECT * FROM artifact_transfers WHERE status IN ('+','.join('?' for _ in states)+') ORDER BY created'
+    return [dict(r, spec=json.loads(r['spec']), report=json.loads(r['report']), released=False)
+            for r in store.db.execute(query, states)]
 
 
 def campaign_for(experiment, campaigns):
@@ -47,6 +58,51 @@ def campaign_for(experiment, campaigns):
     check(len({dumps(c['hf']) for c in matches}) <= 1,
           'experiment selected by HF campaigns with different destinations')
     return min(matches, key=lambda c: c['id']) if matches else None
+
+
+def retry_history(history):
+    """A new operator repair revision grants a separate bounded retry series."""
+    if not history:
+        return history
+    revision = history[-1]['spec'].get('config', {}).get('repair_revision')
+    return [t for t in history if t['spec'].get('config', {}).get('repair_revision') == revision] if revision else history
+
+
+def retry_possible(history, now=None, check_time=True):
+    history = retry_history(history)
+    if any(t['status'] != 'failed' for t in history):
+        return False
+    rate_limited = [t for t in history if t['report'].get('rate_limit')]
+    if len(history)-len(rate_limited) >= 3 or len(rate_limited) >= 4:
+        return False
+    now = time.time() if now is None else now
+    deadline = max([t['report'].get('rate_limit', {}).get('retry_at', 0) for t in history]+[0])
+    return not check_time or (now >= deadline and (not history or now-history[-1]['created'] > 60))
+
+
+def upload_pause(config, transfers, campaigns, now=None):
+    """One upload per repository, with a durable gap shared across branches/nodes."""
+    now = time.time() if now is None else now
+    hf = config.get('hf', {})
+    identity = (hf.get('repo_id'), hf.get('repo_type', 'model'))
+    policies = [c.get('hf') or {} for c in campaigns.values()]
+    interval = max([hf.get('commit_interval_s', 0)] + [h.get('commit_interval_s', 0) for h in policies
+        if (h.get('repo_id'), h.get('repo_type', 'model')) == identity])
+    configured = os.environ.get('RS_HF_UPLOAD_INTERVAL_S')
+    if configured is not None:
+        interval = int(configured)
+        check(1 <= interval <= 3600, 'RS_HF_UPLOAD_INTERVAL_S must be 1..3600')
+    if not interval:
+        return False
+    history = [t for t in transfers if t['direction'] == 'upload'
+        and (t['spec']['config'].get('hf', {}).get('repo_id'),
+             t['spec']['config'].get('hf', {}).get('repo_type', 'model')) == identity]
+    if any(t['status'] in ACTIVE for t in history):
+        return True
+    if any(t['report'].get('rate_limit', {}).get('retry_at', 0) > now for t in history):
+        return True
+    last = max((max(t['created'], t['report'].get('finished', 0)) for t in history), default=0)
+    return now-last < interval
 
 
 def start(controller, attempt, node, direction, config):
@@ -75,6 +131,44 @@ def start(controller, attempt, node, direction, config):
     except Exception:
         pass  # Lost ACK: reconcile the same immutable transfer, never duplicate it.
     return key
+
+
+def runnable_stage_demand(queued, jobs, experiments, nodes, snapshots, attempts, successful, groups, now):
+    """Rank missing artifacts by GPU work that can run once staging finishes.
+
+    Hypothetical locations are used only here, never for actual admission.
+    All non-artifact gates (including explicit holds and VRAM) still apply.
+    """
+    from .planner import fit
+    held = [a for a in attempts if a['status'] in ACTIVE]
+    demand = {}
+    for j in queued:
+        spec = j['spec']
+        if not spec['resources']['gpu_count'] or any(jobs[d]['status'] != 'succeeded' for d in spec['depends_on']):
+            continue
+        deps = [d for d in spec['depends_on'] if d not in spec.get('order_only_dependencies', [])]
+        for n in nodes.values():
+            if (not n['enabled'] or (spec['hosts'] and n['id'] not in spec['hosts'])
+                    or any(n['labels'].get(k) != v for k,v in spec['labels'].items())):
+                continue
+            missing = [d for d in deps if successful[d]['node'] != n['id']
+                       and n['id'] not in successful[d].get('artifact_locations', {})
+                       and not (n['storage_domain'] and n['storage_domain'] == successful[d]['spec']['node_spec']['storage_domain'])]
+            if not missing:
+                continue
+            hypothetical = dict(successful)
+            for d in missing:
+                item = dict(successful[d])
+                item['artifact_locations'] = dict(item.get('artifact_locations', {}))
+                item['artifact_locations'][n['id']] = {}
+                hypothetical[d] = item
+            if any(not fit(dict(spec, resources=req), n, snapshots.get(n['id']), held,
+                           attempts, hypothetical, groups, now)[0]
+                   for req in [spec['resources'], *spec.get('resource_variants', [])]):
+                priority = experiments[j['experiment']]['priority'] + spec['priority']
+                for d in missing:
+                    demand[d] = max(demand.get(d, priority), priority)
+    return demand
 
 
 def tick(controller, execute):
@@ -108,12 +202,22 @@ def tick(controller, execute):
     live = [r for r in transfers if r['status'] in ACTIVE]
     if len(live) >= 2:
         return
-    attempts = store.attempts()
+    attempts = store.attempts(summary=True)
     jobs = {j['id']: j for j in store.jobs()}
     experiments = store.specs('experiments')
+    from .model_vram_policy import normalize
+    jobs = {k:dict(j,spec=normalize(j['spec'])) for k,j in jobs.items()}
+    from .planner import admission_vram
+    attempts = [dict(a, admission_vram_mib=admission_vram(a, jobs.get(a.get('job'),{}), time.time()))
+                if a['status'] in ACTIVE else a for a in attempts]
 
-    def eligible(a, n, direction):
-        if 'hf' not in n or not n['enabled'] or any(r['node'] == n['id'] for r in live):
+    def eligible(a, n, direction, repair_revision=None):
+        if direction == 'upload':
+            owner = campaign_for(experiments[jobs[a['job']]['experiment']], campaigns)
+            if owner and upload_pause(owner, transfers, campaigns):
+                return False
+        if ('hf' not in n or (not n['enabled'] and not source_upload_allowed(a,n,direction))
+                or any(r['node'] == n['id'] for r in live)):
             return False
         if health.get(n['id'], {}).get('phase') in ('ssh_retrying', 'unavailable'):
             return False
@@ -138,13 +242,44 @@ def tick(controller, execute):
                 return False
         history = [r for r in transfers if r['attempt'] == a['id'] and r['node'] == n['id']
                    and r['direction'] == direction]
-        return (not any(r['status'] != 'failed' for r in history) and len(history) < 3
-                and (not history or time.time() - history[-1]['created'] > 60))
+        if repair_revision:
+            if any(r['status'] in ACTIVE or r['status']=='succeeded' for r in history):return False
+            history=[r for r in history if r['spec']['config'].get('repair_revision')==repair_revision]
+        return retry_possible(history)
+
+    # Explicit finite operator repairs are consumed by the single dispatcher,
+    # ahead of ordinary publication. Preserve all health, slot and 429 gates.
+    if store.db.execute("SELECT 1 FROM sqlite_master WHERE name='artifact_repair_queue'").fetchone():
+        for pending in store.db.execute("SELECT * FROM artifact_repair_queue WHERE state='pending' ORDER BY created").fetchall():
+            if pending['expires'] < time.time():
+                with store.db:store.db.execute("UPDATE artifact_repair_queue SET state='expired' WHERE attempt=?",(pending['attempt'],))
+                continue
+            a=next((v for v in attempts if v['id']==pending['attempt'] and v['status']=='succeeded'),None)
+            if not a:continue
+            cfg=json.loads(pending['config'])
+            if any(t['attempt']==a['id'] and t['direction']=='upload' and (t['status']=='succeeded' or t['spec']['config'].get('repair_revision')==cfg['repair_revision']) for t in transfers):
+                with store.db:store.db.execute("UPDATE artifact_repair_queue SET state='submitted' WHERE attempt=?",(a['id'],))
+                continue
+            n=nodes[a['node']]
+            if eligible(a,n,'upload',cfg['repair_revision']):
+                key=start(controller,a,n,'upload',cfg)
+                with store.db:
+                    store.db.execute("UPDATE artifact_repair_queue SET state='submitted' WHERE attempt=?",(a['id'],))
+                    store.event('artifact_repair_submitted',a['job'],dict(transfer=key))
+                return
 
     # Stage the most urgent runnable successor before publishing unrelated history.
     successful = {a['job']: a for a in attempts if a['status'] == 'succeeded'}
     queued = sorted((j for j in jobs.values() if j['status'] == 'queued'),
                     key=lambda j: -(experiments[j['experiment']]['priority'] + j['spec']['priority']))
+    demand = runnable_stage_demand(queued, jobs, experiments, nodes, snapshots,
+                                   attempts + live, successful, store.specs('groups_'), time.time())
+    # Prefer unused capacity, not inventory insertion order; calculate once.
+    staging_nodes = sorted(nodes.values(), key=lambda n: (
+        sum(len(x['spec'].get('gpus', [])) for x in attempts
+            if x['node'] == n['id'] and x['status'] in ACTIVE)
+        / max(1, sum(g['enabled'] for g in n['gpus'])),
+        -sum(g['enabled'] for g in n['gpus']), n['id']))
     for j in queued:
         if not all(jobs[d]['status'] == 'succeeded' for d in j['spec']['depends_on']):
             continue
@@ -155,17 +290,23 @@ def tick(controller, execute):
             receipt = a['report'].get('hf_artifact')
             if not receipt:
                 continue
-            for n in nodes.values():
+            for n in staging_nodes:
                 if n['id'] == a['node'] or n['id'] in a.get('artifact_locations', {}):
                     continue
                 if n['storage_domain'] and n['storage_domain'] == a['spec']['node_spec']['storage_domain']:
                     continue
                 if not eligible(a, n, 'download'):
                     continue
-                hypothetical = copy.deepcopy(successful)
+                # Copy only the location maps we change. Deep-copying every
+                # historical attempt/report per candidate can outlast the
+                # health freshness window and starve scientific dispatch.
+                hypothetical = dict(successful)
                 for d in j['spec']['depends_on']:
                     if hypothetical[d]['report'].get('hf_artifact'):
-                        hypothetical[d].setdefault('artifact_locations', {})[n['id']] = {}
+                        item = dict(hypothetical[d])
+                        item['artifact_locations'] = dict(item.get('artifact_locations', {}))
+                        item['artifact_locations'][n['id']] = {}
+                        hypothetical[d] = item
                 fits = [fit(dict(j['spec'], resources=resources), n, snapshots[n['id']],
                             [a for a in attempts if a['status'] in ACTIVE] + reservations(store),
                             attempts, hypothetical, store.specs('groups_'), time.time())[0]
@@ -176,7 +317,8 @@ def tick(controller, execute):
     # Prioritize publications that unblock successors; successful computation stays successful.
     needed = {d for j in queued for d in j['spec']['depends_on']}
     priorities = dependency_priorities(list(jobs.values()), experiments)
-    for a in sorted(successful.values(), key=lambda a: (a['job'] not in needed,
+    for a in sorted(successful.values(), key=lambda a: (a['job'] not in demand,
+                    -demand.get(a['job'], 0), a['job'] not in needed,
                     -priorities[a['job']][0], -priorities[a['job']][1], a['created'])):
         if a['report'].get('hf_artifact'):
             continue
@@ -193,7 +335,11 @@ def tick(controller, execute):
         config = dict(hf=campaign['hf'], campaign=campaign['id'], attempt=a['id'], job=a['job'],
                       source_root=a['spec']['attempt_dir'], outputs=a['report']['outputs'],
                       patterns=list(dict.fromkeys(spec['outputs'] + spec.get('hf_artifacts', []))),
-                      relocate_json=relocations)
+                      relocate_json=relocations,
+                      archive_payload=campaign['hf'].get('archive_payload', True))
+        history = [r for r in transfers if r['attempt'] == a['id'] and r['direction'] == 'upload']
+        if history and history[-1]['spec']['config'].get('repair_revision'):
+            config['repair_revision'] = history[-1]['spec']['config']['repair_revision']
         start(controller, a, n, 'upload', config)
         return
 
@@ -203,33 +349,39 @@ def status(store):
                  status=r['status'], result=r['report'].get('artifact')) for r in rows(store)]
 
 
-def publication_summary(store, campaign=None):
+def publication_summary(store, campaign=None, snapshot=None):
     from .notifications import campaign_specs
+    from .observation_snapshot import ObservationSnapshot
+    snapshot = snapshot if snapshot is not None else ObservationSnapshot(store)
     campaigns = {campaign['id']: campaign} if campaign else campaign_specs(store)
-    jobs = {j['id']: j for j in store.jobs()}
-    experiments, nodes = store.specs('experiments'), store.specs('nodes')
-    transfers = rows(store)
+    jobs = snapshot.jobs_by_id
+    experiments, nodes = snapshot.experiments, snapshot.nodes
+    from .recovery import current_campaign_jobs
+    current = ({j['id'] for j in current_campaign_jobs(list(jobs.values()), experiments, campaign)}
+               if campaign else None)
+    transfers = snapshot.transfers
     counts = dict(pending=0, published=0, error=0)
     errors = []
-    for a in store.attempts():
+    for a in snapshot.attempts:
         if a['status'] != 'succeeded' or not jobs[a['job']]['spec']['outputs']:
             continue
-        if not campaign_for(experiments[jobs[a['job']]['experiment']], campaigns):
+        if (a['job'] not in current if current is not None else
+                not campaign_for(experiments[jobs[a['job']]['experiment']], campaigns)):
             continue
-        history = [r for r in transfers if r['attempt'] == a['id'] and r['direction'] == 'upload']
+        history = snapshot.uploads_by_attempt.get(a['id'], [])
         if a['report'].get('hf_artifact'):
             counts['published'] += 1
         elif 'hf' not in nodes.get(a['node'], {}):
             counts['error'] += 1
             errors.append(dict(job=a['job'], status='artifact_error', reason='HF Python/auth paths not configured on source node'))
-        elif len(history) >= 3 and all(r['status'] == 'failed' for r in history):
+        elif history and all(r['status'] == 'failed' for r in history) and not retry_possible(history, check_time=False):
             counts['error'] += 1
             errors.append(dict(job=a['job'], status='artifact_error', reason='HF upload retry budget exhausted; training remains successful'))
         else:
             counts['pending'] += 1
     downloads = {}
-    selected = {key for key,j in jobs.items() if campaign_for(experiments[j['experiment']], campaigns)}
-    needed_attempts = {a['id'] for a in store.attempts() if a['job'] in selected}
+    selected = current if current is not None else {key for key,j in jobs.items() if campaign_for(experiments[j['experiment']], campaigns)}
+    needed_attempts = {a['id'] for a in snapshot.attempts if a['job'] in selected}
     for r in transfers:
         if r['direction'] == 'download' and r['attempt'] in needed_attempts:
             downloads.setdefault((r['attempt'], r['node']), []).append(r)

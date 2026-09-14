@@ -1,0 +1,38 @@
+{
+  "id": "rtl-example",
+  "project": "rtl-development",
+  "name": "RTL regression and full implementation template",
+  "rq": "Does the frozen RTL pass numerical and physical validation?",
+  "filesystem": "local",
+  "jobs": [
+    {
+      "id": "rtl-example-sim",
+      "name": "Numerical RTL regression",
+      "kind": "rtl_sim",
+      "hosts": ["vivado-example"],
+      "cwd": "/srv/rtl/releases/REPLACE_REVISION",
+      "argv": ["bash", "simulate.sh", "{attempt_dir}"],
+      "resources": {"gpu_count": 0, "cpu": 2, "ram_mib": 4096, "disk_mib": 1024},
+      "outputs": ["stdout.log"],
+      "validation": {"log": "stdout.log", "pass_marker": "PASS RTL_REGRESSION"}
+    },
+    {
+      "id": "rtl-example-build",
+      "name": "Full implementation and sign-off",
+      "kind": "rtl_build",
+      "hosts": ["vivado-example"],
+      "labels": {"tool": "vivado-2026.1", "part": "xczu15eg"},
+      "cwd": "/srv/rtl/releases/REPLACE_REVISION",
+      "argv": ["bash", "build_foreground.sh", "{attempt_dir}"],
+      "preflight_argv": ["bash", "preflight_readonly.sh", "{attempt_dir}"],
+      "depends_on": ["rtl-example-sim"],
+      "resources": {
+        "gpu_count": 0, "cpu": 8, "ram_mib": 24576, "disk_mib": 32768,
+        "build_slots": 1, "tokens": {"license.example-vivado": 1}
+      },
+      "input_files": [{"path": "/srv/rtl/releases/REPLACE_REVISION/SOURCE_SHA256SUMS.txt", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}],
+      "outputs": ["timing_summary.rpt", "route_status.rpt", "design.bit"],
+      "validation": {"timing_report": "timing_summary.rpt", "route_report": "route_status.rpt", "bitstream": "design.bit"}
+    }
+  ]
+}

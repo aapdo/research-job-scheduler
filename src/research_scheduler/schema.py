@@ -8,6 +8,71 @@ from pathlib import PurePosixPath
 
 FILESYSTEMS = ("local", "nfs")
 FILESYSTEM_REQUESTS = ("any", *FILESYSTEMS)
+RTL_KINDS = ("rtl_sim", "rtl_ooc", "rtl_build", "board_test")
+
+
+def relative_file(value):
+    check(isinstance(value, str) and value and not PurePosixPath(value).is_absolute()
+          and ".." not in PurePosixPath(value).parts and "\\" not in value and "\x00" not in value,
+          "expected an attempt-relative file")
+
+
+def tokens(value):
+    check(isinstance(value, dict), "tokens must be an object")
+    for key, count in value.items():
+        identifier(key)
+        number(count, "token capacity/request", 1, True)
+
+
+def rtl_contract(job):
+    """Explicit, fail-closed contracts; no implicit adoption or retries."""
+    if job['kind'] not in RTL_KINDS:
+        check(not any(k in job for k in ('validation', 'preflight_argv', 'board_id')),
+              'RTL validation/preflight/board fields require an RTL job kind')
+        return
+    check(job['resources']['gpu_count'] == 0, 'RTL jobs must request gpu_count=0')
+    check(job['max_attempts'] == 1 and not job['failover_safe'], 'RTL automatic retries/failover are disabled')
+    check(job['filesystem'] == 'local', 'RTL execution requires local filesystem')
+    if job['kind'] == 'rtl_build':
+        check(job['resources'].get('build_slots', 0) == 1, 'full RTL build requires one build slot')
+    preflight = job.get('preflight_argv', [])
+    check(isinstance(preflight, list) and all(isinstance(s, str) and s and '\x00' not in s for s in preflight),
+          'preflight_argv must be a string array')
+    if job['kind'] in ('rtl_ooc', 'rtl_build', 'board_test'):
+        check(preflight, 'tool/license/board preflight command required')
+    v = job.get('validation')
+    check(isinstance(v, dict), 'RTL validation contract required')
+    if job['kind'] in ('rtl_ooc', 'rtl_build'):
+        fields(v, 'timing_report route_report bitstream')
+        for key in ('timing_report', 'route_report'):
+            relative_file(v.get(key))
+        if job['kind'] == 'rtl_build':
+            relative_file(v.get('bitstream'))
+        elif 'bitstream' in v:
+            relative_file(v['bitstream'])
+    elif job['kind'] == 'rtl_sim':
+        fields(v, 'log pass_marker')
+        relative_file(v.get('log'))
+        check(isinstance(v.get('pass_marker'), str) and v['pass_marker'].strip(), 'simulation PASS marker required')
+    else:
+        identifier(job.get('board_id'))
+        check(job['resources'].get('tokens', {}).get('board.' + job['board_id']) == 1,
+              'board job requires its global board token')
+        fields(v, 'comparisons')
+        check(isinstance(v.get('comparisons'), list) and v['comparisons'], 'board capture comparisons required')
+        captures = set()
+        for pair in v['comparisons']:
+            fields(pair, 'capture expected_sha256')
+            relative_file(pair.get('capture'))
+            check(pair['capture'] not in captures, 'duplicate board capture')
+            captures.add(pair['capture'])
+            check(isinstance(pair.get('expected_sha256'), str) and
+                  bool(re.fullmatch(r'[0-9a-f]{64}', pair['expected_sha256'])), 'expected capture SHA256 required')
+    if job['kind'] != 'board_test':
+        check('board_id' not in job, 'board_id requires board_test')
+    artifacts = ([p['capture'] for p in v['comparisons']] if job['kind'] == 'board_test'
+                 else [v['log']] if job['kind'] == 'rtl_sim' else list(v.values()))
+    check(set(artifacts) <= set(job['outputs']), 'validation artifacts must be declared outputs')
 
 
 def node_filesystem(node):
@@ -56,7 +121,8 @@ def file_contract(value):
 def node_spec(raw):
     n = copy.deepcopy(raw)
     fields(n, "id transport target python work_root storage_domain labels gpus enabled max_jobs "
-           "cpu_limit ram_limit_mib policy assets startup_group recovery datasets filesystem hf admission_priority")
+           "cpu_limit ram_limit_mib policy assets startup_group recovery datasets filesystem hf admission_priority "
+           "physical_host rtl_build_slots tokens board_locks")
     identifier(n["id"])
     n.setdefault("transport", "ssh")
     check(n["transport"] in ("local", "ssh"), "transport must be local or ssh")
@@ -80,6 +146,21 @@ def node_spec(raw):
     check(n["filesystem"] in FILESYSTEMS, "node filesystem must be local or nfs")
     check(isinstance(n["enabled"], bool), "enabled must be boolean")
     number(n["max_jobs"], "max_jobs", 1, True)
+    if 'physical_host' in n:
+        identifier(n['physical_host'])
+    if 'rtl_build_slots' in n:
+        number(n['rtl_build_slots'], 'rtl_build_slots', 0, True)
+    if 'tokens' in n:
+        tokens(n['tokens'])
+        check(all(not k.startswith('board.') or count == 1 for k, count in n['tokens'].items()),
+              'physical board token capacity must be one')
+    if 'board_locks' in n:
+        check(isinstance(n['board_locks'], dict), 'board_locks must be an object')
+        for board, path in n['board_locks'].items():
+            identifier(board)
+            absolute(path)
+            check(n.get('tokens', {}).get('board.' + board) == 1,
+                  'board gateway requires its capacity-one token')
     number(n.setdefault("admission_priority", 0), "admission_priority", 0, True)
     for k in ("cpu_limit", "ram_limit_mib"):
         if k in n:
@@ -92,7 +173,7 @@ def node_spec(raw):
         identifier(name)
         absolute(path)
     p = n["policy"]
-    fields(p, "stable_polls max_snapshot_age_s max_cpu_percent max_gpu_percent min_free_ram_mib "
+    fields(p, "stable_polls max_snapshot_age_s max_health_poll_gap_s max_cpu_percent max_gpu_percent min_free_ram_mib "
            "min_free_disk_mib gpu_margin_mib max_idle_used_mib allow_gpu_sharing "
            "allow_external_gpu_processes max_shared_jobs_per_gpu warm_gpu_temp_c max_gpu_temp_c "
            "warm_max_jobs shared_stable_polls read_probe_path read_probe_bytes read_probe_timeout_s "
@@ -102,7 +183,7 @@ def node_spec(raw):
     p.setdefault("disabled_gpu_uuids", [])
     check(isinstance(p["disabled_gpu_uuids"], list) and all(isinstance(g, str) and g.startswith("GPU-")
           for g in p["disabled_gpu_uuids"]), "invalid disabled_gpu_uuids")
-    defaults = dict(stable_polls=3, max_snapshot_age_s=60, max_cpu_percent=90,
+    defaults = dict(stable_polls=3, max_snapshot_age_s=60, max_health_poll_gap_s=120, max_cpu_percent=90,
                     max_gpu_percent=10, min_free_ram_mib=1024, min_free_disk_mib=1024,
                     gpu_margin_mib=1024, max_idle_used_mib=256, allow_gpu_sharing=False,
                     allow_external_gpu_processes=False, max_shared_jobs_per_gpu=2,
@@ -114,7 +195,7 @@ def node_spec(raw):
         if isinstance(v, bool):
             check(isinstance(p[k], bool), k + " must be boolean")
         else:
-            number(p[k], k, 1 if k in ("stable_polls", "max_snapshot_age_s", "read_probe_timeout_s",
+            number(p[k], k, 1 if k in ("stable_polls", "max_snapshot_age_s", "max_health_poll_gap_s", "read_probe_timeout_s",
                                        "max_shared_jobs_per_gpu", "warm_max_jobs", "shared_stable_polls") else 0,
                    k in ("stable_polls", "read_probe_bytes", "max_shared_jobs_per_gpu", "warm_max_jobs",
                          "shared_stable_polls"))
@@ -186,9 +267,10 @@ def experiment_spec(raw):
     check(isinstance(e["jobs"], list) and e["jobs"], "at least one job required")
     for j in e["jobs"]:
         fields(j, "id name kind purpose argv cwd env config resources depends_on order_only_dependencies priority labels hosts "
-               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem hf_artifacts hf_relocate_json resource_variants")
+               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem hf_artifacts hf_relocate_json resource_variants "
+               "validation preflight_argv board_id")
         identifier(j["id"])
-        check(j["kind"] in ("train", "eval", "prepare", "analysis"), "invalid job kind")
+        check(j["kind"] in ("train", "eval", "prepare", "analysis", *RTL_KINDS), "invalid job kind")
         check(isinstance(j.get("name"), str) and j["name"].strip(), "job name required")
         check(isinstance(j["argv"], list) and j["argv"]
               and all(isinstance(v, str) and "\x00" not in v for v in j["argv"]), "argv must be a string array")
@@ -225,7 +307,7 @@ def experiment_spec(raw):
               "order-only dependencies must be unique members of depends_on")
         # Control dependencies only wait for success. Artifact transfer must be
         # explicit in the workflow; they never imply remote path accessibility.
-        text = json.dumps({k: j[k] for k in ("argv", "cwd", "env", "config", "input_files")})
+        text = json.dumps({k: j.get(k) for k in ("argv", "cwd", "env", "config", "input_files", "preflight_argv")})
         check(not any("{dep:" + d + "}" in text for d in order_only),
               "order-only dependency cannot be used as an artifact path")
         for asset_hash in j["assets"].values():
@@ -246,7 +328,7 @@ def experiment_spec(raw):
                           and ".." not in PurePosixPath(path).parts and "\\" not in path,
                           key + " must contain relative paths/globs inside attempt_dir")
         r = j.setdefault("resources", {})
-        fields(r, "gpu_count vram_mib cpu ram_mib gpu_mode parameter_count")
+        fields(r, "gpu_count vram_mib cpu ram_mib gpu_mode parameter_count build_slots disk_mib tokens")
         for k, v in dict(gpu_count=0, vram_mib=0, cpu=1, ram_mib=512, gpu_mode="exclusive").items():
             r.setdefault(k, v)
         for k in ("gpu_count", "vram_mib", "cpu", "ram_mib"):
@@ -255,6 +337,11 @@ def experiment_spec(raw):
         check(r["gpu_mode"] in ("exclusive", "shared"), "invalid gpu_mode")
         if "parameter_count" in r:
             number(r["parameter_count"], "parameter_count", 0, True)
+        for key in ('build_slots', 'disk_mib'):
+            if key in r:
+                number(r[key], key, 0, key == 'build_slots')
+        if 'tokens' in r:
+            tokens(r['tokens'])
         if 'resource_variants' in j:
             check(isinstance(j['resource_variants'], list) and len(j['resource_variants']) <= 8,
                   'resource_variants must contain at most 8 alternatives')
@@ -263,11 +350,23 @@ def experiment_spec(raw):
                 fields(alternative, 'gpu_count vram_mib cpu ram_mib gpu_mode parameter_count')
                 child = dict(j, resources=dict(r, **alternative))
                 child.pop('resource_variants')
+                if isinstance(child.get('metadata'),dict) and 'gpu_count_by_host' in child['metadata']:
+                    child['metadata']=dict(child['metadata'])
+                    child['metadata'].pop('gpu_count_by_host')
                 normalized = experiment_spec(dict(id='variant', name='variant', rq='variant', jobs=[child]))['jobs'][0]['resources']
                 check(normalized['gpu_count'] > 0 and r['gpu_count'] > 0, 'variants require GPU jobs')
                 check(normalized not in [r, *variants], 'duplicate resource variant')
                 variants.append(normalized)
             j['resource_variants'] = variants
+        mapping=j.get('metadata',{}).get('gpu_count_by_host')
+        if mapping is not None:
+            check(isinstance(mapping,dict) and mapping and set(mapping)==set(j['hosts']),
+                  'gpu_count_by_host must cover exactly the permitted hosts')
+            permitted={r['gpu_count'],*(v['gpu_count'] for v in j.get('resource_variants',[]))}
+            for host,count in mapping.items():
+                identifier(host);number(count,'host GPU count',1,True)
+                check(count in permitted,'host GPU count has no registered resource variant')
+        rtl_contract(j)
     check(len({j["id"] for j in e["jobs"]}) == len(e["jobs"]), "duplicate job ID")
     return e
 

@@ -5,6 +5,10 @@ import os
 import re
 import shutil
 import stat
+import tarfile
+import tempfile
+import time
+from email.utils import parsedate_to_datetime
 from pathlib import Path, PurePosixPath
 
 
@@ -85,6 +89,8 @@ def collect(config):
 def upload(config, api=None):
     from huggingface_hub import HfApi, CommitOperationAdd
     api = api or HfApi(token=token(config))
+    if config.get('archive_payload', config.get('hf', {}).get('archive_payload', False)):
+        return archive_upload(config, api)
     hf = config['hf']
     # Existing repository required: no implicit public repository creation.
     manifest = collect(config)
@@ -94,8 +100,28 @@ def upload(config, api=None):
                               path_or_fileobj=str(Path(config['source_root']) / name))
            for name in manifest['files']]
     ops.append(CommitOperationAdd(path_in_repo=prefix + '/HF_MANIFEST.json', path_or_fileobj=data))
-    info = api.create_commit(repo_id=hf['repo_id'], repo_type=hf['repo_type'], revision=hf['revision'],
-                             operations=ops, commit_message='Scheduler artifacts: ' + config['attempt'])
+    # Keep commits bounded. Only the last commit includes the manifest; no
+    # usable receipt is returned for partial publication or a changed source.
+    offset, batch_size = 0, 50
+    while offset < len(ops):
+        batch = ops[offset:offset + batch_size]
+        if offset + batch_size >= len(ops) and collect(config) != manifest:
+            raise ValueError('source artifacts changed during upload')
+        try:
+            info = commit_with_backoff(api, config, repo_id=hf['repo_id'], repo_type=hf['repo_type'], revision=hf['revision'],
+                                     operations=batch, commit_message='Scheduler artifacts: ' + config['attempt'])
+        except Exception as exc:
+            # Some endpoints impose a lower file cap. Shrink only on this
+            # explicit rejection, at most 50 -> 25 -> 12 -> 6 -> 3 -> 1.
+            if (getattr(getattr(exc, 'response', None), 'status_code', None) != 400
+                    or 'too many files' not in str(exc).lower() or len(batch) <= 1
+                    or 'git repo would contain' in str(exc).lower()
+                    or config.get('diagnostic_no_adaptive', False)):
+                raise
+            batch_size = max(1, len(batch) // 2)
+            print('HF commit file limit: retrying batch with ' + str(batch_size) + ' files', flush=True)
+            continue
+        offset += len(batch)
     # Detect mutation during a transfer; never publish a usable receipt for it.
     if collect(config) != manifest:
         raise ValueError('source artifacts changed during upload')
@@ -107,6 +133,110 @@ def upload(config, api=None):
                 url=base + '/tree/' + revision + '/' + prefix,
                 manifest_sha256=hashlib.sha256(data).hexdigest(), attempt=config['attempt'],
                 files=manifest['files'], source_root=manifest['source_root'])
+
+
+def rate_limit_delay(exc, now=None):
+    now = time.time() if now is None else now
+    headers = {k.lower(): v for k,v in (getattr(getattr(exc, 'response', None), 'headers', {}) or {}).items()}
+    delays = []
+    retry = headers.get('retry-after')
+    if retry:
+        try: delays.append(float(retry))
+        except ValueError:
+            try: delays.append(parsedate_to_datetime(retry).timestamp()-now)
+            except (TypeError, ValueError, OverflowError): pass
+    match = re.search(r'\bt\s*=\s*(\d+)', headers.get('ratelimit', ''))
+    if match: delays.append(float(match.group(1)))
+    # Repository commit quotas can use a longer window than generic API headers.
+    if 'per hour' in str(exc).lower(): delays.append(3600)
+    delay = max([60] + delays) if delays else 3600
+    if not 0 <= delay <= 21600:
+        raise ValueError('HF retry deadline exceeds six-hour safety bound')
+    return delay
+
+
+_last_commit_at = None
+
+
+class RateLimitDeferred(RuntimeError):
+    def __init__(self, delay):
+        self.delay = delay
+        super().__init__('HF rate limit; retry deferred')
+
+
+def commit_with_backoff(api, config, **kwargs):
+    global _last_commit_at
+    interval = config.get('hf', {}).get('commit_interval_s', 0)
+    if _last_commit_at is not None and interval:
+        pause = interval-(time.monotonic()-_last_commit_at)
+        if pause > 0: time.sleep(pause)
+    _last_commit_at = time.monotonic()
+    try:
+        return api.create_commit(**kwargs)
+    except Exception as exc:
+        if getattr(getattr(exc, 'response', None), 'status_code', None) == 429:
+            raise RateLimitDeferred(rate_limit_delay(exc)) from None
+        raise
+
+
+def archive_upload(config, api):
+    """Two Hub files, but original per-file identity and download layout."""
+    from huggingface_hub import CommitOperationAdd
+    manifest = collect(config)
+    hf = config['hf']
+    prefix = '/'.join(x for x in [hf['path_prefix'], config['campaign'], config['job'], config['attempt']] if x)
+    with tempfile.TemporaryDirectory(prefix='hf-archive-', dir=os.environ.get('RS_ATTEMPT_DIR')) as temporary:
+        archive = Path(temporary)/'HF_PAYLOAD.tar.gz'
+        with tarfile.open(archive, 'w:gz', compresslevel=1) as bundle:
+            for name in sorted(manifest['files']):
+                source = Path(config['source_root'])/str(relative(name))
+                info = bundle.gettarinfo(str(source), arcname=name)
+                if not info.isfile():
+                    raise ValueError('archive source must be a regular file')
+                info.uid = info.gid = info.mtime = 0
+                info.uname = info.gname = ''
+                with source.open('rb') as stream:
+                    bundle.addfile(info, stream)
+        if collect(config) != manifest:
+            raise ValueError('source artifacts changed during archive creation')
+        packed = dict(manifest, archive=dict(file=archive.name, sha256=digest(archive), bytes=archive.stat().st_size))
+        data = json.dumps(packed, sort_keys=True, ensure_ascii=False).encode()
+        operations = [
+            CommitOperationAdd(path_in_repo=prefix+'/'+archive.name, path_or_fileobj=str(archive)),
+            CommitOperationAdd(path_in_repo=prefix+'/HF_MANIFEST.json', path_or_fileobj=data)]
+        result = commit_with_backoff(api, config, repo_id=hf['repo_id'], repo_type=hf['repo_type'], revision=hf['revision'],
+                                   operations=operations, commit_message='Scheduler archived artifacts: '+config['attempt'])
+        if collect(config) != manifest:
+            raise ValueError('source artifacts changed during upload')
+        if not re.fullmatch('[0-9a-f]{40}', result.oid):
+            raise ValueError('Hub did not return an immutable commit SHA')
+        base = 'https://huggingface.co/' + ('datasets/' if hf['repo_type']=='dataset' else '') + hf['repo_id']
+        return dict(repo_id=hf['repo_id'], repo_type=hf['repo_type'], revision=result.oid, path=prefix,
+                    url=base+'/tree/'+result.oid+'/'+prefix, manifest_sha256=hashlib.sha256(data).hexdigest(),
+                    attempt=config['attempt'], files=manifest['files'], source_root=manifest['source_root'],
+                    archive=packed['archive'])
+
+
+def unpack_archive(source, destination, entries):
+    """No extractall: only declared regular files with exact sizes and SHA."""
+    seen = set()
+    with tarfile.open(source, 'r:gz') as bundle:
+        for member in bundle:
+            name = member.name
+            relative(name)
+            if name not in entries or name in seen or not member.isfile() or member.size != entries[name]['bytes']:
+                raise ValueError('undeclared, duplicate or invalid archive member')
+            target = destination/str(relative(name))
+            if not target.resolve().is_relative_to(destination.resolve()):
+                raise ValueError('download destination escape')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with bundle.extractfile(member) as stream, target.open('wb') as output:
+                shutil.copyfileobj(stream, output, 1024*1024)
+            if digest(target) != entries[name]['sha256']:
+                raise ValueError('download artifact hash mismatch: '+name)
+            seen.add(name)
+    if seen != set(entries):
+        raise ValueError('archive is missing declared artifacts')
 
 
 def relocate(value, old, new):
@@ -139,7 +269,13 @@ def download(config, fetch=None):
     manifest = json.loads(manifest_path.read_text())
     if manifest['attempt'] != receipt['attempt'] or manifest['files'] != receipt['files']:
         raise ValueError('download manifest identity mismatch')
-    for name, entry in manifest['files'].items():
+    archive = manifest.get('archive')
+    if archive:
+        source = get(str(relative(archive['file'])))
+        if source.stat().st_size != archive['bytes'] or digest(source) != archive['sha256']:
+            raise ValueError('download archive hash mismatch')
+        unpack_archive(source, dest, manifest['files'])
+    for name, entry in ([] if archive else manifest['files'].items()):
         source = get(name)
         if source.stat().st_size != entry['bytes'] or digest(source) != entry['sha256']:
             raise ValueError('download artifact hash mismatch: ' + name)
@@ -162,14 +298,49 @@ def download(config, fetch=None):
                 manifest_sha256=receipt['manifest_sha256'])
 
 
+def safe_error_details(exc, secrets=()):
+    def redact(value):
+        value = str(value)
+        for secret in secrets:
+            if secret: value = value.replace(secret, '[REDACTED]')
+        value = re.sub(r'https?://\S+', '[URL]', value)
+        value = re.sub(r'\bhf_[A-Za-z0-9_-]+', '[TOKEN]', value)
+        value = re.sub(r'(?i)Bearer\s+\S+', 'Bearer [REDACTED]', value)
+        return value[:2000]
+    response = getattr(exc, 'response', None)
+    headers = getattr(response, 'headers', {}) or {}
+    allowed = {'retry-after','ratelimit','ratelimit-policy','x-ratelimit-limit',
+               'x-ratelimit-remaining','x-ratelimit-reset','x-error-message','x-error-code'}
+    return dict(message=redact(exc), headers={k:redact(v) for k,v in headers.items() if k.lower() in allowed})
+
+
 def main():
     config = json.loads(Path(os.environ['RS_CONFIG_PATH']).read_text())
     try:
         result = upload(config) if config['direction'] == 'upload' else download(config)
         Path(os.environ['RS_ATTEMPT_DIR'], 'HF_RECEIPT.json').write_text(json.dumps(result))
+    except RateLimitDeferred as exc:
+        now = time.time()
+        retry = dict(attempt=os.environ['RS_ATTEMPT_ID'], http_status=429, created=now, retry_at=now+exc.delay)
+        Path(os.environ['RS_ATTEMPT_DIR'], 'HF_RETRY.json').write_text(json.dumps(retry))
+        print(json.dumps(dict(event='hf_retry_deferred', **retry)), flush=True)
+        raise SystemExit(75)
     except Exception as exc:
+        if config.get('capture_safe_error_details'):
+            print('HF error details: ' + json.dumps(safe_error_details(exc, [token(config)])), flush=True)
         # HTTP errors may contain signed URLs or credentials; never print str(exc).
-        print('HF transfer failed: ' + type(exc).__name__, flush=True)
+        response = getattr(exc, 'response', None)
+        code = getattr(response, 'status_code', None)
+        # Classify without exposing response bodies, signed URLs, or credentials.
+        detail = str(exc).lower()
+        categories = [term for term in ('rate limit', 'quota', 'too many', 'too many files', 'too many operations', 'too many requests', 'too many commits', 'too many lfs', 'storage',
+                       'conflict', 'precondition', 'unauthorized', 'expired', 'xet') if term in detail]
+        vocabulary = {'too','many','files','file','commit','commits','folder','folders','repository','repositories',
+                      'regular','lfs','limit','maximum','exceeded','per','payload','rate','requests','minute','hour','day',
+                      'operation','operations','non','large','small','binary','text'}
+        context = [w for w in re.findall(r'[a-z]+', re.sub(r'https?://\S+', '', detail)) if w in vocabulary][:60]
+        print('HF transfer failed: ' + type(exc).__name__ + ' ' +
+              json.dumps(dict(http_status=code, categories=categories, limit_context=context)), flush=True)
         raise SystemExit(1)
 
 

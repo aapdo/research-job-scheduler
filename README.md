@@ -21,6 +21,11 @@
 
 ## 주요 기능과 기본 개념
 
+RTL 회귀·OOC·Vivado full build·보드 시험도 CPU-only 작업으로 표현할 수 있습니다.
+GPU 기본 정책은 유지하며, 별도 build 슬롯·공유 토큰·물리 호스트 예약·보고서 검증을 사용합니다.
+보드 실행은 단일 gateway와 기존 도구가 공유하는 잠금 통합이 필요합니다.
+등록 예제와 안전한 도입 순서는 [RTL workflows](docs/RTL_WORKFLOWS.md)를 참고하세요.
+
 - 서버와 GPU 등록: SSH/local 실행, GPU UUID·모델·VRAM 조회, 장치별 사용 허용.
 - 실험 관리: 이름·RQ·job별 목적, 설정값, 예상 자원량, 우선순위, 학습→평가 의존성.
 - 의존성 우선 배치와 검증된 DDP 대안: 후속을 여는 job을 우선하고 서버에 맞는 등록된 GPU 구성을 선택.
@@ -50,6 +55,10 @@
 “실험 그룹”을 사용합니다.
 
 ## 설치
+
+GPU별·캠페인별 현재 작업 조회는 [읽기 전용 overview](docs/OVERVIEW.md)를 사용합니다.
+`overview --view gpu|campaign`은 dispatcher lock 없이 스냅샷을 읽으며,
+`--job <ID>`로 대기 이유, `--live-progress`로 최신 학습 step을 확인할 수 있습니다.
 
 ### 준비 사항
 

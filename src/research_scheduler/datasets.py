@@ -60,8 +60,9 @@ def tick(controller,execute=False):
     catalogs={r['id']:json.loads(r['spec']) for r in store.db.execute('SELECT * FROM dataset_catalog')}
     if not catalogs:return
     jobs={j['id']:j for j in store.jobs()};nodes=store.specs('nodes')
-    successful={a['job']:a for a in store.attempts() if a['status']=='succeeded'}
-    for row in store.db.execute("SELECT * FROM dataset_preparations WHERE state!='ready'").fetchall():
+    pending=store.db.execute("SELECT * FROM dataset_preparations WHERE state!='ready'").fetchall()
+    successful={a['job']:a for a in store.attempts(job_ids={r['job'] for r in pending}) if a['status']=='succeeded'}
+    for row in pending:
         j=jobs[row['job']];state=j['status']
         if state=='succeeded':
             a=successful[j['id']]

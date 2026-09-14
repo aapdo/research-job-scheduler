@@ -1,0 +1,18 @@
+{
+  "id": "vivado-example",
+  "transport": "ssh",
+  "target": "configure-me-vivado",
+  "python": "python3",
+  "enabled": false,
+  "work_root": "/srv/rtl-scheduler",
+  "filesystem": "local",
+  "physical_host": "example-host",
+  "cpu_limit": 16,
+  "ram_limit_mib": 65536,
+  "max_jobs": 8,
+  "rtl_build_slots": 2,
+  "gpus": [],
+  "labels": {"tool": "vivado-2026.1", "part": "xczu15eg"},
+  "tokens": {"license.example-vivado": 1},
+  "policy": {"min_free_ram_mib": 0, "min_free_disk_mib": 8192}
+}

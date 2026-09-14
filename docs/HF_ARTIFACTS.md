@@ -6,6 +6,13 @@ campaign은 기존 동작을 유지합니다. 실행 서버에 등록한 HF Pyth
 
 ## 등록
 
+운영 모델 스케줄러의 공통 업로드 간격 옵션은 환경 변수
+`RS_HF_UPLOAD_INTERVAL_S`(1~3600초)입니다. 현재 서비스 설정은 `20`이며,
+캠페인별 `commit_interval_s`보다 우선하여 모든 HF 저장소에 적용됩니다.
+저장소별 동시 업로드 1건, 429의 서버 지정 대기시간은 그대로 유지합니다.
+서비스 환경 옵션을 변경한 뒤 모델 관리 서비스만 재시작하면 적용됩니다.
+옵션을 지정하지 않는 다른 실행기는 기존 캠페인 정책을 사용합니다.
+
 운영자가 준비한 **기존** model 또는 dataset 저장소를 사용합니다. 저장소를 자동 생성하거나
 공개 범위를 변경하지 않습니다. campaign의 `hf` 필드에는 비밀값을 넣지 않습니다.
 
@@ -19,6 +26,21 @@ campaign은 기존 동작을 유지합니다. 실행 서버에 등록한 HF Pyth
   }
 }
 ```
+
+선택 정책: `hf.archive_payload=true`는 이후 업로드도 압축 파일/manifest 2개로
+저장합니다. `hf.commit_interval_s=20`은 같은 repo ID/type의 모든 브랜치·서버에
+업로드 직렬화와 최소 간격을 적용합니다. 다운로드는 이 업로드 제한에 포함하지 않습니다.
+2026-09-13 사용자 승인으로 picodet-s-cssa-epoch20 저장소의 SCDA8/R18/HM4 정책을
+120초에서 20초로 변경했습니다. 기존 실행 중 전송 명세와 429 대기는 유지합니다.
+429는 `Retry-After`/`RateLimit`을 읽고, 시간당 커밋 제한 또는 헤더 누락 시 보수적으로
+1시간 뒤로 미룹니다. 전송은 `HF_RETRY.json`을 남기고 종료하여 슬롯/시작 잠금을
+해제합니다. 스케줄러가 기록된 시각 이후 최대 3회 추가 시도하며, 과거 실패 이력은
+유지합니다. 승인된 별도 복구 revision만 새 유한 재시도 구간을 시작합니다.
+운영 모델 관리 프로세스는 `research-model-controller.service`에서 단일 인스턴스로
+실행합니다. 재시작용 임시 unit의 자식으로 띄우지 않습니다.
+2026-09-13 완료 회수 중단 복구 후 서비스는 `Restart=always`를 사용합니다.
+정상 코드로 예기치 않게 종료돼도 다시 시작하지만, 운영자의 명시적
+`systemctl stop`은 자동 재시작하지 않습니다. 단일 관리자 중복 검사와 기존 DB 잠금을 유지합니다.
 
 기존 campaign JSON에 위 필드만 추가해 재등록할 수 있습니다. 완료된 학습도 publication
 대상에 포함되지만 기존 성공 상태와 실행 명세는 초기화하지 않습니다. 한 experiment가 두
@@ -39,6 +61,11 @@ token 값은 JSON, CLI 인수, Git 또는 job.env에 넣지 않습니다. 서버
 인증을 별도로 준비해야 하며 scheduler가 token을 다른 서버로 복사하지는 않습니다.
 
 ## 어떤 파일을 올리는가
+
+2026-09-13부터 스케줄러가 새로 만드는 업로드는 `archive_payload` 생략 시에도
+압축을 기본 적용합니다. 명시적인 `hf.archive_payload=false`는 호환성 예외이며,
+기존 전송/receipt/다운로드는 변경하지 않습니다. 파일 수가 찬 브랜치는 압축만으로
+해결되지 않으므로 별도 승인된 publication 브랜치를 사용해야 합니다.
 
 기본적으로 job의 `outputs`에 명시한 결과를 업로드합니다. 결과 JSON만 `outputs`에 선언한
 연구 코드에서는 checkpoint를 `hf_artifacts`에 추가해야 합니다. 파일 또는 파일 glob만
@@ -69,7 +96,17 @@ research-scheduler --db "$SCHEDULER_DB" set-job-hf-artifacts JOB_ID examples/job
 
 1. 학습이 성공하면 완료 receipt의 SHA256과 export 파일을 검사합니다.
 2. 원래 실행 서버에서 GPU를 예약하지 않는 별도 CPU upload task를 시작합니다.
-3. `prefix/campaign/job/attempt/`에 파일과 `HF_MANIFEST.json`을 한 commit으로 올립니다.
+3. `prefix/campaign/job/attempt/`에 최대 50개 파일 단위로 나누어 commit합니다.
+   `HF_MANIFEST.json`은 마지막 commit에만 포함하며 최종 commit SHA를 receipt에 기록합니다.
+   중간 실패나 source SHA 변경 시 완료 receipt를 만들지 않습니다. 부분 업로드는 성공으로
+   간주하지 않으며, 재시도해도 원본과 실패 이력은 보존합니다.
+   HTTP 400의 명시적 `too many files` 거부에만 batch를 절반으로 줄입니다(최소 1개).
+   1개도 거부되거나 다른 오류이면 중단하며 무한 재시도·인증/용량 제한 우회는 하지 않습니다.
+   `git repo would contain ... files`는 저장소 전체 파일 제한이므로 batch 축소를 하지 않습니다.
+   승인된 전송의 `archive_payload=true`는 원본 파일을 `HF_PAYLOAD.tar.gz`와 manifest 두 파일로
+   보관합니다. 원본별 크기/SHA와 논리 경로는 manifest에 유지합니다. 다운로드는 압축 파일의
+   SHA 검증 후 선언된 일반 파일만 복원하며, 각 파일 SHA 검증 전 완료 처리하지 않습니다.
+   기존 개별 파일 전송 receipt도 계속 지원합니다. 기존 원본이나 HF 이력을 삭제하지 않습니다.
 4. 성공 결과에 `hf_artifact`를 붙입니다. repo ID/type, commit SHA, 경로, 링크, manifest 및 파일
    hash가 포함됩니다. branch 이름 대신 전체 commit SHA가 다운로드 기준입니다.
 5. 다른 local 서버에서 대기 중인 후속 job을 실행할 자원이 있으면 CPU download task를 만듭니다.
@@ -89,6 +126,11 @@ research-scheduler --db "$SCHEDULER_DB" set-job-hf-artifacts JOB_ID examples/job
 않습니다. cache eviction과 서버 간 token 배포는 지원하지 않습니다.
 
 ## 상태와 알림
+
+승인된 업로드 복구는 `artifact_repair_queue`에 만료 시각과 별도 repair revision을
+기록해 단일 스케줄러가 일반 publication보다 먼저 처리할 수 있습니다.
+슬롯·health·저장소별 간격·429 대기를 우회하지 않으며, 제출 후 기존 유한 재시도
+정책으로 인계합니다. 이번 BANKR4 E5 복구 요청의 유효기간은 1시간입니다.
 
 ```bash
 research-scheduler --db "$SCHEDULER_DB" artifact-status

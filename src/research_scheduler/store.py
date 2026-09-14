@@ -63,13 +63,14 @@ class Store:
         os.chmod(self.path, 0o600)
 
     @contextlib.contextmanager
-    def lock(self, timeout=0, poll_interval=0.1):
+    def lock(self, timeout=None, poll_interval=0.1):
         """Exclusive registry lock; dispatchers fail fast, control jobs may wait.
 
         The timeout covers lock acquisition only. Never wait while holding a
         SQLite transaction: callers use ``with store.lock(...), store.db``.
         """
         from .schema import number
+        timeout = getattr(self, 'lock_wait_s', 0) if timeout is None else timeout
         number(timeout, 'lock timeout', 0)
         number(poll_interval, 'lock poll interval', 0)
         check(poll_interval > 0, 'lock poll interval must be positive')
@@ -102,6 +103,15 @@ class Store:
             # One inventory entry per physical UUID prevents alias double-booking.
             for other in self.specs("nodes").values():
                 if other["id"] != n["id"]:
+                    check(not set(n.get('board_locks', {})) & set(other.get('board_locks', {})),
+                          'board already has a gateway; all tunnel clients must use the same gateway')
+                    for token in set(n.get('tokens', {})) & set(other.get('tokens', {})):
+                        check(n['tokens'][token] == other['tokens'][token], 'shared token capacities disagree: ' + token)
+                    if n.get('physical_host') and n.get('physical_host') == other.get('physical_host'):
+                        for key in ('cpu_limit', 'ram_limit_mib'):
+                            check(n.get(key) == other.get(key), 'physical-host limits disagree: ' + key)
+                        if n.get('rtl_build_slots') and other.get('rtl_build_slots'):
+                            check(n['rtl_build_slots'] == other['rtl_build_slots'], 'physical-host build limits disagree')
                     check(not {g["uuid"] for g in n["gpus"]} & {g["uuid"] for g in other["gpus"]},
                           "GPU UUID already registered under another node")
                     if n["transport"] == other["transport"]:
@@ -329,15 +339,28 @@ class Store:
     def jobs(self):
         return [dict(r, spec=json.loads(r["spec"])) for r in self.db.execute("SELECT * FROM jobs")]
 
-    def attempts(self, active=False):
-        query = "SELECT * FROM attempts" + (" WHERE status IN ('starting','running','unknown')" if active else "")
-        result = [dict(r, spec=json.loads(r["spec"]), report=json.loads(r["report"])) for r in self.db.execute(query)]
+    def attempts(self, active=False, *, job_ids=None, summary=False):
+        # Scheduling needs resource/lineage fields, not a duplicate of every
+        # other job in the frozen campaign. Full execution/audit reads remain
+        # the default; never submit summary specs to a launch/validation RPC.
+        columns = ("id,job,node,status,created,released,ready_polls,report,"
+                   "json_remove(spec,'$.experiment_spec') AS spec") if summary else '*'
+        conditions, parameters = [], []
+        if active:
+            conditions.append("status IN ('starting','running','unknown')")
+        if job_ids is not None:
+            parameters = list(job_ids)
+            if not parameters: return []
+            conditions.append('job IN ('+','.join('?' for _ in parameters)+')')
+        query = 'SELECT '+columns+' FROM attempts'+(' WHERE '+' AND '.join(conditions) if conditions else '')
+        result = [dict(r, spec=json.loads(r["spec"]), report=json.loads(r["report"])) for r in self.db.execute(query, parameters)]
         by_id = {a['id']: a for a in result}
-        for row in self.db.execute("SELECT * FROM artifact_transfers WHERE status='succeeded' ORDER BY created"):
+        for row in self.db.execute("SELECT attempt,node,direction,report FROM artifact_transfers WHERE status='succeeded' ORDER BY created"):
             attempt = by_id.get(row['attempt'])
-            receipt = json.loads(row['report']).get('artifact')
-            if attempt is None or not receipt or attempt['status'] != 'succeeded':
+            if attempt is None or attempt['status'] != 'succeeded':
                 continue
+            receipt = json.loads(row['report']).get('artifact')
+            if not receipt: continue
             if row['direction'] == 'upload':
                 attempt['report']['hf_artifact'] = receipt
             else:

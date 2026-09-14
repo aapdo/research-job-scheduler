@@ -10,9 +10,15 @@ from pathlib import Path
 
 from . import agent
 from .planner import base_health, gpu_healthy, placements
-from .schema import job_filesystem, node_filesystem
+from .schema import job_filesystem, node_filesystem, RTL_KINDS
 from .store import ACTIVE, dumps
 from .states import observe_health, recovery_due, transition
+
+
+class ExpiredBatchSnapshot(ValueError):
+    def __init__(self, nodes):
+        super().__init__('batch resource snapshot expired before reservation')
+        self.nodes = nodes
 
 
 class Transport:
@@ -32,7 +38,11 @@ class Transport:
             raise TimeoutError(f"{node['id']} {action}: response timeout after {timeout}s") from exc
         if result.returncode:
             raise RuntimeError("remote helper failed: " + result.stderr[-1500:])
-        return json.loads(result.stdout)
+        value=json.loads(result.stdout)
+        if action=='probe':
+            from .gpu_ownership import enrich
+            value=enrich(node,request,value)
+        return value
 
 
 class Controller:
@@ -53,6 +63,11 @@ class Controller:
         selected = [n for key, n in nodes.items() if (node_ids is None or key in node_ids)
                     and recovery_due(health.get(key, {}), time.time())]
         previous = self.snapshots()
+        # Authoritative active registrations, not all processes owned by a UID.
+        registered = {}
+        query = "SELECT id,node,json_extract(spec,'$.attempt_dir') AS directory FROM attempts WHERE status IN ('starting','running','unknown') UNION ALL SELECT id,node,json_extract(spec,'$.attempt_dir') FROM artifact_transfers WHERE status IN ('starting','running','unknown')"
+        for row in self.store.db.execute(query):
+            registered.setdefault(row['node'], []).append(dict(id=row['id'], attempt_dir=row['directory']))
         results = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             futures = {}
@@ -62,7 +77,10 @@ class Controller:
                 if recovery.get("phase") == "ssh_retrying":
                     idx = recovery["retries_done"] % n["recovery"]["ssh_attempts_per_round"]
                     transport_node["_rpc_timeout_s"] = n["recovery"]["ssh_timeouts_s"][idx]
-                futures[pool.submit(self.transport.call, transport_node, "probe", n)] = n
+                prior = previous.get(n['id'], {})
+                request = dict(n, _registered_attempts=registered.get(n['id'], []),
+                               _d_state_previous={k:prior[k] for k in ('boot_id','d_state_tracks','d_state_sample_at') if k in prior})
+                futures[pool.submit(self.transport.call, transport_node, "probe", request)] = n
             for future in concurrent.futures.as_completed(futures):
                 n = futures[future]
                 try:
@@ -72,7 +90,12 @@ class Controller:
                 now = time.time()
                 data["received_at"] = now
                 old = previous.get(n["id"], {})
-                continuous = 0 <= now - old.get("received_at", 0) <= n["policy"]["max_snapshot_age_s"]
+                # Observation cadence is separate from admission freshness.
+                # A healthy 62s polling cycle must not reset a three-poll streak
+                # when the newly received snapshot still has a 60s launch TTL.
+                poll_gap = n["policy"].get("max_health_poll_gap_s", 120)
+                continuous = (old.get("boot_id") == data.get("boot_id")
+                              and 0 <= now - old.get("received_at", 0) <= poll_gap)
                 healthy = not base_health(n, data, now)
                 # Rapid CLI calls cannot manufacture three independent health polls.
                 count_poll = now - old.get("last_counted_at", 0) >= 2
@@ -95,6 +118,35 @@ class Controller:
                     self.store.event("node_health", key, state)
         return results
 
+    def stabilize_healthy_nodes(self):
+        """Collect bounded independent polls when a long loop loses its streak.
+
+        Retain the existing three-poll gate and snapshot TTL. This never declares
+        an unhealthy node/GPU healthy or lifts any admission restriction.
+        """
+        for _ in range(2):
+            now = time.time()
+            snapshots = self.snapshots()
+            selected = []
+            for key, node in self.store.specs('nodes').items():
+                snap = snapshots.get(key, {})
+                if not node['enabled'] or base_health(node, snap, now):
+                    continue
+                required = node['policy']['stable_polls']
+                allowed = {g['uuid'] for g in node['gpus'] if g['enabled']
+                           and g['uuid'] not in node['policy'].get('disabled_gpu_uuids', [])}
+                mode = 'shared' if node['policy']['allow_gpu_sharing'] else 'exclusive'
+                needs_gpu = any(g['uuid'] in allowed and gpu_healthy(g, node, mode)
+                                and g.get('stable_polls', 0) < required for g in snap.get('gpus', []))
+                if snap.get('stable_polls', 0) < required or needs_gpu:
+                    selected.append(key)
+            if not selected:
+                break
+            # refresh() independently enforces >=2s between counted samples.
+            time.sleep(2)
+            self.refresh(selected)
+            self.invalidate_unavailable()
+
     def plan(self):
         from .artifacts import reservations
         nodes, snapshots = self.store.specs("nodes"), self.snapshots()
@@ -116,7 +168,7 @@ class Controller:
             if n["startup_group"] in blocked_groups and key in snapshots:
                 snapshots[key] = dict(snapshots[key], error="shared backend unhealthy/unreachable: " + blocked_groups[n["startup_group"]])
         return placements(self.store.jobs(), self.store.specs("experiments"), nodes,
-                          snapshots, self.store.attempts() + reservations(self.store), self.store.specs("groups_"), now)
+                          snapshots, self.store.attempts(summary=True) + reservations(self.store), self.store.specs("groups_"), now)
 
     def invalidate_unavailable(self):
         health = self.node_health()
@@ -124,9 +176,29 @@ class Controller:
             h = health.get(a["node"], {})
             if h.get("phase") != "unavailable":
                 continue
-            job = next(j for j in self.store.jobs() if j["id"] == a["job"])
-            count = sum(x["job"] == a["job"] for x in self.store.attempts())
+            # A timeout is not proof that a tool or board operation stopped.
+            # Preserve its reservation across all gateways and aliases.
+            if (a['spec'].get('job_spec', {}).get('kind') in RTL_KINDS
+                    or a['spec']['resources'].get('tokens')
+                    or a['spec'].get('node_spec', {}).get('physical_host')):
+                continue
+            row = self.store.db.execute('SELECT spec,status FROM jobs WHERE id=?', (a['job'],)).fetchone()
+            job = dict(spec=json.loads(row['spec']), status=row['status'])
+            count = self.store.db.execute('SELECT COUNT(*) FROM attempts WHERE job=?', (a['job'],)).fetchone()[0]
             safe = job["spec"]["failover_safe"] and count < job["spec"]["max_attempts"]
+            if h.get('reason') == 'continuous D-state exceeded timeout' and not safe:
+                # Host I/O stalls do not establish that this scientific child died
+                # or that its outputs are corrupt. Keep its identity and resources.
+                reason = 'node I/O health unavailable; existing process not declared failed; reservation preserved'
+                report = dict(a['report'], status='unknown', reason=reason,
+                              node_health_reason=h['reason'])
+                with self.store.db:
+                    self.store.db.execute("UPDATE attempts SET status='unknown',released=0,report=? WHERE id=?",
+                                          (dumps(report), a['id']))
+                    self.store.db.execute("UPDATE jobs SET status='unknown',reason=? WHERE id=?", (reason, a['job']))
+                    if a['status'] != 'unknown':
+                        self.store.event('node_io_attempt_held', a['id'], {'reason': reason, 'node_health': h})
+                continue
             status = "queued" if safe else "blocked"
             reason = "previous attempt invalid: " + h["reason"]
             if not safe:
@@ -139,18 +211,60 @@ class Controller:
                 self.store.event("attempt_invalid", a["id"], {"reason": reason, "remote_process": "unknown; NOT killed",
                                                              "late_results": "ignored", "failover": safe})
 
-    def reconcile(self):
+    def _status_reports(self, attempts, health):
+        """Read status concurrently across nodes, sequentially within each node.
+
+        Workers never access SQLite or reserve/launch anything. Consume reports
+        in original attempt order so lifecycle writes retain serial semantics.
+        """
+        grouped, reports = {}, {}
+        for a in attempts:
+            if health.get(a['node'], {}).get('phase') in ('ssh_retrying', 'unavailable'):
+                reports[a['id']] = dict(a['report'], status='unknown', reason='node recovery in progress',
+                                       node_health_reason=health[a['node']].get('reason', 'SSH recovery'))
+            else:
+                grouped.setdefault(a['node'], []).append(a)
+
+        def read_node(rows):
+            result = {}
+            for a in rows:
+                try:
+                    request=dict(a['spec'],_oom_previous=a.get('report',{}).get('oom_observation',{}))
+                    if a.get('report',{}).get('failure_class')=='experiment_oom':
+                        request['_oom_verified_evidence']=a['report'].get('failure_evidence')
+                    result[a['id']] = self.transport.call(a['spec']['node_spec'], 'status', request)
+                except Exception as exc:
+                    result[a['id']] = dict(status='unknown', reason=str(exc))
+            return result
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            for result in pool.map(read_node, grouped.values()):
+                reports.update(result)
+        return [(a, reports[a['id']]) for a in attempts]
+
+    def reconcile(self, recover_oom=False, exclude_attempts=()):
         snapshots, groups = self.snapshots(), self.store.specs("groups_")
         health = self.node_health()
-        for a in self.store.attempts(active=True):
-            node = a["spec"]["node_spec"]  # immutable attempt transport, not edited inventory
-            if health.get(a["node"], {}).get("phase") in ("ssh_retrying", "unavailable"):
-                report = {"status": "unknown", "reason": "node recovery in progress"}
-            else:
-                try:
-                    report = self.transport.call(node, "status", a["spec"])
-                except Exception as exc:
-                    report = {"status": "unknown", "reason": str(exc)}
+        active=[a for a in self.store.attempts(active=True) if a['id'] not in exclude_attempts]
+        for a, report in self._status_reports(active, health):
+            node = a['spec']['node_spec']
+            if (recover_oom and report.get('failure_class')=='experiment_oom'
+                    and not report.get('termination_verified')):
+                cleanup_count=a.get('report',{}).get('oom_cleanup_attempts',0)
+                if cleanup_count>=2:
+                    report=dict(report,status='unknown',oom_cleanup_attempts=cleanup_count,
+                                reason='OOM cleanup budget exhausted; manual termination confirmation required')
+                    # Preserve the reservation; do not create a replacement.
+                    status='unknown'
+                else:
+                    try:
+                        request=dict(a['spec'],_oom_previous=report.get('oom_observation',{}),
+                                     _oom_verified_evidence=report.get('failure_evidence'))
+                        report=self.transport.call(node,'recover_oom',request)
+                    except Exception as exc:
+                        report=dict(report,status='unknown',termination_verified=False,
+                                    reason='OOM cleanup unconfirmed: '+type(exc).__name__)
+                    report=dict(report,oom_cleanup_attempts=cleanup_count+1)
             status = report.get("status", "unknown")
             if status not in (*ACTIVE, "succeeded", "failed"):
                 status = "unknown"
@@ -161,6 +275,10 @@ class Controller:
                 if report.get("returncode") != 0 or set(report.get("outputs", {})) != set(a["spec"]["outputs"]):
                     status = "unknown"
                     report["reason"] = "success receipt is incomplete"
+                if (a['spec'].get('job_spec', {}).get('kind') in RTL_KINDS
+                        and report.get('validation', {}).get('status') != 'pass'):
+                    status = 'unknown'
+                    report['reason'] = 'RTL validation receipt is incomplete'
             released = a["released"]
             polls = a["ready_polls"]
             group = a["spec"]["startup_group"]
@@ -183,24 +301,69 @@ class Controller:
                                       (status, int(released), polls, dumps(report), a["id"]))
                 job_status = status
                 if status == "failed":
-                    j = next(j for j in self.store.jobs() if j["id"] == a["job"])
+                    j = self.store.db.execute('SELECT spec FROM jobs WHERE id=?', (a['job'],)).fetchone()
                     count = self.store.db.execute("SELECT COUNT(*) FROM attempts WHERE job=?", (a["job"],)).fetchone()[0]
-                    if count < j["spec"]["max_attempts"]:
+                    from .gpu_recovery import retry_spec
+                    retried = retry_spec(json.loads(j['spec']), report, count)
+                    if retried is not None:
+                        self.store.db.execute('UPDATE jobs SET spec=? WHERE id=?', (dumps(retried), a['job']))
+                        self.store.event('experiment_oom_failover' if report.get('failure_class') == 'experiment_oom' else 'gpu_startup_failover', a['job'],
+                                         dict(attempt=a['id'], node=a['node'], gpus=a['spec']['gpus'],
+                                              retry=retried['metadata'].get('gpu_startup_failovers', len(retried['metadata'].get('oom_failovers', [])))))
+                        j = dict(spec=dumps(retried))
+                    if count < json.loads(j['spec'])["max_attempts"]:
                         job_status = "queued"
                 reason = report.get("reason", report.get("error", ""))
-                old_job = next(j for j in self.store.jobs() if j["id"] == a["job"])
+                old_job = self.store.db.execute('SELECT status FROM jobs WHERE id=?', (a['job'],)).fetchone()
                 transition("job", old_job["status"], job_status)
                 self.store.db.execute("UPDATE jobs SET status=?,reason=? WHERE id=?", (job_status, reason, a["job"]))
                 if status != a["status"]:
                     self.store.event("attempt_" + status, a["id"], report)
 
-    def request(self, placement):
+    def _request_context(self, placements):
+        """Read selected jobs and their dependencies once; retain full launch audit specs."""
+        keys = list(dict.fromkeys(p['job'] for p in placements))
+        if not keys:
+            return dict(nodes={}, jobs={}, experiments={}, successful={})
+        query = 'SELECT * FROM jobs WHERE id IN (' + ','.join('?' for _ in keys) + ')'
+        jobs = {r['id']: dict(r, spec=json.loads(r['spec'])) for r in self.store.db.execute(query, keys)}
+        if set(jobs) != set(keys):
+            raise ValueError('selected job disappeared before request preparation')
+        experiments = {}
+        for key in {j['experiment'] for j in jobs.values()}:
+            row = self.store.db.execute('SELECT spec FROM experiments WHERE id=?', (key,)).fetchone()
+            experiments[key] = json.loads(row['spec'])
+        dependencies = {d for j in jobs.values() for d in j['spec']['depends_on']}
+        attempts = self.store.attempts(job_ids=dependencies, summary=True)
+        return dict(nodes=self.store.specs('nodes'), jobs=jobs, experiments=experiments,
+                    successful={a['job']: a for a in attempts if a['status']=='succeeded'})
+
+    def request(self, placement, context=None):
         s = self.store
-        node = s.specs("nodes")[placement["node"]]
-        job = next(j for j in s.jobs() if j["id"] == placement["job"])
+        context = context if context is not None else self._request_context([placement])
+        node = context['nodes'][placement['node']]
+        job = context['jobs'][placement['job']]
         spec = job["spec"]
+        from .model_vram_policy import normalize
+        spec = normalize(spec)
         resources = placement.get('resources', spec['resources'])
-        if resources not in [spec['resources'], *spec.get('resource_variants', [])]:
+        from .execution_profiles import for_node
+        profile=spec.get('metadata',{}).get('execution_profiles',{}).get(node['id'])
+        if profile and resources!=profile.get('resource_contract'):
+            raise ValueError('placement differs from validated execution profile')
+        spec=for_node(spec,node['id'])
+        if spec.get('metadata',{}).get('required_resources'):
+            import copy
+            from .resources import marker
+            spec=copy.deepcopy(spec)
+            for rid,sha in spec['metadata']['required_resources'].items():
+                m=marker(rid,sha);asset=node['assets'].get(m['name'])
+                if not asset or asset['sha256']!=m['sha256']:
+                    raise ValueError('resource not verified on selected node: '+rid)
+                spec['input_files'].append(copy.deepcopy(asset))
+        from .hardware_resources import effective_resources
+        resources = effective_resources(spec, node, resources)
+        if resources not in [effective_resources(spec, node, r) for r in [spec['resources'], *spec.get('resource_variants', [])]]:
             raise ValueError('placement resources are not a registered variant')
         if spec.get('resource_variants') and len(placement['gpus']) != resources['gpu_count']:
             raise ValueError('GPU assignment differs from selected resource variant')
@@ -217,7 +380,7 @@ class Controller:
             raise ValueError("placement filesystem no longer satisfies job request")
         attempt_id = job["id"] + "." + uuid.uuid4().hex
         directory = str(Path(node["work_root"], "attempts", attempt_id))
-        successful = {a["job"]: a for a in s.attempts() if a["status"] == "succeeded"}
+        successful = context['successful']
         substitutions = {"{attempt_dir}": directory, "{config_path}": directory + "/config.json",
                          "{gpu_count}": str(len(placement["gpus"])), "{gpus}": ",".join(placement["gpus"]),
                          "{dataset_path}": dataset_path, "{filesystem}": filesystem}
@@ -260,7 +423,7 @@ class Controller:
             return value
 
         request = dict(id=attempt_id, job=job["id"], experiment=job["experiment"],
-                       experiment_spec=s.specs("experiments")[job["experiment"]],
+                       experiment_spec=context['experiments'][job['experiment']],
                        job_spec=spec, node_spec=node, attempt_dir=directory,
                        argv=[expand(v) for v in spec["argv"]], cwd=expand(spec["cwd"]),
                        env={k: expand(v) for k, v in spec["env"].items()}, config=expand_config(spec["config"]),
@@ -270,6 +433,11 @@ class Controller:
                        outputs=spec["outputs"], resources=resources,
                        startup_group=node["startup_group"], gpus=placement["gpus"])
         request["runner_sha256"] = hashlib.sha256(Path(agent.__file__).read_bytes()).hexdigest()
+        if spec['kind'] in RTL_KINDS:
+            request['validation'] = spec['validation']
+            request['preflight_argv'] = [expand(v) for v in spec.get('preflight_argv', [])]
+        if spec['kind'] == 'board_test':
+            request['board_lock'] = node['board_locks'][spec['board_id']]
         request["spec_sha256"] = hashlib.sha256(dumps(request).encode()).hexdigest()
         return request
 
@@ -296,24 +464,134 @@ class Controller:
             self.store.event("launch_ack", request["id"], report)
         return dict(chosen, attempt=request["id"], status=status)
 
-    def tick(self, execute=False, refresh=True, max_launches=1):
+    def _launch_batch(self, chosen):
+        """Reserve one simulated plan atomically, then send independent RPCs."""
+        context=self._request_context(chosen)
+        requests=[self.request(p, context=context) for p in chosen]
+        snapshots=self.snapshots()
+        now=time.time()
+        expired=[]
+        for request in requests:
+            node=request['node_spec'];snap=snapshots.get(node['id'],{})
+            if not 0<=now-snap.get('received_at',0)<=node['policy']['max_snapshot_age_s']:
+                expired.append(node['id'])
+        if expired:
+            raise ExpiredBatchSnapshot(list(dict.fromkeys(expired)))
+        with self.store.db:
+            for placement,request in zip(chosen,requests):
+                row=self.store.db.execute('SELECT status FROM jobs WHERE id=?',(request['job'],)).fetchone()
+                if not row or row['status']!='queued':raise ValueError('batch job is no longer queued')
+                self.store.db.execute("INSERT INTO attempts(id,job,node,spec,status,created) VALUES(?,?,?,?,?,?)",
+                    (request['id'],request['job'],placement['node'],dumps(request),'starting',time.time()))
+                self.store.db.execute("UPDATE jobs SET status='starting',reason='' WHERE id=?",(request['job'],))
+                self.store.event('attempt_reserved',request['id'],placement)
+        def launch(request):
+            try:
+                report=self.transport.call(request['node_spec'],'launch',request)
+                status=report.get('status','unknown')
+                if status not in ACTIVE:status='unknown'
+            except Exception as exc:report,status={'reason':str(exc)},'unknown'
+            return report,status
+        result=[]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8,len(requests))) as pool:
+            reports=list(pool.map(launch,requests))
+        for placement,request,(report,status) in zip(chosen,requests,reports):
+            with self.store.db:
+                self.store.db.execute('UPDATE attempts SET status=?,report=? WHERE id=?',(status,dumps(report),request['id']))
+                self.store.db.execute('UPDATE jobs SET status=?,reason=? WHERE id=?',(status,report.get('reason',''),request['job']))
+                self.store.event('launch_ack',request['id'],report)
+            result.append(dict(placement,attempt=request['id'],status=status))
+        return result
+
+    def tick(self, execute=False, refresh=True, max_launches=1, warmup=True, launch_budget_s=None, parallel_launches=False):
         if not isinstance(max_launches, int) or isinstance(max_launches, bool) or max_launches < 1:
             raise ValueError("max_launches must be a positive integer")
+        if launch_budget_s is not None and (isinstance(launch_budget_s, bool)
+                or not isinstance(launch_budget_s, (int, float)) or not 0 < launch_budget_s < float('inf')):
+            raise ValueError('launch_budget_s must be positive and finite')
         with self.store.lock():
             if refresh:
                 self.refresh()
             self.invalidate_unavailable()
-            self.reconcile()
+            self.reconcile(recover_oom=execute)
+            from .execution_profiles import tick as execution_tick
+            execution_tick(self, execute=execute)
+            from .resources import tick as resource_tick
+            resource_tick(self, execute=execute)
             from .datasets import tick as dataset_tick
             dataset_tick(self, execute=execute)
             from .artifacts import tick as artifact_tick
+            # Reconciliation/transfers may take longer than the launch TTL.
+            # Refresh expired observations instead of returning an all-stale
+            # plan and starving otherwise idle executors on every long cycle.
+            def refresh_expired():
+                if not refresh:
+                    return
+                now = time.time()
+                snapshots = self.snapshots()
+                expired = [key for key, node in self.store.specs('nodes').items()
+                           if node['enabled'] and (key not in snapshots
+                           or now - snapshots[key].get('received_at', 0) > node['policy']['max_snapshot_age_s'])]
+                if expired:
+                    self.refresh(expired)
+                    self.invalidate_unavailable()
+                return bool(expired)
+            refresh_expired()
+            if execute and refresh and warmup:
+                self.stabilize_healthy_nodes()
+            # Artifact admission needs the same fresh independent observations
+            # as model admission, not the stale samples from before reconcile.
             artifact_tick(self, execute=execute)
+            refresh_expired()
             plan = self.plan()
             if not execute:
                 return {"mode": "dry-run", "plan": plan, "launches": []}
             launches, skipped = [], set()
+            batch_revalidations = 0
+            current = plan
+            launch_started = time.monotonic()
+            # Probe the candidate hosts together instead of serial SSH before
+            # every reservation. Replanning still includes every new lease.
+            candidate_nodes=list(dict.fromkeys(p['node'] for p in current if p['decision']=='ready'))[:max_launches]
+            probed=set()
+            if candidate_nodes:
+                self.refresh(candidate_nodes)
+                self.invalidate_unavailable()
+                current=self.plan()
+                probed.update(candidate_nodes)
             while len(launches) < max_launches:
-                current = self.plan()
+                # Yield between complete admissions, never interrupt a reserve
+                # or RPC. Always permit one candidate so slow RPCs cannot starve it.
+                if ((launches or skipped) and launch_budget_s is not None
+                        and time.monotonic()-launch_started >= launch_budget_s):
+                    break
+                if refresh_expired():
+                    current = self.plan()
+                if parallel_launches:
+                    candidates=[p for p in current if p['decision']=='ready' and p['job'] not in skipped][:max_launches-len(launches)]
+                    if not candidates:break
+                    snaps=self.snapshots()
+                    stale=list(dict.fromkeys(p['node'] for p in candidates
+                        if p['node'] not in probed or not 0<=time.time()-snaps.get(p['node'],{}).get('received_at',0)<=10))
+                    if stale:
+                        self.refresh(stale);self.invalidate_unavailable();probed.update(stale)
+                        current=self.plan()
+                        candidates=[p for p in current if p['decision']=='ready' and p['job'] not in skipped][:max_launches-len(launches)]
+                    if not candidates:break
+                    try:
+                        launches.extend(self._launch_batch(candidates))
+                    except ExpiredBatchSnapshot as exc:
+                        if batch_revalidations >= 1:
+                            skipped.update(p['job'] for p in candidates)
+                            break  # Bounded recovery; never reserve stale resources.
+                        self.refresh(exc.nodes)
+                        self.invalidate_unavailable()
+                        probed.update(exc.nodes)
+                        batch_revalidations += 1
+                        current=self.plan()
+                        continue
+                    current=self.plan()
+                    continue
                 chosen = next((p for p in current
                                if p["decision"] == "ready" and p["job"] not in skipped), None)
                 if chosen is None:
@@ -321,14 +599,24 @@ class Controller:
                 # Revalidate only the selected node immediately before reservation.
                 # Existing reservations make subsequent replans account for every
                 # launch in this cycle; startup groups therefore remain serialized.
-                self.refresh([chosen["node"]])
-                self.invalidate_unavailable()
-                fresh = next((p for p in self.plan() if p["job"] == chosen["job"]), {})
-                if (fresh.get("decision") != "ready" or fresh.get("node") != chosen["node"]
-                        or fresh.get("gpus") != chosen["gpus"]):
+                selected_snapshot=self.snapshots().get(chosen['node'],{})
+                if chosen['node'] not in probed or not 0<=time.time()-selected_snapshot.get('received_at',0)<=10:
+                    self.refresh([chosen["node"]])
+                    self.invalidate_unavailable()
+                    current = self.plan()
+                    probed.add(chosen['node'])
+                fresh = next((p for p in current if p["job"] == chosen["job"]), {})
+                if fresh.get("decision") != "ready" or fresh.get("node") != chosen["node"]:
                     skipped.add(chosen["job"])
                     continue
-                launches.append(self._launch(chosen))
-            final_plan = self.plan()
+                # Temperature/VRAM tie-breaks can reorder healthy GPUs on the
+                # freshly probed node. Reserve the freshly validated choice;
+                # do not starve a job solely because its old ranking changed.
+                launches.append(self._launch(fresh))
+                current = self.plan()
+            # Reap work that ended during preparation/planning/launch RPCs now,
+            # rather than leaving it active until the next long dispatch cycle.
+            self.reconcile(recover_oom=execute, exclude_attempts={p.get('attempt') for p in launches})
+            final_plan = current
             return {"mode": "execute", "launched": launches[0] if launches else None,
                     "launches": launches, "plan": plan, "final_plan": final_plan}

@@ -3,6 +3,43 @@ import time
 
 from .schema import job_filesystem, node_filesystem
 from .store import ACTIVE
+from .build_placement import placement_key, build_pressure
+from .draining import epoch_publication_allowed, host_resource_reservations
+
+
+def gpu_occupancy_key(chosen, snapshot, held):
+    """Prefer wholly unused GPU sets across hosts before sharing occupied GPUs."""
+    observed={g['uuid']:g for g in snapshot.get('gpus',[])}
+    counts=[sum(g in a['spec'].get('gpus',[]) for a in held) for g in chosen]
+    busy=[bool(count or observed.get(g,{}).get('processes')) for g,count in zip(chosen,counts)]
+    return (int(any(busy)),max(counts,default=0),sum(busy),sum(counts))
+
+
+def occupied_vram(gpu, users, allow_external):
+    """Live unowned memory plus per-attempt max(live owned, reservation)."""
+    import math
+    reserved=sum(a['spec']['resources']['vram_mib'] for a in users)
+    live=gpu['used_mib']
+    known={a['id']:a for a in users if a.get('id')}
+    owned={key:0.0 for key in known}
+    for p in gpu.get('processes',[]):
+        if p.get('attempt') not in known:continue
+        try:value=float(p['used_mib'])
+        except (KeyError,TypeError,ValueError):continue
+        if math.isfinite(value) and value>=0:owned[p['attempt']]+=value
+    if sum(owned.values())>live:return live+reserved
+    if any(owned.values()):
+        def reservation(a):
+            from .model_vram_policy import default_mib
+            measured=owned.get(a.get('id'),0)
+            value=a.get('admission_vram_mib')
+            original=a['spec']['resources']['vram_mib']
+            if default_mib() is not None and type(value) in (int,float) and value>0 and measured>0:
+                return value
+            return value if type(value) in (int,float) and 0<measured<=value<=original else original
+        return live+sum(max(0,reservation(a)-owned.get(a.get('id'),0)) for a in users)
+    # Preserve legacy conservative behavior if process ownership is unavailable.
+    return max(live,reserved) if users and not allow_external else live+reserved
 
 
 def base_health(node, snap, now):
@@ -12,10 +49,11 @@ def base_health(node, snap, now):
     if not 0 <= now - snap.get("received_at", 0) <= p["max_snapshot_age_s"]:
         return "stale resource snapshot"
     if snap.get("d_state", 1):
-        return "D-state detected; new launches paused"
+        return ("registered process D-state >=180s; new launches paused" if snap.get('d_state_policy') == 'registered-process-180s-v1'
+                else "D-state detected; new launches paused")
     if not snap.get("read_ok", False):
         return "storage read health failed"
-    if snap["cpu_percent"] > p["max_cpu_percent"]:
+    if not node.get('labels', {}).get('ignore_cpu_admission', False) and snap["cpu_percent"] > p["max_cpu_percent"]:
         return "CPU utilization above limit"
     if snap["ram_available_mib"] < p["min_free_ram_mib"]:
         return "insufficient host RAM headroom"
@@ -63,11 +101,82 @@ def dependency_priorities(jobs, experiments):
             for key, downstream in successors.items()}
 
 
+def admission_ram(attempt, job, now):
+    """Operator-audited reservation only; immutable execution specs are untouched."""
+    original = attempt['spec']['resources']['ram_mib']
+    item = job.get('spec', {}).get('metadata', {}).get('ram_admission_overrides', {}).get(attempt['id'], {})
+    value = item.get('ram_mib')
+    report = attempt.get('report', {})
+    rss = report.get('rss_mib')
+    heartbeat = report.get('heartbeat', 0)
+    if (attempt['status'] != 'running' or not item.get('evidence')
+            or type(value) not in (int, float) or not 0 < value <= original
+            or type(rss) not in (int, float) or not 0 <= rss <= value
+            or not 0 <= now - heartbeat <= 120):
+        return original
+    return value
+
+
+def admission_vram(attempt, job, now):
+    original=attempt['spec']['resources']['vram_mib']
+    from .model_vram_policy import reservation
+    policy=reservation(job.get('spec',{}))
+    if policy is not None and attempt['status']=='running' and attempt.get('report',{}).get('ready') and 0<=now-attempt.get('report',{}).get('heartbeat',0)<=120:
+        return policy
+    item=job.get('spec',{}).get('metadata',{}).get('vram_admission_overrides',{}).get(attempt['id'],{})
+    value=item.get('vram_mib')
+    report=attempt.get('report',{})
+    if (attempt['status']!='running' or not report.get('ready') or not item.get('evidence')
+            or item.get('original_vram_mib')!=original
+            or type(value) not in (int,float) or not 0<value<=original
+            or not 0<=now-report.get('heartbeat',0)<=120):
+        return original
+    return value
+
+
+def lineage_error(key, by_id, latest, lineage_cache):
+    """An early artifact never silently follows a producer into a new retry.
+
+    Check ancestors too, so a completed intermediate evaluation cannot let a
+    final report combine checkpoints from superseded training attempts.
+    """
+    if key in lineage_cache:
+        return lineage_cache[key]
+    spec = by_id[key]['spec']
+    from .recovery import frozen_initialization_valid
+    frozen = frozen_initialization_valid(by_id[key], latest.get(key))
+    if frozen is not None:
+        reason = '' if frozen else 'frozen initialization authority invalid: ' + key
+        lineage_cache[key] = reason
+        return reason
+    binding = spec.get('metadata', {}).get('epoch_dependency')
+    reason = ''
+    if binding:
+        source = latest.get(binding['source_job'])
+        if source is None or source['id'] != binding['source_attempt']:
+            reason = 'checkpoint lineage superseded or unavailable: ' + binding['source_job']
+        elif source['status'] not in ('running', 'succeeded'):
+            reason = 'checkpoint producer is not running/successful: ' + binding['source_job']
+    if not reason:
+        for dep in spec['depends_on']:
+            reason = lineage_error(dep, by_id, latest, lineage_cache)
+            if reason: break
+    lineage_cache[key] = reason
+    return reason
+
+
 def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
     """Return simulated placements with reasons; never mutate runtime or launch jobs."""
     now = time.time() if now is None else now
+    from .model_vram_policy import normalize
+    jobs=[dict(j,spec=normalize(j['spec'])) for j in jobs]
+    from .gpu_recovery import quarantine_snapshots
+    snapshots = quarantine_snapshots(snapshots, attempts)
     by_id = {j["id"]: j for j in jobs}
-    active = [a for a in attempts if a["status"] in ACTIVE]
+    active = [dict(a, admission_ram_mib=admission_ram(a, by_id.get(a.get('job'), {}), now),
+                   admission_vram_mib=admission_vram(a, by_id.get(a.get('job'), {}), now))
+              if a.get('job') in by_id else a
+              for a in attempts if a["status"] in ACTIVE]
     successful = {a["job"]: a for a in attempts if a["status"] == "succeeded"}
     held = list(active)
     plan = []
@@ -78,36 +187,20 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
             latest[attempt['job']] = attempt
     lineage_cache = {}
 
-    def lineage_error(key):
-        """An early artifact never silently follows a producer into a new retry.
-
-        Check ancestors too, so a completed intermediate evaluation cannot let a
-        final report combine checkpoints from superseded training attempts.
-        """
-        if key in lineage_cache:
-            return lineage_cache[key]
-        spec = by_id[key]['spec']
-        binding = spec.get('metadata', {}).get('epoch_dependency')
-        reason = ''
-        if binding:
-            source = latest.get(binding['source_job'])
-            if source is None or source['id'] != binding['source_attempt']:
-                reason = 'checkpoint lineage superseded or unavailable: ' + binding['source_job']
-            elif source['status'] not in ('running', 'succeeded'):
-                reason = 'checkpoint producer is not running/successful: ' + binding['source_job']
-        if not reason:
-            for dep in spec['depends_on']:
-                reason = lineage_error(dep)
-                if reason: break
-        lineage_cache[key] = reason
-        return reason
     scores = dependency_priorities(jobs, experiments)
+    def validation_expansion(j):
+        # Admit runnable consumers before expanding validation to more hosts.
+        # Blocked consumers still backfill normally into parallel validation.
+        return (j['id'].startswith('EXEC_VERIFY_')
+                and experiments[j['experiment']].get('project')=='execution-preparation'
+                and j['spec']['kind']=='prepare'
+                and j['spec']['resources']['gpu_count']>0)
     queued = sorted((j for j in jobs if j["status"] == "queued"),
-                    key=lambda j: (-scores[j['id']][0], -scores[j['id']][1],
+                    key=lambda j: (validation_expansion(j), -scores[j['id']][0], -scores[j['id']][1],
                                    j["created"], j["id"]))
     for j in queued:
         spec, failures = j["spec"], {}
-        invalid_lineage = lineage_error(j['id'])
+        invalid_lineage = lineage_error(j['id'], by_id, latest, lineage_cache)
         if invalid_lineage:
             plan.append({'job': j['id'], 'decision': 'blocked', 'reason': invalid_lineage})
             continue
@@ -119,24 +212,34 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
         for node_id, node in sorted(nodes.items()):
             reasons = []
             for index, resources in enumerate([spec['resources'], *spec.get('resource_variants', [])]):
+                from .hardware_resources import effective_resources
+                resources = effective_resources(spec, node, resources)
                 reason, chosen = fit(dict(spec, resources=resources), node, snapshots.get(node_id), held, attempts,
                                      successful, groups, now)
                 if reason:
                     reasons.append(reason)
                 else:
                     count = sum(a["node"] == node_id for a in held)
-                    candidates.append((-node.get("admission_priority", 0), count, index, node_id, chosen, resources))
-                    break
+                    key = placement_key(node, snapshots[node_id], held, resources, now, count, index, chosen, kind=spec['kind'])
+                    if spec.get('metadata', {}).get('prefer_primary_resources'):
+                        key = (index, *key)
+                    if resources['gpu_count']:
+                        key = (*gpu_occupancy_key(chosen,snapshots[node_id],held),*key)
+                    candidates.append((key, node_id, chosen, resources))
+                    if not resources['gpu_count']:break
             if reasons and len(reasons) == 1 + len(spec.get('resource_variants', [])):
                 failures[node_id] = '; '.join(dict.fromkeys(reasons))
         if not candidates:
             plan.append({"job": j["id"], "decision": "waiting", "reasons": failures or {"inventory": "no nodes registered"}})
             continue
-        _, _, _, node_id, chosen, resources = min(candidates, key=lambda c: c[:5])
+        _, node_id, chosen, resources = min(candidates, key=lambda c: c[0])
         placement = {"job": j["id"], "decision": "ready", "node": node_id, "gpus": chosen,
                      "filesystem_request": job_filesystem(spec),
                      "filesystem": node_filesystem(nodes[node_id])}
-        if spec.get('resource_variants'):
+        if resources.get('build_slots', 0):
+            score, pressure = build_pressure(nodes[node_id], snapshots[node_id], held, resources, now)
+            placement['build_placement'] = dict(policy='spread-first-v2', score=score, projected_pressure=pressure)
+        if spec.get('resource_variants') or resources != spec['resources']:
             placement['resources'] = resources
         if spec.get("dataset"):
             placement.update(dataset=spec["dataset"], dataset_path=nodes[node_id]["datasets"][spec["dataset"]])
@@ -146,6 +249,8 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
         held.append({"id": "planned:" + j["id"], "job": j["id"], "node": node_id,
                      "created": now, "released": False, "status": "starting",
                      "spec": {"resources": resources, "gpus": chosen,
+                              "node_spec": nodes[node_id],
+                              "job_spec": spec,
                               "startup_group": nodes[node_id]["startup_group"]}})
     for row in plan:
         row['effective_priority'], row['pending_descendants'] = scores[row['job']]
@@ -153,11 +258,50 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
 
 
 def fit(job, node, snap, held, history, successful, groups, now):
+    from .model_vram_policy import normalize
+    job=normalize(job)
+    # A partial runtime qualification is not permission for score/statistics jobs.
+    capability=node.get('labels',{}).get('execution_capability_limits',{}).get(job.get('dataset'))
+    if capability:
+        profile=job.get('metadata',{}).get('execution_profiles',{}).get(node['id'],{})
+        if (job.get('config',{}).get('mode') not in capability['modes']
+                or profile.get('catalog') not in capability['catalogs']):
+            return 'execution capability not verified for this operation', []
+    if node['id'] in job.get('metadata', {}).get('excluded_hosts', []):
+        return 'user excluded host for this job', []
+    from .execution_profiles import for_node
+    profile=job.get('metadata',{}).get('execution_profiles',{}).get(node['id'])
+    if profile and job['resources']!=profile.get('resource_contract'):
+        return 'execution-profile resource constraint', []
+    original=job.get('metadata',{}).get('execution_original_resources')
+    if not profile and original is not None and job['resources'] not in original:
+        return 'resource variant requires a verified execution profile', []
+    try:
+        job=for_node(job,node['id'],readonly=True)
+    except ValueError:
+        return 'invalid execution profile', []
     p, req = node["policy"], job["resources"]
-    if not node["enabled"]:
+    runtime_hold = node.get('labels', {}).get('gpu_runtime_quarantine', {})
+    if (req['gpu_count'] and runtime_hold.get('boot_id')
+            and runtime_hold['boot_id'] == (snap or {}).get('boot_id')):
+        return 'CUDA runtime unavailable; awaiting reboot or verified recovery', []
+    gpu_limit = node.get('labels', {}).get('max_gpus_per_job')
+    diagnostic_limit = node.get('labels', {}).get('diagnostic_gpu_count_overrides', {}).get(job['id'])
+    if (diagnostic_limit is not None and job.get('kind') == 'prepare'
+            and job.get('metadata', {}).get('diagnostic_only') is True):
+        gpu_limit = diagnostic_limit
+    if gpu_limit is not None:
+        if isinstance(gpu_limit, bool) or not isinstance(gpu_limit, int) or gpu_limit < 1:
+            return 'invalid node GPU-per-job limit', []
+        if req['gpu_count'] > gpu_limit:
+            return 'node GPU-per-job limit: ' + str(gpu_limit), []
+    if not node["enabled"] and not epoch_publication_allowed(job, node):
         return "node disabled/drained", []
     if job["hosts"] and node["id"] not in job["hosts"]:
         return "host constraint", []
+    mapping=job.get('metadata',{}).get('gpu_count_by_host')
+    if mapping is not None and mapping.get(node['id'])!=req['gpu_count']:
+        return 'host-specific GPU count constraint', []
     requested_filesystem = job_filesystem(job)
     actual_filesystem = node_filesystem(node)
     if requested_filesystem != "any" and requested_filesystem != actual_filesystem:
@@ -174,6 +318,9 @@ def fit(job, node, snap, held, history, successful, groups, now):
         return reason, []
     if snap.get("stable_polls", 0) < p["stable_polls"]:
         return "waiting for stable health polls", []
+    from .resources import availability
+    reason=availability(job,node,snap)
+    if reason:return reason, []
     if dataset:
         observed = snap.get("datasets", {}).get(dataset, {})
         if observed.get("path") != dataset_path or not observed.get("available"):
@@ -194,8 +341,35 @@ def fit(job, node, snap, held, history, successful, groups, now):
                 suffix = ' (HF download pending)' if a.get('report', {}).get('hf_artifact') else ''
                 return "dependency artifacts on another local filesystem: " + dep + suffix, []
     own = [a for a in held if a["node"] == node["id"]]
+    domain = node.get('physical_host', node['id'])
+    host_held = host_resource_reservations(node, held)
+    for token, count in req.get('tokens', {}).items():
+        capacity = node.get('tokens', {}).get(token, 0)
+        used = sum(a['spec']['resources'].get('tokens', {}).get(token, 0) for a in held)
+        if count + used > capacity:
+            return 'shared token unavailable: ' + token, []
+    if job['kind'] == 'board_test' and job['board_id'] not in node.get('board_locks', {}):
+        return 'board gateway not registered on node', []
+    build_slots = req.get('build_slots', 0)
+    psi_limit = node.get('labels', {}).get('rtl_memory_psi_full_avg10_limit')
+    if build_slots and psi_limit is not None:
+        psi = snap.get('memory_pressure_full_avg10')
+        if not isinstance(psi, (int, float)) or not 0 <= psi < float(psi_limit):
+            return 'temporary memory PSI gate; recheck next scheduling cycle', []
+    if build_slots and build_slots + sum(a['spec']['resources'].get('build_slots', 0) for a in host_held) > node.get('rtl_build_slots', 0):
+        return 'RTL build slots reserved', []
+    if build_slots:
+        starts = [a['created'] for a in history + held
+                  if a['spec'].get('node_spec', {}).get('physical_host', a['node']) == domain
+                  and a['spec']['resources'].get('build_slots', 0)]
+        if starts and now - max(starts) < 30:
+            return 'RTL build startup stagger (30 seconds)', []
+    disk_claims = sum(a['spec']['resources'].get('disk_mib', 0) for a in own)
+    if req.get('disk_mib', 0) + disk_claims + p['min_free_disk_mib'] > snap['disk_free_mib']:
+        return 'disk reservations/headroom exhausted', []
     registered = {g["uuid"]: g for g in node["gpus"] if g["enabled"]
-                  and g["uuid"] not in p.get("disabled_gpu_uuids", [])}
+                  and g["uuid"] not in p.get("disabled_gpu_uuids", [])
+                  and g["uuid"] not in snap.get("gpu_unavailable_uuids", [])}
     if req["gpu_count"]:
         if not registered:
             return "not enough enabled GPUs", []
@@ -210,24 +384,24 @@ def fit(job, node, snap, held, history, successful, groups, now):
                 return "warm-node job cap reached", []
     if len(own) >= node["max_jobs"]:
         return "node job slots reserved", []
-    if any(a["status"] == "unknown" for a in own):
+    if any(a["status"] == "unknown" for a in host_held):
         return "unknown attempt requires reconciliation", []
-    used_cpu = sum(a["spec"]["resources"]["cpu"] for a in own)
+    used_cpu = sum(a["spec"]["resources"]["cpu"] for a in host_held)
     # MemAvailable already reflects current RSS. Reserve only each active job's
     # unrealized growth to its declared peak; without a fresh process-tree RSS,
     # fall back to the full reservation.
     def remaining_ram(a):
-        requested = a["spec"]["resources"]["ram_mib"]
+        requested = a.get('admission_ram_mib', a["spec"]["resources"]["ram_mib"])
         observed = a.get("report", {}).get("rss_mib")
         return requested if not isinstance(observed, (int, float)) else max(0, requested - observed)
-    outstanding_ram = sum(remaining_ram(a) for a in own)
+    outstanding_ram = sum(remaining_ram(a) for a in host_held)
     cpu_capacity = min(snap["cpu_count"], node.get("cpu_limit", snap["cpu_count"]))
-    if req["cpu"] + used_cpu > cpu_capacity:
+    if not node.get('labels', {}).get('ignore_cpu_admission', False) and req["cpu"] + used_cpu > cpu_capacity:
         return "CPU reservations exhausted", []
     # Deliberately conservative: live available minus reservations. No inferred
     # PID accounting in containers, and no claim that requests are hard limits.
     ram_available = min(snap["ram_available_mib"], node.get("ram_limit_mib", float("inf")))
-    if req["ram_mib"] + outstanding_ram + p["min_free_ram_mib"] > ram_available:
+    if not node.get('labels', {}).get('ignore_ram_reservations', False) and req["ram_mib"] + outstanding_ram + p["min_free_ram_mib"] > ram_available:
         return "RAM reservations/headroom exhausted", []
     group = node["startup_group"]
     if group:
@@ -244,7 +418,11 @@ def fit(job, node, snap, held, history, successful, groups, now):
     for gpu in snap["gpus"]:
         if gpu["uuid"] not in registered:
             continue
-        users = [a for a in own if gpu["uuid"] in a["spec"]["gpus"]]
+        if gpu["uuid"] in snap.get('gpu_startup_quarantine', []):
+            continue
+        # GPU inventory may move to a replacement container while old attempts
+        # keep running. UUID reservations remain global across those containers.
+        users = [a for a in held if gpu["uuid"] in a["spec"]["gpus"]]
         if (p.get("temperature_scope", "node") == "gpu"
                 and gpu.get("temperature_c") is not None
                 and gpu["temperature_c"] >= p.get("warm_gpu_temp_c", 80)
@@ -273,11 +451,10 @@ def fit(job, node, snap, held, history, successful, groups, now):
         # On nodes that disallow external processes, live use and scheduler
         # reservations describe the same occupants; use the larger value instead
         # of double-counting. External-process opt-in retains conservative addition.
-        occupied = (max(gpu["used_mib"], reserved) if users and not p["allow_external_gpu_processes"]
-                    else gpu["used_mib"] + reserved)
+        occupied = occupied_vram(gpu, users, p["allow_external_gpu_processes"])
         if req["vram_mib"] + occupied + p["gpu_margin_mib"] > total:
             continue
-        candidates.append((len(users), occupied, gpu["temperature_c"], gpu["index"], gpu["uuid"]))
+        candidates.append((bool(users or gpu.get('processes')),len(users), occupied, gpu["temperature_c"], gpu["index"], gpu["uuid"]))
     candidates.sort()
     if req["gpu_count"] > len(candidates):
         return "not enough healthy GPUs with requested per-device VRAM/ownership", []

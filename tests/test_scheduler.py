@@ -492,6 +492,22 @@ class PlannerTests(unittest.TestCase):
         active[-1]["report"] = {"ready": True}
         self.assertEqual(plan([third], n=n, attempts=active)[0]["gpus"], ["GPU-a-1"])
 
+    def test_four_shared_jobs_per_gpu_still_respect_cap_and_temperature(self):
+        n=node();n['gpus']=n['gpus'][:1];n['gpus'][0]['memory_mib']=96000;n['max_jobs']=9
+        n['policy'].update(allow_gpu_sharing=True,max_shared_jobs_per_gpu=4,temperature_scope='gpu')
+        j=job('next',vram=5000);j['resources']['gpu_mode']='shared'
+        active=[reservation(n,'old-'+str(i),gpu=0) for i in range(3)]
+        for a in active:
+            a['spec']['resources'].update(gpu_mode='shared',vram_mib=5000)
+            a['report']={'ready':True}
+        self.assertEqual(plan([j],n=n,attempts=active)[0]['decision'],'ready')
+        hot=snapshot(n);hot['gpus'][0]['temperature_c']=85
+        self.assertEqual(plan([j],n=n,snap=hot,attempts=active)[0]['decision'],'waiting')
+        fourth=copy.deepcopy(active[-1]);fourth['id']='old-four';active.append(fourth)
+        self.assertEqual(plan([j],n=n,attempts=active)[0]['decision'],'waiting')
+        n['policy']['max_shared_jobs_per_gpu']=1
+        self.assertEqual(plan([j],n=n,attempts=active[:1])[0]['decision'],'waiting')
+
 
 class FakeProbeTransport(Transport):
     def __init__(self, lost_ack=False):
@@ -712,6 +728,22 @@ class ExecutionTests(unittest.TestCase):
         self.controller.tick(execute=False)
         self.assertEqual(self.store.jobs()[0]["status"], "blocked")
         time.sleep(0.7)  # allow owned dummy runner to finish before deleting its temp directory
+
+    def test_d_state_timeout_holds_unsafe_live_attempt_instead_of_invalidating(self):
+        self.store.register_experiment(experiment([self.cpu_job()]))
+        self.controller.tick(execute=True)
+        original = self.store.attempts()[0]
+        with self.store.db:
+            self.store.db.execute("INSERT OR REPLACE INTO node_health VALUES(?,?)",
+                ('a', dumps(dict(phase='unavailable', reason='continuous D-state exceeded timeout'))))
+        self.controller.tick(execute=False)
+        a = self.store.attempts()[0]
+        self.assertEqual(a['id'], original['id'])
+        self.assertEqual(a['status'], 'unknown')
+        self.assertEqual(a['released'], 0)
+        self.assertEqual(self.store.jobs()[0]['status'], 'unknown')
+        self.assertIn('D-state', a['report']['node_health_reason'])
+        time.sleep(.7)
 
     def test_safe_failover_executes_on_other_node_not_failed_source(self):
         class TwoLocalHosts(FakeProbeTransport):

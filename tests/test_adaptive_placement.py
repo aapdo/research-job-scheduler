@@ -14,6 +14,18 @@ def flexible(key='train'):
 
 
 class AdaptivePlacementTests(unittest.TestCase):
+    def test_lower_priority_backfills_when_high_priority_waits_for_dependency(self):
+        work=[job('upstream'),job('high',priority=30000,deps=['upstream']),job('low',priority=5000)]
+        result=plan(work,statuses={'upstream':'running'})
+        by={r['job']:r for r in result}
+        self.assertEqual(by['high']['decision'],'blocked')
+        self.assertEqual(by['low']['decision'],'ready')
+
+    def test_lower_priority_backfills_when_high_priority_does_not_fit(self):
+        result=plan([job('high',gpu_count=4,priority=30000),job('low',priority=5000)])
+        self.assertEqual(result[0]['decision'],'waiting')
+        self.assertEqual(result[1]['decision'],'ready')
+
     def test_ddp4_falls_back_to_registered_ddp2_only_with_enough_per_gpu_vram(self):
         n=node()
         result=plan([flexible()],n=n)[0]
