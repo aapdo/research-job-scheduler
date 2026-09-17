@@ -32,6 +32,17 @@ class ExecutionPreparationTests(unittest.TestCase):
 
     def consumer(self):return next(j['spec'] for j in self.store.jobs() if j['id']=='consumer')
 
+    def test_inline_catalog_requires_exact_wrapper_code(self):
+        c=copy.deepcopy(self.catalog);code='verified wrapper'
+        c['match']['inline_validation_sha256']=hashlib.sha256(code.encode()).hexdigest()
+        ep.specification(c)
+        j=dict(spec=self.consumer(),status='queued')
+        self.assertFalse(ep.matches(j,c))
+        j['spec']['metadata']['inline_validation']={'sha256':c['match']['inline_validation_sha256'],'code':code}
+        self.assertTrue(ep.matches(j,c))
+        j['spec']['metadata']['inline_validation']['code']='different wrapper'
+        self.assertFalse(ep.matches(j,c))
+
     def test_unchanged_admission_reuses_only_identical_profile(self):
         j=ep.admit(self.consumer(),'b',self.catalog,self.recipe)
         self.assertIs(ep.admit(j,'b',self.catalog,self.recipe,reuse_unchanged=True),j)

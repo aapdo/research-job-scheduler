@@ -170,7 +170,12 @@ def server_health(path, category):
                     reason='Memory PSI full avg10 exceeds hardware admission threshold 0.5%'
             if state.get('phase') in ('unavailable', 'ssh_retrying'):
                 reason = state.get('reason') or state['phase']
+            quarantine=node.get('labels',{}).get('gpu_runtime_quarantine',{})
+            if quarantine.get('boot_id') and quarantine['boot_id']==snap.get('boot_id'):
+                reason='CUDA 실행 불가: '+quarantine.get('reason','GPU runtime quarantine')
             status = 'disabled' if not node['enabled'] else 'stale' if stale else 'attention' if reason else 'healthy'
+            if not node['enabled'] and key in ('cps2-model', 'rtl-pilot-cps2'):
+                status = 'unavailable'
             cg = snap.get('memory_cgroup', {})
             row = dict(id=key, category=category, enabled=node['enabled'], status=status,
                        reason=reason or state.get('reason', ''), recovery_phase=state.get('phase'),
@@ -237,6 +242,17 @@ def payload(db=DB, rtl_db=RTL_DB, index=INDEX):
                                       'step_in_epoch steps_per_epoch completed_cells planned_cells status phase age_s unavailable error member members training_iterations_executed phase_inferred phase_elapsed_s phase_evidence')
         jobs.append(row)
     by_id = {j['id']: j for j in jobs}
+    upload_activity = {}
+    upload_db = database(db)
+    try:
+        for upload in upload_db.execute(
+            "SELECT a.job,t.status FROM artifact_transfers t "
+            "JOIN attempts a ON a.id=t.attempt "
+            "WHERE t.direction='upload' AND t.status IN ('starting','running','unknown')"
+        ):
+            upload_activity.setdefault(upload['job'], set()).add(upload['status'])
+    finally:
+        upload_db.close()
     gpu_rows = []
     for gpu in view['gpus']:
         g = select(gpu, 'node index uuid enabled temperature_c used_mib total_mib utilization_percent '
@@ -261,6 +277,19 @@ def payload(db=DB, rtl_db=RTL_DB, index=INDEX):
         row['label'] = campaign_label(c)
         row['recovered_at']=recovery.get(c['id'])
         row['jobs'] = [by_id[k] for k in c.get('job_ids', []) if k in by_id]
+        publication = c.get('publication') or {}
+        counts = publication.get('counts') or {}
+        active_jobs = c.get('job_ids', [])
+        uploading = sum(bool(upload_activity.get(k, set()) & {'starting', 'running'})
+                        for k in active_jobs)
+        unknown = sum('unknown' in upload_activity.get(k, set())
+                      and not upload_activity.get(k, set()) & {'starting', 'running'}
+                      for k in active_jobs)
+        pending = counts.get('pending', 0)
+        row['publication'] = dict(published=counts.get('published', 0), pending=pending,
+                                  uploading=uploading, unknown=unknown,
+                                  waiting=max(0, pending-uploading-unknown),
+                                  error=counts.get('error', 0))
         campaigns.append(row)
     hardware = []
     for h in view['hardware']:

@@ -173,10 +173,11 @@ def runnable_stage_demand(queued, jobs, experiments, nodes, snapshots, attempts,
 
 def tick(controller, execute):
     """Called with scheduler lock. At most two cluster transfers, one per node."""
-    from .notifications import campaign_specs
+    from .notifications import campaign_specs, campaign_processing_due
     from .planner import base_health, fit, dependency_priorities
     store = controller.store
-    campaigns = campaign_specs(store)
+    campaigns = {key:value for key,value in campaign_specs(store).items()
+                 if campaign_processing_due(store,value)}
     health = controller.node_health()
     for r in rows(store):
         if r['status'] not in ACTIVE or health.get(r['node'], {}).get('phase') in ('ssh_retrying', 'unavailable'):
@@ -202,20 +203,41 @@ def tick(controller, execute):
     live = [r for r in transfers if r['status'] in ACTIVE]
     if len(live) >= 2:
         return
-    attempts = store.attempts(summary=True)
     jobs = {j['id']: j for j in store.jobs()}
     experiments = store.specs('experiments')
     from .model_vram_policy import normalize
     jobs = {k:dict(j,spec=normalize(j['spec'])) for k,j in jobs.items()}
+    ready_queued = [j for j in jobs.values() if j['status'] == 'queued'
+                    and campaign_for(experiments[j['experiment']],campaigns)
+                    and all(jobs[d]['status'] == 'succeeded' for d in j['spec']['depends_on'])]
+    detailed_jobs = {d for j in ready_queued for d in j['spec']['depends_on']}
+    detailed_jobs.update(r[0] for r in store.db.execute(
+        "SELECT DISTINCT job FROM attempts WHERE status IN ('starting','running','unknown')"))
+    if store.db.execute("SELECT 1 FROM sqlite_master WHERE name='artifact_repair_queue'").fetchone():
+        detailed_jobs.update(r[0] for r in store.db.execute(
+            "SELECT job FROM attempts WHERE id IN "
+            "(SELECT attempt FROM artifact_repair_queue WHERE state='pending')"))
+    groups = store.specs('groups_')
+    max_interval = max((g.get('min_start_interval_s', 0) for g in groups.values()), default=0)
+    if max_interval:
+        detailed_jobs.update(r[0] for r in store.db.execute(
+            'SELECT DISTINCT job FROM attempts WHERE created>=?', (time.time()-max_interval,)))
+    attempts = store.attempts(summary=True, job_ids=detailed_jobs)
     from .planner import admission_vram
     attempts = [dict(a, admission_vram_mib=admission_vram(a, jobs.get(a.get('job'),{}), time.time()))
                 if a['status'] in ACTIVE else a for a in attempts]
 
+    pause_cache = {}
     def eligible(a, n, direction, repair_revision=None):
         if direction == 'upload':
             owner = campaign_for(experiments[jobs[a['job']]['experiment']], campaigns)
-            if owner and upload_pause(owner, transfers, campaigns):
-                return False
+            if owner:
+                hf = owner.get('hf') or {}
+                identity = (hf.get('repo_id'), hf.get('repo_type','model'))
+                if identity not in pause_cache:
+                    pause_cache[identity] = upload_pause(owner, transfers, campaigns)
+                if pause_cache[identity]:
+                    return False
         if ('hf' not in n or (not n['enabled'] and not source_upload_allowed(a,n,direction))
                 or any(r['node'] == n['id'] for r in live)):
             return False
@@ -270,10 +292,10 @@ def tick(controller, execute):
 
     # Stage the most urgent runnable successor before publishing unrelated history.
     successful = {a['job']: a for a in attempts if a['status'] == 'succeeded'}
-    queued = sorted((j for j in jobs.values() if j['status'] == 'queued'),
+    queued = sorted(ready_queued,
                     key=lambda j: -(experiments[j['experiment']]['priority'] + j['spec']['priority']))
     demand = runnable_stage_demand(queued, jobs, experiments, nodes, snapshots,
-                                   attempts + live, successful, store.specs('groups_'), time.time())
+                                   attempts + live, successful, groups, time.time())
     # Prefer unused capacity, not inventory insertion order; calculate once.
     staging_nodes = sorted(nodes.values(), key=lambda n: (
         sum(len(x['spec'].get('gpus', [])) for x in attempts
@@ -309,7 +331,7 @@ def tick(controller, execute):
                         hypothetical[d] = item
                 fits = [fit(dict(j['spec'], resources=resources), n, snapshots[n['id']],
                             [a for a in attempts if a['status'] in ACTIVE] + reservations(store),
-                            attempts, hypothetical, store.specs('groups_'), time.time())[0]
+                            attempts, hypothetical, groups, time.time())[0]
                         for resources in [j['spec']['resources'], *j['spec'].get('resource_variants', [])]]
                 if any(not reason for reason in fits):
                     start(controller, a, n, 'download', dict(receipt=receipt))
@@ -317,17 +339,38 @@ def tick(controller, execute):
     # Prioritize publications that unblock successors; successful computation stays successful.
     needed = {d for j in queued for d in j['spec']['depends_on']}
     priorities = dependency_priorities(list(jobs.values()), experiments)
-    for a in sorted(successful.values(), key=lambda a: (a['job'] not in demand,
+    # Select a publication candidate from small immutable metadata; only the
+    # chosen source needs its full frozen attempt/export report.
+    latest_success = {}
+    for row in store.db.execute("SELECT id,job,node,created FROM attempts WHERE status='succeeded' ORDER BY created"):
+        latest_success[row['job']] = dict(row)
+    published = {t['attempt'] for t in transfers if t['direction']=='upload' and t['status']=='succeeded'}
+    detailed = {a['id']:a for a in attempts}
+    for candidate in sorted(latest_success.values(), key=lambda a: (a['job'] not in demand,
                     -demand.get(a['job'], 0), a['job'] not in needed,
-                    -priorities[a['job']][0], -priorities[a['job']][1], a['created'])):
-        if a['report'].get('hf_artifact'):
+                    -priorities[a['job']][0], -priorities[a['job']][1],
+                    -priorities[a['job']][2], a['created'])):
+        if candidate['id'] in published:
             continue
-        campaign = campaign_for(experiments[jobs[a['job']]['experiment']], campaigns)
-        n = nodes.get(a['node'])
-        if not campaign or n is None or not eligible(a, n, 'upload'):
+        job = jobs.get(candidate['job'])
+        if job is None:
             continue
-        spec = jobs[a['job']]['spec']
+        spec = job['spec']
         if not spec['outputs']:
+            continue
+        campaign = campaign_for(experiments[job['experiment']], campaigns)
+        n = nodes.get(candidate['node'])
+        if not campaign or n is None:
+            continue
+        a = detailed.get(candidate['id'])
+        if a is None and n['enabled'] and not eligible(candidate, n, 'upload'):
+            continue
+        if a is None:
+            a = next((item for item in store.attempts(summary=True,job_ids={candidate['job']})
+                      if item['id']==candidate['id']), None)
+            if a is None:
+                continue
+        if a['report'].get('hf_artifact') or not eligible(a,n,'upload'):
             continue
         relocations = list(spec.get('hf_relocate_json', []))
         if 'TRAIN_RESULT.json' in spec['outputs'] and 'TRAIN_RESULT.json' not in relocations:

@@ -115,6 +115,13 @@ research-scheduler --db "$SCHEDULER_DB" set-job-hf-artifacts JOB_ID examples/job
    검사한 뒤 실행합니다. 다운로드 동안 후속 job의 GPU를 예약하지 않습니다.
 
 같은 서버나 명시적인 shared storage domain에서는 기존 local 경로를 우선 사용합니다.
+GPU runtime 장애로 비활성화된 결과 원본 노드는 신규 모델 배정 없이 완료 attempt의
+CPU 업로드만 허용합니다. SSH 복구 예산이 소진된 경우에도 60초 간격으로 출처를
+재조회하고, 정상 read/CPU health 3회가 확인된 뒤 publication-only 상태로
+업로드를 재개합니다. 사용자 사용 철회로 비활성화된 서버는 기존의 명시적
+`drain_upload_only=approved` 없이는 이 예외를 받지 않습니다. 원본 서버와
+검증된 다른 사본 모두 접속 불가이면 전송을 성공으로 간주하거나 후속 평가를
+중복 시작하지 않습니다.
 기본 전송 상한은 cluster 전체 2개, 서버당 1개이며 GPU/D-state/NFS 초기화 정책을 우회하지
 않습니다. 전송 reservation에는 CPU 2개, RAM 1 GiB를 선언합니다. 전체 cache를 미리 복제하지
 않고 후속 실행이 가능한 node에 필요한 dependency를 staging합니다. 동시 실행 상태가 바뀌면

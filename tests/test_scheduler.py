@@ -69,6 +69,21 @@ class SchemaAndStoreTests(unittest.TestCase):
         self.store.db.close()
         self.temp.cleanup()
 
+    def test_planning_attempt_projection_keeps_only_admission_fields(self):
+        self.store.register_node(node())
+        self.store.register_experiment(experiment([job()]))
+        frozen=dict(resources=dict(gpu_count=1,vram_mib=10000,cpu=1,ram_mib=512,gpu_mode='shared'),
+                    gpus=['GPU-a-0'],startup_group='',node_spec=dict(storage_domain='local-a',physical_host='host-a'),
+                    job_spec={'kind':'eval','large':'not needed by planner'},experiment_spec={'large':'not needed by planner'})
+        with self.store.db:
+            self.store.db.execute("INSERT INTO attempts(id,job,node,spec,status,created) VALUES('a','j','a',?,'running',1)",(dumps(frozen),))
+        value=self.store.attempts(planning=True)[0]
+        self.assertEqual(value['spec']['resources'],frozen['resources'])
+        self.assertEqual(value['spec']['gpus'],['GPU-a-0'])
+        self.assertEqual(value['spec']['node_spec'],{'storage_domain':'local-a','physical_host':'host-a'})
+        self.assertEqual(value['spec']['job_kind'],'eval')
+        self.assertNotIn('job_spec',value['spec'])
+
     def test_idempotent_registration(self):
         e = experiment([job()])
         self.store.register_experiment(e)
@@ -805,6 +820,9 @@ class ExecutionTests(unittest.TestCase):
             self.store.db.execute("UPDATE jobs SET status='running'")
         class Ready(FakeProbeTransport):
             def call(self, n, action, request):
+                if action == "status_batch":
+                    return {a["id"]: {"status": "running", "ready": True, "heartbeat": time.time()}
+                            for a in request["attempts"]}
                 if action == "status":
                     return {"status": "running", "ready": True, "heartbeat": time.time()}
                 return super().call(n, action, request)

@@ -52,7 +52,7 @@ class ReadStore:
 
     def jobs(self): return self.rows('jobs')
 
-    def attempts(self, active=False, *, job_ids=None, summary=False):
+    def attempts(self, active=False, *, job_ids=None, summary=False, planning=False):
         # Overview/admission need resource and lineage fields, not the full
         # frozen campaign duplicated in every historical execution request.
         # Retain full reads for explicit audit callers, never for launch RPCs.

@@ -14,6 +14,7 @@ from research_scheduler.store import Store
 class RoutedNotificationTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
+        self.home=patch('pathlib.Path.home',return_value=self.root);self.home.start()
         self.s=Store(self.root/'state.db');self.sent=[]
         events={}
         for kind in ('started','error','complete','progress'):
@@ -23,7 +24,7 @@ class RoutedNotificationTests(unittest.TestCase):
         self.env=patch.dict('os.environ',{'RS_SLACK_ROUTES_FILE':str(route)});self.env.start()
 
     def tearDown(self):
-        self.env.stop();self.s.db.close();self.tmp.cleanup()
+        self.env.stop();self.home.stop();self.s.db.close();self.tmp.cleanup()
 
     def send(self,url,payload):self.sent.append((url,payload['text']))
 

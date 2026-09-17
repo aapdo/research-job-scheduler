@@ -7,7 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from research_scheduler.notifications import poll_campaigns, register_campaign, status, webhook_path
+from research_scheduler.notifications import (poll_campaigns, register_campaign, status, webhook_path,
+                                                campaign_processing_due, _record_observation)
 from research_scheduler.store import Store
 
 
@@ -59,6 +60,23 @@ class CampaignNotificationTests(unittest.TestCase):
     def sender(self, url, payload):
         self.sent.append((url, payload))
 
+    def test_terminal_campaigns_leave_hot_poll_after_policy_window(self):
+        self.store.register_experiment(experiment())
+        spec=campaign();register_campaign(self.store,spec)
+        with self.store.db:
+            _record_observation(self.store,spec,dict(state='error',counts={'failed':1},
+                errors=[dict(job='study-train',status='failed',reason='x')],failed_jobs=['study-train']),100)
+        self.assertTrue(campaign_processing_due(self.store,spec,100+86400-1))
+        self.assertFalse(campaign_processing_due(self.store,spec,100+86400))
+        with self.store.db:
+            _record_observation(self.store,spec,dict(state='complete',counts={'succeeded':1},
+                errors=[],failed_jobs=[]),200)
+        self.assertFalse(campaign_processing_due(self.store,spec,201))
+        with self.store.db:
+            self.store.db.execute("UPDATE campaign_runtime SET state='cancelled' WHERE id=?", (spec['id'],))
+        self.assertFalse(campaign_processing_due(self.store,spec,202))
+        self.assertFalse(campaign_processing_due(self.store,dict(spec,enabled=False),201))
+
     def test_operator_disable_blocks_all_routes_and_preserves_local_events(self):
         from research_scheduler.notifications import route_webhook_path, _send
         marker=self.root/'.config/research-scheduler/slack-disabled'
@@ -88,7 +106,7 @@ class CampaignNotificationTests(unittest.TestCase):
             spec['hf'] = dict(repo_id='test/model')
             register_campaign(self.store, spec)
         with patch.object(self.store, 'jobs', wraps=self.store.jobs) as jobs, \
-                patch.object(self.store, 'attempts', wraps=self.store.attempts) as attempts, \
+                patch.object(self.store, 'observation_attempts', wraps=self.store.observation_attempts) as attempts, \
                 patch.object(self.store, 'specs', wraps=self.store.specs) as specs, \
                 patch.object(artifacts, 'rows', wraps=artifacts.rows) as transfers:
             poll_campaigns(self.store, webhook_file='', sender=self.sender)
@@ -214,7 +232,7 @@ class CampaignNotificationTests(unittest.TestCase):
         poll()
         with self.store.db:
             self.store.db.execute("UPDATE jobs SET status='queued' WHERE id='study-train'")
-        with patch.object(self.store, 'attempts', return_value=[
+        with patch.object(self.store, 'observation_attempts', return_value=[
                 {'job':'unrelated-train','status':'running','report':{'ready':True}}]):
             self.assertEqual(poll()['sent'], 0)
         self.store.db.close()
@@ -222,7 +240,7 @@ class CampaignNotificationTests(unittest.TestCase):
         with self.store.db:
             self.store.db.execute("UPDATE jobs SET status='running' WHERE id='study-train'")
         self.assertEqual(poll()['sent'], 0)
-        with patch.object(self.store, 'attempts', return_value=[
+        with patch.object(self.store, 'observation_attempts', return_value=[
                 {'job':'study-train','status':'running','report':{'ready':True}}]):
             self.assertEqual(poll()['sent'], 1)
             self.assertEqual(poll()['sent'], 0)
@@ -233,7 +251,7 @@ class CampaignNotificationTests(unittest.TestCase):
         self.assertEqual(poll()['sent'], 1)
         with self.store.db:
             self.store.db.execute("UPDATE jobs SET status='running' WHERE id='study-train'")
-        with patch.object(self.store, 'attempts', return_value=[
+        with patch.object(self.store, 'observation_attempts', return_value=[
                 {'job':'study-train','status':'running','report':{'ready':True}}]):
             self.assertEqual(poll()['sent'], 1)
 
@@ -253,7 +271,7 @@ class CampaignNotificationTests(unittest.TestCase):
         self.store.register_experiment(exp)
         register_campaign(self.store, campaign())
         def poll(attempts):
-            with patch.object(self.store, 'attempts', return_value=attempts):
+            with patch.object(self.store, 'observation_attempts', return_value=attempts):
                 return poll_campaigns(self.store, webhook_file=self.secret, sender=self.sender)
         failed = dict(id='failed-1', job='study-train', status='failed', created=1, report={})
         retry = dict(id='retry-1', job='study-train', node='lab1', status='running', created=2,
@@ -294,7 +312,7 @@ class CampaignNotificationTests(unittest.TestCase):
             self.store.db.execute("UPDATE jobs SET status='running'")
         attempts = [dict(id='old', job='study-train', created=1, status='failed', report={'ready':True}),
                     dict(id='new', job='study-train', created=2, status='starting', report={})]
-        with patch.object(self.store, 'attempts', return_value=attempts):
+        with patch.object(self.store, 'observation_attempts', return_value=attempts):
             self.assertEqual(_job_observation(self.store, campaign())['train_recoveries'], [])
         payload = json.loads(self.store.db.execute("SELECT payload FROM notification_outbox WHERE state='recovered'").fetchone()[0])
         self.assertEqual(set(payload), {'text'})  # preserve the proven Slack payload contract
@@ -311,7 +329,7 @@ class CampaignNotificationTests(unittest.TestCase):
             self.store.db.execute("UPDATE jobs SET status='running' WHERE id='study-train'")
         attempts = [dict(id='failed', job='study-train', created=1, status='failed', report={}),
                     dict(id='retry', job='study-train', created=2, status='running', report={'ready':True})]
-        with patch.object(self.store, 'attempts', return_value=attempts):
+        with patch.object(self.store, 'observation_attempts', return_value=attempts):
             poll_campaigns(self.store, webhook_file=self.secret, sender=self.sender)
         self.assertEqual(status(self.store)['runtime']['context-campaign']['state'], 'error')
         recoveries = [r for r in status(self.store)['outbox'] if r['state']=='recovered']

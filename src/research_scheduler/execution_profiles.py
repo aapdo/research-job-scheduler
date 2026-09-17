@@ -44,7 +44,10 @@ def specification(raw):
     value=copy.deepcopy(raw)
     identifier(value['id']);identifier(value['coordinator'])
     check(set(value)=={'id','coordinator','match','targets','max_parallel'},'invalid execution catalog fields')
-    check({'cwd','dataset'}<=set(value['match']) and set(value['match'])<= {'cwd','dataset','entry','files','config_modes'},'execution match must bind source and dataset')
+    check({'cwd','dataset'}<=set(value['match']) and set(value['match'])<= {'cwd','dataset','entry','files','config_modes','inline_validation_sha256'},'execution match must bind source and dataset')
+    if 'inline_validation_sha256' in value['match']:
+        sha=value['match']['inline_validation_sha256']
+        check(isinstance(sha,str) and len(sha)==64 and all(c in '0123456789abcdef' for c in sha),'invalid inline validation SHA')
     if 'config_modes' in value['match']:
         check(isinstance(value['match']['config_modes'],list) and value['match']['config_modes']
               and all(isinstance(m,str) and m for m in value['match']['config_modes']),'invalid capability modes')
@@ -107,6 +110,11 @@ def for_node(spec, node_id, *, readonly=False):
 
 def matches(job, catalog):
     spec=job['spec']
+    required=catalog['match'].get('inline_validation_sha256')
+    if required:
+        inline=spec.get('metadata',{}).get('inline_validation',{})
+        if inline.get('sha256')!=required or hashlib.sha256(inline.get('code','').encode()).hexdigest()!=required:
+            return False
     if 'config_modes' in catalog['match'] and spec.get('config',{}).get('mode') not in catalog['match']['config_modes']:
         return False
     approved=catalog['match'].get('files')

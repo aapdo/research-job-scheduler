@@ -4,6 +4,34 @@ from research_scheduler.model_vram_policy import normalize,reservation
 from research_scheduler.gpu_recovery import retry_spec
 
 class ModelVramPolicyTests(unittest.TestCase):
+    @patch.dict(os.environ,{'RS_MODEL_VRAM_MIB':'9216','RS_MODEL_EVAL_VRAM_MIB':'3072'})
+    def test_eval_default_is_separate_from_train_default(self):
+        train=self.spec();evaluation=self.spec();evaluation['kind']='eval'
+        self.assertEqual(normalize(train)['resources']['vram_mib'],9216)
+        self.assertEqual(normalize(evaluation)['resources']['vram_mib'],3072)
+        evaluation['metadata']['vram_reservation_override_mib']=2048
+        self.assertEqual(normalize(evaluation)['resources']['vram_mib'],2048)
+
+    @patch.dict(os.environ,{'RS_MODEL_VRAM_MIB':'9216','RS_MODEL_EVAL_VRAM_MIB':'3072'})
+    def test_normalization_removes_collapsed_resource_variants(self):
+        evaluation=self.spec();evaluation['kind']='eval'
+        evaluation['resource_variants']=[dict(evaluation['resources']),dict(evaluation['resources'],vram_mib=16000)]
+        normalized=normalize(evaluation)
+        self.assertEqual(normalized['resources']['vram_mib'],3072)
+        self.assertEqual(normalized['resource_variants'],[])
+
+    @patch.dict(os.environ,{'RS_MODEL_VRAM_MIB':'9216'})
+    def test_explicit_small_reservation_and_oom_growth_are_scoped(self):
+        s=self.spec();s['metadata']['vram_reservation_override_mib']=2048
+        n=normalize(s);self.assertEqual(n['resources']['vram_mib'],2048)
+        self.assertEqual(n['metadata']['execution_profiles']['a']['resource_contract']['vram_mib'],2048)
+        report=dict(failure_class='experiment_oom',status='failed',termination_verified=True,
+                    oom_node='a',oom_memory='gpu',oom_reserved_vram_mib=2048)
+        retried=retry_spec(s,report,1)
+        self.assertEqual(retried['metadata']['vram_after_oom_mib'],4096)
+        self.assertEqual(normalize(retried)['resources']['vram_mib'],4096)
+        bad=self.spec();bad['metadata']['vram_reservation_override_mib']=512
+        with self.assertRaises(ValueError):normalize(bad)
     @patch.dict(os.environ,{'RS_MODEL_VRAM_MIB':'9216'})
     def test_nine_gib_default_preserves_oom_increase_and_original(self):
         s=self.spec();n=normalize(s)
@@ -43,7 +71,7 @@ class ModelVramPolicyTests(unittest.TestCase):
             self.assertEqual(resource['vram_mib'],14000)
             resource['vram_mib']=10240
         n['resource_variants']=[dict(gpu_count=1,vram_mib=14000)]
-        self.assertEqual(normalize(n)['resource_variants'][0]['vram_mib'],10240)
+        self.assertEqual(normalize(n)['resource_variants'],[])
         n=normalize(n)
         n['metadata']['vram_after_oom_mib']=12288
         self.assertEqual(normalize(n)['resources']['vram_mib'],12288)

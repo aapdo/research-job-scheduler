@@ -87,6 +87,7 @@ node를 drain한 뒤 local replica로 전환하는 경우에는
 | `allow_gpu_sharing` | false | job의 shared GPU 요청 허용 |
 | `allow_external_gpu_processes` | false | compute PID가 보이는 GPU의 shared 배치 허용 |
 | `max_shared_jobs_per_gpu` | 2 | 한 GPU에 허용할 scheduler-owned shared job 상한 |
+| `admission_priority` | 0 | 동일하게 배정 가능한 노드 사이의 선호도. 큰 값이 우선이며 빈 GPU·health·resource gate 뒤에 적용 |
 | `shared_stable_polls` | 1 | 이미 예약된 GPU에 추가 packing하기 전 필요한 저사용률 관측 수 |
 | `warm_gpu_temp_c` | 80 | 이 온도부터 node 전체 신규 작업 수를 `warm_max_jobs`로 제한 |
 | `max_gpu_temp_c` | 85 | 이 온도 이상이면 해당 node의 신규 GPU 작업을 전부 중지 |
@@ -232,6 +233,10 @@ job ID는 DB 전체에서 고유해야 합니다. 모든 dependency가 기존 DB
 
 `shared`는 VRAM만 보고 무조건 겹쳐 실행하지 않습니다. 현재 GPU 사용률이 node의
 `max_gpu_percent` 이하이고, 온도·VRAM margin·`max_shared_jobs_per_gpu`를 통과해야 합니다.
+모델 서버·GPU의 공유 slot 계산에서 eval은 0.3, train은 1로 계산합니다.
+학습 신규 배정은 기존 물리 job 상한을 유지하며, 명시적인
+`max_eval_jobs_per_gpu`/`max_mixed_jobs_per_gpu`는 물리 개수 제한으로 우선합니다.
+이 계산은 실제 VRAM·온도·fresh health·ready 조건을 면제하지 않습니다.
 첫 job들은 빈 GPU에 분산되고 그 뒤에만 packing됩니다. 80°C 이상에서는 실행 중인 job을
 종료하지 않지만 node에 이미 한 job이 있으면 추가 배치하지 않으며, 85°C 이상에서는 신규 GPU
 작업을 전혀 시작하지 않습니다. 다음 poll에서 온도가 기준 아래로 내려가면 자동으로 다시 후보가 됩니다.
@@ -252,9 +257,12 @@ worker 자체도 child 시작 직전에 VRAM·사용률·온도를 다시 확인
 않습니다. `set-job-resource-variants JOB FILE`로 아직 시작하지 않은 job에만 JSON 배열을
 등록할 수 있습니다.
 
-job의 기본 우선순위는 experiment+job priority입니다. 대기 중인 후속 job의 우선순위가 더 높으면
-선행 job이 그 값을 상속하고, 같은 우선순위에서는 대기 중인 후손 수가 많은 job을 먼저 배치합니다.
-`plan`의 `effective_priority`, `pending_descendants`로 이를 확인할 수 있습니다. 의존성 성공 조건과
+job의 기본 우선순위는 `(experiment priority, job priority)`의 사전식 순서입니다. 먼저 캠페인
+우선순위를 비교하고, 같은 캠페인 우선순위 안에서만 작업 우선순위를 비교합니다. 대기 중인 후속
+job의 우선순위가 더 높으면 선행 job이 그 두 값을 상속하고, 같은 우선순위에서는 대기 중인 후손
+수가 많은 job을 먼저 배치합니다. `plan`의 `effective_campaign_priority`,
+`effective_job_priority`, `pending_descendants`로 이를 확인할 수 있습니다. 기존 API 호환용
+`effective_priority`는 작업 우선순위 값만 제공합니다. 의존성 성공 조건과
 자원/스토리지/온도 gate는 그대로 적용됩니다.
 
 치환은 `argv`, `cwd`, `env`의 값, `config` 안의 문자열, `input_files[].path`에서 수행합니다.

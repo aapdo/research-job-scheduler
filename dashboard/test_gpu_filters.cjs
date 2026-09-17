@@ -61,6 +61,21 @@ test('hardware phase is one localized badge with semantic colors', () => {
   }
 });
 
+test('campaign publication distinguishes active upload from unsent backlog', () => {
+  const {context}=dashboard();
+  for(const [publication,label,color] of [
+    [{published:14,pending:47,uploading:2,waiting:45},'업로드 중','blue'],
+    [{published:14,pending:47,uploading:0,waiting:47},'업로드 대기','warn'],
+    [{published:14,pending:47,uploading:0,unknown:1,waiting:46},'업로드 상태 불명','bad'],
+  ]){
+    context.c={recorded_state:'running',counts:{succeeded:61,cancelled:14},publication};
+    const html=vm.runInContext('campaignStatusHtml(c)',context);
+    assert.match(html,new RegExp(`<span class="badge ${color}">${label}<\\/span>`));
+  }
+  context.c={recorded_state:'running',counts:{running:1},publication:{pending:47,uploading:2}};
+  assert.equal(vm.runInContext('campaignStatusHtml(c)',context),'<span class="badge blue">실행 중</span>');
+});
+
 test('RTL validation aggregates actual validation jobs, not the later build outcome', () => {
   const {context}=dashboard();
   for(const [validation,expected] of [[{},'unknown'],[{a:'queued'},'queued'],[{a:'starting'},'starting'],[{a:'succeeded',b:'running'},'running'],[{a:'succeeded',b:'failed'},'failed'],[{a:'succeeded'},'succeeded'],[{a:'cancelled'},'cancelled'],[{a:'unknown'},'unknown']]){
@@ -72,6 +87,14 @@ test('RTL validation aggregates actual validation jobs, not the later build outc
 test('GPU scope includes CPS', () => {
   const html = fs.readFileSync(path.join(__dirname, 'dist/index.html'), 'utf8');
   assert.match(html, /<option value="cps">CPS<\/option>/);
+});
+
+test('CPS2 unavailable badge is distinct from ordinary disabled servers', () => {
+  const {context}=dashboard();
+  assert.equal(vm.runInContext('badge("unavailable")',context),
+               '<span class="badge ">사용 불가</span>');
+  assert.equal(vm.runInContext('badge("disabled")',context),
+               '<span class="badge ">배정 금지</span>');
 });
 
 test('cancelled campaigns are hidden by default with independent toggles', () => {

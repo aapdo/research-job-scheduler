@@ -70,6 +70,35 @@ class OOMTests(unittest.TestCase):
                 result=agent.oom_failure(request,state)
                 self.assertEqual(result['status'],'failed');self.assertTrue(result['termination_verified'])
 
+    def test_failed_evaluation_cell_log_classifies_gpu_oom_without_tree_scan(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);cell=root/'evaluation'/'Snow_s04';cell.mkdir(parents=True)
+            (cell/'stdout.log').write_text('ResourceExhaustedError: Out of memory error on GPU 0')
+            (root/'stderr.log').write_text(
+                f'RuntimeError: child failed (1): {cell}/stdout.log\n')
+            request=self.request(root)
+            request['job_spec']['kind']='eval'
+            request['resources']={'vram_mib':3072}
+            state=dict(status='failed',attempt='j.a',returncode=1)
+            with patch.object(agent,'oom_owned_processes',return_value=[]):
+                result=agent.oom_failure(request,state)
+            self.assertEqual(result['failure_class'],'experiment_oom')
+            self.assertEqual(result['failure_evidence'],'evaluation/Snow_s04/stdout.log')
+            self.assertEqual(result['oom_memory'],'gpu')
+            self.assertEqual(result['oom_reserved_vram_mib'],3072)
+            self.assertTrue(result['termination_verified'])
+
+    def test_failed_evaluation_cell_log_outside_attempt_is_ignored(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as other:
+            root=Path(d);cell=Path(other)/'evaluation'/'Snow_s04';cell.mkdir(parents=True)
+            (cell/'stdout.log').write_text('GPU out of memory')
+            (root/'stderr.log').write_text(
+                f'RuntimeError: child failed (1): {cell}/stdout.log\n')
+            request=self.request(root);request['job_spec']['kind']='eval'
+            state=dict(status='failed',attempt='j.a',returncode=1)
+            with patch.object(agent,'kernel_oom_evidence',return_value=None):
+                self.assertEqual(agent.oom_failure(request,state),state)
+
     def test_exit_137_is_not_oom(self):
         with tempfile.TemporaryDirectory() as d:
             state=dict(status='failed',returncode=137)
@@ -91,6 +120,18 @@ class OOMTests(unittest.TestCase):
         two=retry_spec(one,dict(report,oom_node='b'),2);three=retry_spec(two,dict(report,oom_node='c'),3)
         four=retry_spec(three,dict(report,oom_node='d'),4)
         self.assertEqual(four['max_attempts'],4);self.assertEqual(len(four['metadata']['oom_failovers']),3)
+
+    def test_gpu_oom_same_host_opt_in_keeps_host_eligible(self):
+        spec=experiment([job()])['jobs'][0]
+        spec['metadata']['oom_same_host_retry_allowed']=True
+        report=dict(failure_class='experiment_oom',status='failed',
+                    termination_verified=True,oom_node='a',oom_memory='gpu')
+        retried=retry_spec(spec,report,1)
+        self.assertEqual(retried['metadata']['excluded_hosts'],[])
+        self.assertTrue(retried['metadata']['oom_failovers'][0]['same_host_eligible'])
+        self.assertEqual(retried['max_attempts'],2)
+        cpu=retry_spec(spec,dict(report,oom_memory='cpu'),1)
+        self.assertEqual(cpu['metadata']['excluded_hosts'],['a'])
 
     def test_unconstrained_hosts_retry_and_local_resume_holds(self):
         spec=experiment([job()])['jobs'][0];spec['hosts']=[]

@@ -135,6 +135,15 @@ contract before rebuilding/revalidating an unchanged job. The comparison is
 per-call (not a persistent cache), includes inline-validation wrappers, resource
 variants and GPU-count mapping, and does not skip changed admission validation.
 
+FARM6 bootstrap admission (2026-09-15): `s-bootstrap-bank-farm6-inline-v1`
+matches train mode plus the exact SHA256 of the inline-validation wrapper.
+CPU copy/input/runtime verification remains mandatory. GPU verification occurs
+inside each admitted training attempt, including frozen operator tests scoped
+to its method/route and the existing train/resume/eval smoke. TF32 is disabled
+for this host profile without changing tolerance thresholds. Score/statistics
+and non-inline jobs cannot use this partial qualification. Failed old global
+validation records and previously started requests are not rewritten.
+
 The model controller prepares each dispatch batch from a shared, selective
 request context: selected jobs, their experiments, node inventory, and only
 their dependency attempts. Dependency reads omit duplicated frozen experiment

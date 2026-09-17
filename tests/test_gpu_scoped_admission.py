@@ -32,6 +32,19 @@ class GPUScopedAdmissionTests(unittest.TestCase):
         snaps['b']['read_ok'] = False
         self.assertEqual(plan([job()], nodes={'a': a, 'b': b}, snaps=snaps)[0]['node'], 'a')
 
+    def test_gpu_load_outweighs_one_priority_tier(self):
+        high, lower = node(key='high'), node(key='lower')
+        high['gpus']=high['gpus'][:1];lower['gpus']=lower['gpus'][:1]
+        high['admission_priority']=400;lower['admission_priority']=300
+        for n in (high,lower):
+            n['policy'].update(allow_gpu_sharing=True,max_shared_jobs_per_gpu=3)
+        old=reservation(high,key='old',gpu=0);old['report']={'ready':True}
+        old['spec']['job_kind']='eval';old['spec']['resources'].update(gpu_mode='shared',vram_mib=1000)
+        candidate=job('next',vram=1000);candidate['kind']='eval';candidate['resources']['gpu_mode']='shared'
+        row=plan([candidate],nodes={'high':high,'lower':lower},
+                 snaps={'high':snapshot(high),'lower':snapshot(lower)},attempts=[old])[0]
+        self.assertEqual(row['node'],'lower')
+
     def test_warm_occupied_gpu_blocked_but_other_gpu_usable(self):
         n = node(); n['policy'].update(temperature_scope='gpu', allow_gpu_sharing=True)
         s = snapshot(n); s['gpus'][0]['temperature_c'] = 81

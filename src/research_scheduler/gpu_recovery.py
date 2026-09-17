@@ -24,7 +24,10 @@ def retry_spec(spec, report, attempt_count):
         updated = copy.deepcopy(spec)
         meta = updated.setdefault('metadata', {})
         excluded = set(meta.get('excluded_hosts', []))
-        excluded.add(node)
+        same_host_allowed = (report.get('oom_memory') == 'gpu'
+                             and meta.get('oom_same_host_retry_allowed') is True)
+        if not same_host_allowed:
+            excluded.add(node)
         meta['excluded_hosts'] = sorted(excluded)
         history = meta.setdefault('oom_failovers', [])
         if any(r.get('attempt_count')==attempt_count and r.get('node')==node for r in history):
@@ -32,9 +35,11 @@ def retry_spec(spec, report, attempt_count):
         if len(history) >= 3:
             updated['max_attempts'] = attempt_count
             return updated
-        history.append(dict(node=node, evidence=report.get('failure_evidence'), attempt_count=attempt_count))
-        from .model_vram_policy import default_mib
-        base=default_mib()
+        history.append(dict(node=node, evidence=report.get('failure_evidence'),
+                            attempt_count=attempt_count,
+                            same_host_eligible=same_host_allowed))
+        from .model_vram_policy import reservation
+        base=reservation(spec)
         if base is not None and report.get('oom_memory')=='gpu':
             previous=report.get('oom_reserved_vram_mib')
             if type(previous) is not int or previous<base:previous=base

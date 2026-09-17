@@ -1,7 +1,7 @@
 """Lazy read snapshot shared by campaign observers within one locked poll.
 
 Never retain this object between polls or use it for placement/mutations.
-Attempt reads deliberately use Store.attempts(), including HF receipts.
+Campaign state needs fresh attempt reports, not frozen execution requests.
 """
 from functools import cached_property
 
@@ -28,7 +28,15 @@ class ObservationSnapshot:
 
     @cached_property
     def attempts(self):
-        return self.store.attempts(summary=True)
+        attempts = []
+        for row in self.store.observation_attempts():
+            item = dict(row, report=dict(row.get('report') or {}))
+            for transfer in self.uploads_by_attempt.get(item.get('id'), []):
+                receipt = transfer['report'].get('artifact')
+                if transfer['status'] == 'succeeded' and receipt:
+                    item['report']['hf_artifact'] = receipt
+            attempts.append(item)
+        return attempts
 
     @cached_property
     def attempts_by_job(self):

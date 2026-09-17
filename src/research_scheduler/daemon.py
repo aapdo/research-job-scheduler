@@ -34,7 +34,8 @@ def cycle(controller,output,max_launches=24):
                active=[dict(job=a['job'],node=a['node'],attempt=a['id'],status=a['status'],
                             gpus=a['spec']['gpus'],directory=a['spec']['attempt_dir']) for a in active],
                notifications=notifications,
-               phases=dict(dispatch_s=dispatch,notifications_s=notification_seconds))
+               phases=dict(dispatch_s=dispatch,notifications_s=notification_seconds,
+                           **result.get('phase_times',{})))
     save(output/'STATE.json',state)
     return state['phases']
 

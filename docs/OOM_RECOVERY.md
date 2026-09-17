@@ -9,15 +9,21 @@ CPU preparation, cancelled attempts, or an arbitrary historical-failure sweep.
    classified. On a directly accessible host, kernel OOM messages may also be
    matched to a registered PID observed within 60 seconds, the same boot and
    execution interval. The journal query is bounded; unavailable evidence is not
-   treated as OOM. Exit 137/-9, host memory pressure or global counters alone do
+   treated as OOM. Cell-based evaluation follows only the exact
+   `evaluation/<cell>/stdout.log` path cited by the parent `stderr.log`, after
+   resolving it inside the same attempt directory; it does not scan the tree.
+   Exit 137/-9, host memory pressure or global counters alone do
    not establish which experiment was OOM-killed.
 3. Surviving owned processes keep the attempt unknown and its reservation held.
    Only an execute cycle may invoke `recover_oom`. This rechecks a failed receipt,
    boot and exact process ownership, uses PID-safe file descriptors, and verifies
    termination after bounded TERM/KILL waits. No GPU process is killed merely
    because it occupies memory. Two unsuccessful cleanups leave a manual-check hold.
-4. Only verified termination permits failover. The failed host is excluded for
-   that job, not disabled globally. Existing candidates, scientific settings and
+4. Only verified termination permits failover. By default the failed host is
+   excluded for that job, not disabled globally. A job-specific
+   `metadata.oom_same_host_retry_allowed=true` permits rechecking the same host
+   only for explicit GPU OOM; live VRAM, temperature and health admission still
+   apply. Existing candidates, scientific settings and
    normal data/runtime/VRAM/temperature/storage/fresh-health gates remain intact.
    Up to three additional OOM attempts are permitted; repeated reconciliation is
    idempotent. Original failures and checkpoints remain.

@@ -3,16 +3,49 @@ import time
 
 from .schema import job_filesystem, node_filesystem
 from .store import ACTIVE
+from .startup import startup_group
 from .build_placement import placement_key, build_pressure
 from .draining import epoch_publication_allowed, host_resource_reservations
 
 
-def gpu_occupancy_key(chosen, snapshot, held):
-    """Prefer wholly unused GPU sets across hosts before sharing occupied GPUs."""
+def gpu_placement_key(chosen, snapshot, held, node):
+    """Combine configured node preference with per-GPU scheduler load.
+
+    ``admission_priority`` is configured in 100-point tiers.  One eval consumes
+    three admission units (0.3 job) and other GPU work consumes ten.  Scaling
+    load by 100 means an occupied preferred GPU loses to an empty GPU in the
+    next tier, while an empty preferred GPU still wins.  This prevents a fast
+    node from being filled repeatedly before idle lower-tier nodes are used.
+    """
     observed={g['uuid']:g for g in snapshot.get('gpus',[])}
-    counts=[sum(g in a['spec'].get('gpus',[]) for a in held) for g in chosen]
-    busy=[bool(count or observed.get(g,{}).get('processes')) for g,count in zip(chosen,counts)]
-    return (int(any(busy)),max(counts,default=0),sum(busy),sum(counts))
+    loads=[]
+    counts=[]
+    for gpu in chosen:
+        users=[a for a in held if gpu in a['spec'].get('gpus',[])]
+        units=sum(node_job_units(
+            a['spec'].get('job_kind',a['spec'].get('job_spec',{}).get('kind')),node)
+            for a in users)
+        if observed.get(gpu,{}).get('processes') and not users:
+            units=max(units,10)
+        loads.append(units);counts.append(len(users))
+    priority=node.get('admission_priority',0)
+    maximum=max(loads,default=0)
+    # Host pressure and resource-variant preference remain in placement_key().
+    # Keeping node id / chosen UUIDs out of this prefix lets those existing
+    # tie-breakers decide genuinely equal GPU-load candidates.
+    return (maximum*100-priority,maximum,sum(loads),max(counts,default=0),
+            sum(counts),-priority)
+
+
+def gpu_occupancy_key(chosen, snapshot, held):
+    """Backward-compatible occupancy-only key used by audit callers/tests."""
+    node = dict(id='', gpus=snapshot.get('gpus', []), admission_priority=0)
+    return gpu_placement_key(chosen, snapshot, held, node)
+
+
+def node_job_units(kind, node):
+    """Server admission units: eval=0.3, other work=1 on GPU model nodes."""
+    return 3 if node.get('gpus') and kind == 'eval' else 10
 
 
 def occupied_vram(gpu, users, allow_external):
@@ -79,7 +112,7 @@ def gpu_healthy(gpu, node, mode):
 
 
 def dependency_priorities(jobs, experiments):
-    """Inherit pending descendants' priority; use their count to break ties."""
+    """Inherit descendants' lexicographic campaign/job priority."""
     by_id = {j['id']: j for j in jobs}
     successors = {key: set() for key in by_id}
     for j in jobs:
@@ -96,8 +129,8 @@ def dependency_priorities(jobs, experiments):
                 continue
             successors[key].add(j['id'])
             frontier.extend(by_id[key]['spec']['depends_on'])
-    priority = {j['id']: experiments[j['experiment']]['priority'] + j['spec']['priority'] for j in jobs}
-    return {key: (max([priority[key], *[priority[d] for d in downstream]]), len(downstream))
+    priority = {j['id']: (experiments[j['experiment']]['priority'], j['spec']['priority']) for j in jobs}
+    return {key: (*max([priority[key], *[priority[d] for d in downstream]]), len(downstream))
             for key, downstream in successors.items()}
 
 
@@ -197,6 +230,7 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
                 and j['spec']['resources']['gpu_count']>0)
     queued = sorted((j for j in jobs if j["status"] == "queued"),
                     key=lambda j: (validation_expansion(j), -scores[j['id']][0], -scores[j['id']][1],
+                                   -scores[j['id']][2],
                                    j["created"], j["id"]))
     for j in queued:
         spec, failures = j["spec"], {}
@@ -224,7 +258,7 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
                     if spec.get('metadata', {}).get('prefer_primary_resources'):
                         key = (index, *key)
                     if resources['gpu_count']:
-                        key = (*gpu_occupancy_key(chosen,snapshots[node_id],held),*key)
+                        key = (*gpu_placement_key(chosen,snapshots[node_id],held,node),*key)
                     candidates.append((key, node_id, chosen, resources))
                     if not resources['gpu_count']:break
             if reasons and len(reasons) == 1 + len(spec.get('resource_variants', [])):
@@ -248,12 +282,16 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
         plan.append(placement)
         held.append({"id": "planned:" + j["id"], "job": j["id"], "node": node_id,
                      "created": now, "released": False, "status": "starting",
-                     "spec": {"resources": resources, "gpus": chosen,
+                     "spec": {"resources": resources, "gpus": chosen, "job_kind": spec['kind'],
                               "node_spec": nodes[node_id],
                               "job_spec": spec,
-                              "startup_group": nodes[node_id]["startup_group"]}})
+                              "startup_group": startup_group(spec,nodes[node_id])}})
     for row in plan:
-        row['effective_priority'], row['pending_descendants'] = scores[row['job']]
+        (row['effective_campaign_priority'], row['effective_job_priority'],
+         row['pending_descendants']) = scores[row['job']]
+        # Keep the old field during the API transition, but do not use its
+        # additive value for ordering.
+        row['effective_priority'] = row['effective_job_priority']
     return plan
 
 
@@ -313,6 +351,10 @@ def fit(job, node, snap, held, history, successful, groups, now):
     dataset_path = node.get("datasets", {}).get(dataset)
     if dataset and not dataset_path:
         return "dataset path not registered on node: " + dataset, []
+    group=startup_group(job,node)
+    failed_member=node.get('_blocked_startup_groups',{}).get(group) if group else None
+    if failed_member:
+        return "shared backend unhealthy/unreachable: " + failed_member, []
     reason = base_health(node, snap, now)
     if reason:
         return reason, []
@@ -341,6 +383,12 @@ def fit(job, node, snap, held, history, successful, groups, now):
                 suffix = ' (HF download pending)' if a.get('report', {}).get('hf_artifact') else ''
                 return "dependency artifacts on another local filesystem: " + dep + suffix, []
     own = [a for a in held if a["node"] == node["id"]]
+    if job['kind']=='eval' and 'max_eval_jobs' in node.get('labels',{}):
+        eval_cap=node['labels']['max_eval_jobs']
+        if type(eval_cap) is not int or eval_cap<1:
+            return 'invalid eval job cap', []
+        if sum(a['spec'].get('job_kind')=='eval' for a in own)>=eval_cap:
+            return 'node eval job cap reached', []
     domain = node.get('physical_host', node['id'])
     host_held = host_resource_reservations(node, held)
     for token, count in req.get('tokens', {}).items():
@@ -382,7 +430,10 @@ def fit(job, node, snap, held, history, successful, groups, now):
                 return "GPU temperature at or above hard launch limit", []
             if hottest >= p.get("warm_gpu_temp_c", 80) and len(own) >= p.get("warm_max_jobs", 1):
                 return "warm-node job cap reached", []
-    if len(own) >= node["max_jobs"]:
+    used_job_units = sum(node_job_units(
+        a['spec'].get('job_kind', a['spec'].get('job_spec', {}).get('kind')), node)
+        for a in own)
+    if used_job_units + node_job_units(job['kind'], node) > 10 * node["max_jobs"]:
         return "node job slots reserved", []
     if any(a["status"] == "unknown" for a in host_held):
         return "unknown attempt requires reconciliation", []
@@ -403,7 +454,6 @@ def fit(job, node, snap, held, history, successful, groups, now):
     ram_available = min(snap["ram_available_mib"], node.get("ram_limit_mib", float("inf")))
     if not node.get('labels', {}).get('ignore_ram_reservations', False) and req["ram_mib"] + outstanding_ram + p["min_free_ram_mib"] > ram_available:
         return "RAM reservations/headroom exhausted", []
-    group = node["startup_group"]
     if group:
         if group not in groups:
             return "startup group not registered", []
@@ -440,7 +490,19 @@ def fit(job, node, snap, held, history, successful, groups, now):
         # progress. The next cycle then observes its real utilization and VRAM.
         if users and any(not a.get("report", {}).get("ready", False) for a in users):
             continue
-        if len(users) >= p.get("max_shared_jobs_per_gpu", 2):
+        shared_cap=p.get("max_shared_jobs_per_gpu",2)
+        if job['kind']=='eval' and 'max_eval_jobs_per_gpu' in node.get('labels',{}):
+            shared_cap=node['labels']['max_eval_jobs_per_gpu']
+            if type(shared_cap) is not int or shared_cap<1:
+                return 'invalid eval GPU sharing cap', []
+            mixed_cap=node['labels'].get('max_mixed_jobs_per_gpu')
+            if any(a['spec'].get('job_kind')!='eval' for a in users) and mixed_cap is not None:
+                if type(mixed_cap) is not int or mixed_cap<1:
+                    return 'invalid mixed GPU sharing cap', []
+                shared_cap=min(shared_cap,mixed_cap)
+        # Eval=0.3 applies to the server-wide admission budget.  The physical
+        # per-GPU concurrency cap remains an absolute number of processes.
+        if len(users) >= shared_cap:
             continue
         # A process on a scheduler-reserved GPU is treated as owned for packing.
         # A process with no reservation remains external and needs explicit opt-in.

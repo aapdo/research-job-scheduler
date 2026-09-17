@@ -116,7 +116,11 @@ def messages(data, assigned_hardware=None, limit=9000):
         if typed and any(kind in typed for kind in ('train','eval')):
             campaigns.append([campaign_label(c)]+[typed[kind].get(key,0) if kind in typed else '—'
                               for kind in ('train','eval') for key,_ in model_statuses])
-        for kind,row_counts in (typed or {'외부집계' if c.get('external') else '미분류':counts}).items():
+        elif not typed:
+            # Preserve visibility without guessing whether legacy/external
+            # aggregate counts are train, eval, or support work.
+            campaigns.append([campaign_label(c)]+['—']*(len(model_header)-1))
+        for kind,row_counts in (typed or {}).items():
             if kind in ('train','eval'):
                 # Do not silently fold initialization, unknown, blocked or
                 # cancelled states into run/err, or discard them.
@@ -139,9 +143,12 @@ def messages(data, assigned_hardware=None, limit=9000):
              hardware_status(h.get('build_status') or '—','build'),
              hardware_status((h.get('board') or {}).get('status') or '—','test')]
             for h in latest_hardware]
+    auxiliary_header=['캠페인','유형','합계']+[label for _,label in labels]+['캠페인 상태']
     sections=[('GPU별 배정',['서버','GPU','작업','상태','온도','비고'],gpu),
-              ('캠페인별 train / eval 진행',model_header,campaigns),
-              ('하드웨어 실제 작업 배정',['실행 서버','유형','작업','상태'],hardware),
+              ('캠페인별 train / eval 진행',model_header,campaigns)]
+    if auxiliary:
+        sections.append(('보조 작업 및 추가 상태',auxiliary_header,auxiliary))
+    sections += [('하드웨어 실제 작업 배정',['실행 서버','유형','작업','상태'],hardware),
               ('하드웨어 build / test · 최신 15개',['캠페인','단계','build','test: board'],stages)]
     payloads=[]
     for title,header,rows in sections:

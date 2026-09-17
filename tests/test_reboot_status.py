@@ -45,3 +45,24 @@ class RebootStatusTests(unittest.TestCase):
     def test_remote_hardware_tokens_remain_conservative(self):
         self.assertEqual(self.read(kind='board_test')['status'],'unknown')
         self.assertEqual(self.read(tokens={'board':1})['status'],'unknown')
+
+    def test_optional_oom_sample_does_not_flip_live_runner_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state=dict(attempt='a',status='running',boot_id='same',runner_pid=20,
+                       runner_start='30',child_pid=21,child_pgid=21,ready=True)
+            (Path(tmp)/'state.json').write_text(json.dumps(state))
+            original=Path.read_text
+            def read_text(path,*args,**kwargs):
+                if str(path)=='/proc/sys/kernel/random/boot_id':return 'same'
+                return original(path,*args,**kwargs)
+            runner=dict(state='S',ppid=1,pgrp=20,start='30')
+            request=dict(id='a',attempt_dir=tmp,job_spec=dict(kind='eval'),resources={})
+            with patch.object(Path,'read_text',read_text), \
+                    patch.object(agent,'process',return_value=runner), \
+                    patch.object(agent,'diagnostic_startup_ready',return_value=state), \
+                    patch.object(agent,'process_tree_rss_mib',return_value=123), \
+                    patch.object(agent,'oom_owned_processes',side_effect=agent.UncertainExecution('protected')):
+                result=agent.read_status(request)
+            self.assertEqual(result['status'],'running')
+            self.assertEqual(result['rss_mib'],123)
+            self.assertEqual(result['oom_observation_incomplete'],'protected')

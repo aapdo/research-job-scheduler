@@ -12,9 +12,38 @@ def host_resource_reservations(node, held):
 
 def source_upload_allowed(attempt, node, direction):
     frozen=attempt.get('spec',{}).get('node_spec',{})
-    return (direction=='upload' and node.get('labels',{}).get('drain_upload_only')=='approved'
+    labels=node.get('labels',{})
+    # A GPU-runtime quarantine must not strand completed results on the source.
+    # This grants only CPU publication once ordinary SSH/health gates recover;
+    # a user-drained node without explicit upload approval remains excluded.
+    publication_only=(labels.get('drain_upload_only')=='approved'
+                      or (not node.get('enabled') and bool(labels.get('gpu_runtime_quarantine'))))
+    return (direction=='upload' and publication_only
             and attempt.get('node')==node['id'] and frozen.get('id')==node['id']
             and frozen.get('target')==node.get('target'))
+
+
+def publication_probe_due(node, health, now):
+    """Retry a quarantined source without readmitting its scientific GPU jobs."""
+    return (not node.get('enabled') and bool(node.get('labels',{}).get('gpu_runtime_quarantine'))
+            and health.get('phase') == 'unavailable'
+            and now >= health.get('next_publication_probe_at', 0))
+
+
+def publication_probe_health(node, old, stable_polls, healthy, now):
+    """Independent CPU-publication recovery; never changes node.enabled."""
+    if node.get('enabled') or not node.get('labels',{}).get('gpu_runtime_quarantine'):
+        return None
+    if not (publication_probe_due(node, old, now) or old.get('phase') == 'publication_only'):
+        return None
+    state = dict(old)
+    if healthy and (old.get('phase') == 'publication_only'
+                    or stable_polls >= node['policy']['stable_polls']):
+        state.update(phase='publication_only', last_success_at=now,
+                     next_publication_probe_at=now + 60)
+    else:
+        state.update(phase='unavailable', next_publication_probe_at=now + (2 if healthy else 60))
+    return state
 
 
 def epoch_publication_allowed(job, node):

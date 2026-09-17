@@ -498,10 +498,13 @@ def finish_oom_classification(request,state,evidence):
     survivors=oom_owned_processes(request)
     group_live=bool(state.get('child_pgid') and group_alive(state['child_pgid']))
     verified=not survivors and not group_live
+    same_host_allowed = request.get('job_spec', {}).get('metadata', {}).get('oom_same_host_retry_allowed') is True
     return dict(state,status='failed' if verified else 'unknown',failure_class='experiment_oom',
                 oom_node=request['node_spec']['id'],termination_verified=verified,
                 failure_evidence=evidence,oom_survivors=survivors,oom_observation=request.get('_oom_previous',{}),
-                reason='Experiment OOM; '+('termination verified; alternate host required' if verified else 'owned processes await cleanup'))
+                reason='Experiment OOM; '+(('termination verified; host admission will be rechecked'
+                                            if same_host_allowed else 'termination verified; alternate host required')
+                                           if verified else 'owned processes await cleanup'))
 
 
 def recover_oom(request):
@@ -552,8 +555,26 @@ def oom_failure(request, state):
     root = Path(request['attempt_dir'])
     import re
     pattern = re.compile(r'CUDA out of memory|ResourceExhaustedError|OutOfMemoryError|MemoryError:|CUDA_ERROR_OUT_OF_MEMORY|cudaErrorMemoryAllocation|CUDNN_STATUS_ALLOC_FAILED', re.I)
-    for name in ('stderr.log', 'stdout.log', 'run/rank0.stdout', 'run/training.stdout',
-                 'run/stdout.log', 'smoke/rank0.stdout', 'evaluation/evaluation.stdout'):
+    names = ['stderr.log', 'stdout.log', 'run/rank0.stdout', 'run/training.stdout',
+             'run/stdout.log', 'smoke/rank0.stdout', 'evaluation/evaluation.stdout']
+    # Cell-based evaluators report the exact failed child log in stderr. Follow
+    # only that bounded, attempt-local path; never walk the whole evaluation tree.
+    try:
+        parent_log = root / 'stderr.log'
+        with parent_log.open('rb') as stream:
+            stream.seek(max(0, parent_log.stat().st_size - 65536))
+            parent_tail = stream.read(65536).decode(errors='replace')
+        for match in re.finditer(
+                r'(?m)^RuntimeError: child failed \(\d+\): (.+?/evaluation/[^/]+/stdout\.log)\s*$',
+                parent_tail):
+            child_log = Path(match.group(1))
+            if (child_log.name == 'stdout.log'
+                    and child_log.resolve().is_relative_to(root.resolve())
+                    and child_log.resolve().parent.parent == (root / 'evaluation').resolve()):
+                names.append(str(child_log.resolve().relative_to(root.resolve())))
+    except OSError:
+        pass
+    for name in names:
         path = root / name
         try:
             if not path.resolve().is_relative_to(root.resolve()):
@@ -691,7 +712,17 @@ def read_status(request):
             rss = process_tree_rss_mib(state.get("child_pid", 0))
             observation={}
             if request.get('job_spec',{}).get('kind') in ('train','eval'):
-                observation['oom_observation']=dict(boot_id=boot,time=time.time(),processes=oom_owned_processes(request))
+                try:
+                    processes=oom_owned_processes(request)
+                except UncertainExecution as exc:
+                    # OOM ownership sampling is optional telemetry while the
+                    # authenticated runner is alive. A short-lived protected
+                    # child must not turn a healthy attempt into an error. OOM
+                    # cleanup/classification paths remain strict.
+                    observation['oom_observation_incomplete']=str(exc)
+                else:
+                    observation['oom_observation']=dict(
+                        boot_id=boot,time=time.time(),processes=processes)
             return dict(state,**observation, **({"rss_mib": rss} if rss is not None else {}))
         return dict(state, status="unknown", reason="runner absent/rebooted; preserve reservation for reconciliation")
     except (OSError, ValueError, KeyError, UncertainExecution) as exc:
@@ -826,6 +857,19 @@ def main():
         result = probe(request)
     elif action == "status":
         result = read_status(request)
+    elif action == "status_batch":
+        attempts = request.get("attempts", [])
+        if not isinstance(attempts, list) or len(attempts) > 64:
+            raise ValueError("invalid status batch")
+        result = {}
+        for attempt in attempts:
+            key = attempt["id"]
+            if key in result:
+                raise ValueError("duplicate attempt in status batch")
+            try:
+                result[key] = read_status(attempt)
+            except Exception as exc:
+                result[key] = {"status": "unknown", "reason": "status query failed: " + type(exc).__name__}
     elif action == 'recover_oom':
         result = recover_oom(request)
     elif action == "artifact_status":

@@ -13,6 +13,13 @@ The overview uses summary attempt reads that omit duplicated `experiment_spec`
 campaign definitions at SQL projection time. Explicit full audit reads remain
 available. Resource, job-spec and lineage fields are preserved; summaries must
 never be used as launch requests.
+The live controller reads active attempts, runnable dependencies, relevant
+lineage authorities, recent startup history, and same-boot GPU-startup faults
+for planning instead of decoding every historical attempt each cycle. Frozen
+planning-spec summaries are cached per manager lifetime; live reports and
+verified artifact receipts are still read from SQLite. Status reconciliation
+uses one bounded RPC per node for exactly the registered attempts, with a
+per-attempt fallback after a lost/incomplete batch response.
 
 ```bash
 research-scheduler --db /absolute/path/state.db overview --view gpu
@@ -54,6 +61,14 @@ Queued dependency waits are shown separately from `jobs.status=blocked` errors.
 Live read failure or absent hardware metadata is reported, not changed to a zero
 or a fabricated success. The stored planner's result is diagnostic only; fresh
 admission must still be checked by the ordinary dispatcher before actual launch.
+
+Controller hot loops retire completed and operator-cancelled campaigns
+immediately after their terminal observation. A campaign with the same current
+error remains eligible for recovery and notification for 24 hours from the
+error transition, then leaves notification and artifact-staging scans. Durable
+jobs, attempts, receipts, events, and dashboard history remain queryable;
+active or unknown attempts are always reconciled independently of campaign
+retirement.
 
 The last 40 storage-profile change events are inspected for repeated alternating
 `max_jobs` values within ten minutes. A warning identifies settings that may keep

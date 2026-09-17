@@ -17,6 +17,31 @@ from .registration import registration_fields
 ALERT_STATES = {"complete", "error"}
 ACTIVE_JOB_STATES = {"queued", "starting", "running", "unknown"}
 ERROR_JOB_STATES = {"failed", "blocked", "unknown"}
+FAILED_CAMPAIGN_RETENTION_S = 24 * 60 * 60
+
+
+def campaign_processing_due(store, spec, now=None):
+    """Keep history visible while retiring terminal campaigns from hot loops."""
+    now = time.time() if now is None else now
+    if not spec.get('enabled', True):
+        return False
+    row = store.db.execute(
+        'SELECT state,details,updated FROM campaign_runtime WHERE id=?',
+        (spec['id'],)).fetchone()
+    if not row:
+        return True
+    if row['state'] in {'complete', 'cancelled'}:
+        return False
+    if row['state'] != 'error':
+        return True
+    details = json.loads(row['details'])
+    since = details.get('_error_since')
+    if not isinstance(since, (int, float)):
+        alert = store.db.execute(
+            "SELECT MAX(created) FROM notification_outbox WHERE campaign=? AND state='error'",
+            (spec['id'],)).fetchone()[0]
+        since = alert if isinstance(alert, (int, float)) else row['updated']
+    return now - since < FAILED_CAMPAIGN_RETENTION_S
 
 
 def ensure_tables(store):
@@ -221,6 +246,17 @@ def _record_observation(store, spec, observation, now):
     new_error = (observation['state']=='error' and previous=='error'
                  and old.get('_error_fingerprint', fingerprint) != fingerprint)
     observation['_error_fingerprint'] = fingerprint if observation['state']=='error' else None
+    if observation['state'] == 'error':
+        same_error = previous == 'error' and old.get('_error_fingerprint', fingerprint) == fingerprint
+        since = old.get('_error_since') if same_error else None
+        if not isinstance(since, (int, float)) and same_error:
+            alert = store.db.execute(
+                "SELECT MAX(created) FROM notification_outbox WHERE campaign=? AND state='error'",
+                (spec['id'],)).fetchone()[0]
+            since = alert if isinstance(alert, (int, float)) else now
+        observation['_error_since'] = since if isinstance(since, (int, float)) else now
+    else:
+        observation['_error_since'] = None
     recovery = old.get('_pending_recovery')
     if observation['state'] == 'error':
         targets = set((recovery or {}).get('jobs', [])) | set(observation.get('failed_jobs', []))
@@ -445,6 +481,7 @@ def poll_campaigns(store, external_observations=None, webhook_file=None, sender=
         specs = campaign_specs(store)
         if campaign_ids is not None:
             specs = {k:v for k,v in specs.items() if k in campaign_ids}
+        specs = {k:v for k,v in specs.items() if campaign_processing_due(store,v,now)}
         from .observation_snapshot import ObservationSnapshot
         snapshot = ObservationSnapshot(store)
         for key, spec in specs.items():

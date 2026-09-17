@@ -59,6 +59,10 @@ class Store:
                 id TEXT PRIMARY KEY, attempt TEXT NOT NULL, node TEXT NOT NULL,
                 direction TEXT NOT NULL, status TEXT NOT NULL, spec TEXT NOT NULL,
                 report TEXT NOT NULL DEFAULT '{}', created REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS attempts_status_job_idx ON attempts(status,job);
+            CREATE INDEX IF NOT EXISTS attempts_created_job_idx ON attempts(created,job);
+            CREATE INDEX IF NOT EXISTS artifact_transfers_attempt_status_created_idx
+                ON artifact_transfers(attempt,status,created);
         """)
         os.chmod(self.path, 0o600)
 
@@ -339,12 +343,21 @@ class Store:
     def jobs(self):
         return [dict(r, spec=json.loads(r["spec"])) for r in self.db.execute("SELECT * FROM jobs")]
 
-    def attempts(self, active=False, *, job_ids=None, summary=False):
+    def observation_attempts(self):
+        """Fresh campaign fields without decoding immutable launch requests."""
+        return [dict(r, report=json.loads(r['report'])) for r in self.db.execute(
+            'SELECT id,job,node,status,created,released,ready_polls,report FROM attempts')]
+
+    def attempts(self, active=False, *, job_ids=None, summary=False, planning=False):
         # Scheduling needs resource/lineage fields, not a duplicate of every
         # other job in the frozen campaign. Full execution/audit reads remain
         # the default; never submit summary specs to a launch/validation RPC.
-        columns = ("id,job,node,status,created,released,ready_polls,report,"
-                   "json_remove(spec,'$.experiment_spec') AS spec") if summary else '*'
+        check(not (summary and planning), 'choose summary or planning attempt projection')
+        if planning:
+            columns = "id,job,node,status,created,released,ready_polls,report"
+        else:
+            columns = (("id,job,node,status,created,released,ready_polls,report,"
+                        "json_remove(spec,'$.experiment_spec') AS spec") if summary else '*')
         conditions, parameters = [], []
         if active:
             conditions.append("status IN ('starting','running','unknown')")
@@ -353,9 +366,53 @@ class Store:
             if not parameters: return []
             conditions.append('job IN ('+','.join('?' for _ in parameters)+')')
         query = 'SELECT '+columns+' FROM attempts'+(' WHERE '+' AND '.join(conditions) if conditions else '')
-        result = [dict(r, spec=json.loads(r["spec"]), report=json.loads(r["report"])) for r in self.db.execute(query, parameters)]
+        result=[]
+        planning_cache = getattr(self, '_planning_spec_cache', None)
+        if planning and planning_cache is None:
+            planning_cache = self._planning_spec_cache = {}
+        missing = []
+        for r in self.db.execute(query, parameters):
+            item=dict(r);item['report']=json.loads(item['report'])
+            if planning:
+                if item['id'] not in planning_cache:
+                    missing.append(item['id'])
+            else:item['spec']=json.loads(item['spec'])
+            result.append(item)
+        if planning and missing:
+            # Attempt specs are frozen at reservation. Parse each large original
+            # only once per manager lifetime; report/health remain fresh reads.
+            for offset in range(0,len(missing),900):
+                batch=missing[offset:offset+900]
+                projection=("SELECT id,json_extract(spec,'$.resources','$.gpus',"
+                            "'$.startup_group','$.node_spec.storage_domain',"
+                            "'$.node_spec.physical_host','$.job_spec.kind') AS value "
+                            "FROM attempts WHERE id IN ("+','.join('?' for _ in batch)+")")
+                for row in self.db.execute(projection,batch):
+                    resources,gpus,startup_group,storage_domain,physical_host,job_kind=json.loads(row['value'])
+                    node_spec_summary={'storage_domain':storage_domain or ''}
+                    if physical_host is not None:node_spec_summary['physical_host']=physical_host
+                    planning_cache[row['id']]=dict(resources=resources,gpus=gpus or [],
+                                                   startup_group=startup_group or '',
+                                                   node_spec=node_spec_summary,job_kind=job_kind)
+        if planning:
+            for item in result:
+                item['spec']=dict(planning_cache[item['id']])
         by_id = {a['id']: a for a in result}
-        for row in self.db.execute("SELECT attempt,node,direction,report FROM artifact_transfers WHERE status='succeeded' ORDER BY created"):
+        if not by_id:
+            return result
+        # Active and planning reads usually contain only a small subset of the
+        # historical attempts. Do not decode every old transfer receipt merely
+        # to discard it after the lookup below.
+        if len(by_id) <= 900:
+            ids = list(by_id)
+            transfer_query = ("SELECT attempt,node,direction,report FROM artifact_transfers "
+                              "WHERE status='succeeded' AND attempt IN ("
+                              + ','.join('?' for _ in ids) + ") ORDER BY created")
+        else:
+            ids = []
+            transfer_query = ("SELECT attempt,node,direction,report FROM artifact_transfers "
+                              "WHERE status='succeeded' ORDER BY created")
+        for row in self.db.execute(transfer_query, ids):
             attempt = by_id.get(row['attempt'])
             if attempt is None or attempt['status'] != 'succeeded':
                 continue

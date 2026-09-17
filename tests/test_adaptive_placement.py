@@ -1,5 +1,6 @@
 """Registered DDP alternatives and dependency-aware scheduling, without GPUs."""
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from test_scheduler import node, snapshot, job, experiment, plan
@@ -46,7 +47,25 @@ class AdaptivePlacementTests(unittest.TestCase):
         result=plan(work)
         self.assertEqual(result[0]['job'],'source')
         self.assertEqual((result[0]['effective_priority'],result[0]['pending_descendants']),(100,1))
+        self.assertEqual(result[0]['effective_campaign_priority'],0)
+        self.assertEqual(result[0]['effective_job_priority'],100)
         self.assertEqual(next(x for x in result if x['job']=='urgent')['decision'],'blocked')
+
+    def test_campaign_priority_precedes_job_priority(self):
+        high_campaign=experiment([job('campaign-first',priority=0)])
+        high_campaign['id']='high-campaign';high_campaign['priority']=2
+        low_campaign=experiment([job('job-first',priority=1_000_000)])
+        low_campaign['id']='low-campaign';low_campaign['priority']=1
+        jobs=[]
+        for campaign in (high_campaign,low_campaign):
+            for spec in campaign['jobs']:
+                jobs.append(dict(id=spec['id'],experiment=campaign['id'],spec=spec,
+                                 status='queued',created=0,reason=''))
+        from research_scheduler.planner import placements as raw_plan
+        n=node()
+        result=raw_plan(jobs,{c['id']:c for c in (high_campaign,low_campaign)},
+                        {'a':n},{'a':snapshot(n)},[],{},now=time.time())
+        self.assertEqual(result[0]['job'],'campaign-first')
 
     def test_attempt_freezes_chosen_resources_and_rejects_unregistered_variants(self):
         with tempfile.TemporaryDirectory() as root:

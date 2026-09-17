@@ -13,6 +13,7 @@ from .planner import base_health, gpu_healthy, placements
 from .schema import job_filesystem, node_filesystem, RTL_KINDS
 from .store import ACTIVE, dumps
 from .states import observe_health, recovery_due, transition
+from .draining import publication_probe_due, publication_probe_health
 
 
 class ExpiredBatchSnapshot(ValueError):
@@ -61,7 +62,8 @@ class Controller:
         nodes = self.store.specs("nodes")
         health = self.node_health()
         selected = [n for key, n in nodes.items() if (node_ids is None or key in node_ids)
-                    and recovery_due(health.get(key, {}), time.time())]
+                    and (recovery_due(health.get(key, {}), time.time())
+                         or publication_probe_due(n, health.get(key, {}), time.time()))]
         previous = self.snapshots()
         # Authoritative active registrations, not all processes owned by a UID.
         registered = {}
@@ -112,7 +114,13 @@ class Controller:
         with self.store.db:
             for key, value in results.items():
                 self.store.db.execute("INSERT OR REPLACE INTO snapshots VALUES(?,?)", (key, dumps(value)))
-                state = observe_health(health.get(key, {}), value, nodes[key]["recovery"], value["received_at"])
+                old_health = health.get(key, {})
+                state = observe_health(old_health, value, nodes[key]["recovery"], value["received_at"])
+                publication_state = publication_probe_health(
+                    nodes[key], old_health, value['stable_polls'],
+                    not base_health(nodes[key], value, value['received_at']), value['received_at'])
+                if publication_state is not None:
+                    state = publication_state
                 self.store.db.execute("INSERT OR REPLACE INTO node_health VALUES(?,?)", (key, dumps(state)))
                 if state != health.get(key, {}):
                     self.store.event("node_health", key, state)
@@ -127,10 +135,14 @@ class Controller:
         for _ in range(2):
             now = time.time()
             snapshots = self.snapshots()
+            health = self.node_health()
             selected = []
             for key, node in self.store.specs('nodes').items():
                 snap = snapshots.get(key, {})
-                if not node['enabled'] or base_health(node, snap, now):
+                publication_source = (not node['enabled']
+                    and bool(node.get('labels',{}).get('gpu_runtime_quarantine'))
+                    and health.get(key, {}).get('phase') == 'unavailable')
+                if (not node['enabled'] and not publication_source) or base_health(node, snap, now):
                     continue
                 required = node['policy']['stable_polls']
                 allowed = {g['uuid'] for g in node['gpus'] if g['enabled']
@@ -138,7 +150,7 @@ class Controller:
                 mode = 'shared' if node['policy']['allow_gpu_sharing'] else 'exclusive'
                 needs_gpu = any(g['uuid'] in allowed and gpu_healthy(g, node, mode)
                                 and g.get('stable_polls', 0) < required for g in snap.get('gpus', []))
-                if snap.get('stable_polls', 0) < required or needs_gpu:
+                if snap.get('stable_polls', 0) < required or (node['enabled'] and needs_gpu):
                     selected.append(key)
             if not selected:
                 break
@@ -150,6 +162,8 @@ class Controller:
     def plan(self):
         from .artifacts import reservations
         nodes, snapshots = self.store.specs("nodes"), self.snapshots()
+        jobs = self.store.jobs()
+        groups = self.store.specs("groups_")
         health = self.node_health()
         for key, state in health.items():
             if state.get("phase") in ("unavailable", "ssh_retrying"):
@@ -164,11 +178,47 @@ class Controller:
                 if (s.get("error") or not s.get("read_ok") or s.get("d_state", 1)
                         or not 0 <= now - s.get("received_at", 0) <= n["policy"]["max_snapshot_age_s"]):
                     blocked_groups[n["startup_group"]] = key
-        for key, n in nodes.items():
-            if n["startup_group"] in blocked_groups and key in snapshots:
-                snapshots[key] = dict(snapshots[key], error="shared backend unhealthy/unreachable: " + blocked_groups[n["startup_group"]])
-        return placements(self.store.jobs(), self.store.specs("experiments"), nodes,
-                          snapshots, self.store.attempts(summary=True) + reservations(self.store), self.store.specs("groups_"), now)
+        # Do not poison a whole node snapshot: jobs using approved local data do
+        # not depend on the shared cold-start backend. fit() applies this fault
+        # only when that particular job still has an effective startup group.
+        nodes={key:dict(n,_blocked_startup_groups=blocked_groups) for key,n in nodes.items()}
+        return placements(jobs, self.store.specs("experiments"), nodes,
+                          snapshots, self._planning_attempts(jobs, groups, now) + reservations(self.store),
+                          groups, now)
+
+    def _planning_attempts(self, jobs, groups, now):
+        """Load only attempts needed by live admission, lineage, and recent starts."""
+        by_id = {j['id']: j for j in jobs}
+        queued = [j for j in jobs if j['status'] == 'queued']
+        relevant = {j['id'] for j in queued}
+        relevant.update(d for j in queued for d in j['spec'].get('depends_on', []))
+        # Lineage walks the whole ancestor DAG, but only frozen boundaries and
+        # explicit source bindings need historical attempt receipts.
+        visited, frontier = set(), [j['id'] for j in queued]
+        while frontier:
+            key = frontier.pop()
+            if key in visited or key not in by_id:
+                continue
+            visited.add(key)
+            spec = by_id[key]['spec']
+            if spec.get('metadata', {}).get('frozen_initialization_authority'):
+                relevant.add(key)
+            source = spec.get('metadata', {}).get('epoch_dependency', {}).get('source_job')
+            if source in by_id:
+                relevant.add(source)
+            frontier.extend(spec.get('depends_on', []))
+        relevant.update(r[0] for r in self.store.db.execute(
+            "SELECT DISTINCT job FROM attempts WHERE status IN ('starting','running','unknown')"))
+        max_interval = max((g.get('min_start_interval_s', 0) for g in groups.values()), default=0)
+        if max_interval:
+            relevant.update(r[0] for r in self.store.db.execute(
+                'SELECT DISTINCT job FROM attempts WHERE created>=?', (now-max_interval,)))
+        # Failed startup reservations can quarantine a GPU for the same boot;
+        # do not lose this evidence when trimming unrelated historical attempts.
+        relevant.update(r[0] for r in self.store.db.execute(
+            "SELECT DISTINCT job FROM attempts WHERE status='failed' AND released=1 "
+            "AND json_extract(report,'$.failure_class')='gpu_startup_unavailable'"))
+        return self.store.attempts(job_ids=relevant, planning=True)
 
     def invalidate_unavailable(self):
         health = self.node_health()
@@ -212,7 +262,7 @@ class Controller:
                                                              "late_results": "ignored", "failover": safe})
 
     def _status_reports(self, attempts, health):
-        """Read status concurrently across nodes, sequentially within each node.
+        """Read status concurrently across nodes, one bounded RPC per node.
 
         Workers never access SQLite or reserve/launch anything. Consume reports
         in original attempt order so lifecycle writes retain serial semantics.
@@ -226,16 +276,28 @@ class Controller:
                 grouped.setdefault(a['node'], []).append(a)
 
         def read_node(rows):
-            result = {}
+            requests = []
             for a in rows:
-                try:
-                    request=dict(a['spec'],_oom_previous=a.get('report',{}).get('oom_observation',{}))
-                    if a.get('report',{}).get('failure_class')=='experiment_oom':
-                        request['_oom_verified_evidence']=a['report'].get('failure_evidence')
-                    result[a['id']] = self.transport.call(a['spec']['node_spec'], 'status', request)
-                except Exception as exc:
-                    result[a['id']] = dict(status='unknown', reason=str(exc))
-            return result
+                request=dict(a['spec'],_oom_previous=a.get('report',{}).get('oom_observation',{}))
+                if a.get('report',{}).get('failure_class')=='experiment_oom':
+                    request['_oom_verified_evidence']=a['report'].get('failure_evidence')
+                requests.append(request)
+            try:
+                result=self.transport.call(rows[0]['spec']['node_spec'],'status_batch',
+                                           {'attempts':requests})
+                if not isinstance(result,dict) or set(result)!={a['id'] for a in rows}:
+                    raise ValueError('incomplete status batch')
+                return result
+            except Exception:
+                # Keep existing per-attempt recovery for old/fake transports or
+                # a lost batch response; no lifecycle write is inferred from ACK.
+                result={}
+                for a,request in zip(rows,requests):
+                    try:
+                        result[a['id']]=self.transport.call(a['spec']['node_spec'],'status',request)
+                    except Exception as exc:
+                        result[a['id']]=dict(status='unknown',reason=str(exc))
+                return result
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             for result in pool.map(read_node, grouped.values()):
@@ -422,6 +484,7 @@ class Controller:
                 return {k: expand_config(v) for k, v in value.items()}
             return value
 
+        from .startup import startup_group
         request = dict(id=attempt_id, job=job["id"], experiment=job["experiment"],
                        experiment_spec=context['experiments'][job['experiment']],
                        job_spec=spec, node_spec=node, attempt_dir=directory,
@@ -431,7 +494,7 @@ class Controller:
                        filesystem_request=filesystem_request, filesystem=filesystem,
                        input_files=[dict(f, path=expand(f["path"])) for f in inputs],
                        outputs=spec["outputs"], resources=resources,
-                       startup_group=node["startup_group"], gpus=placement["gpus"])
+                       startup_group=startup_group(spec,node), gpus=placement["gpus"])
         request["runner_sha256"] = hashlib.sha256(Path(agent.__file__).read_bytes()).hexdigest()
         if spec['kind'] in RTL_KINDS:
             request['validation'] = spec['validation']
@@ -510,16 +573,28 @@ class Controller:
                 or not isinstance(launch_budget_s, (int, float)) or not 0 < launch_budget_s < float('inf')):
             raise ValueError('launch_budget_s must be positive and finite')
         with self.store.lock():
+            phase_times = {}
+            stage_started = time.monotonic()
+            def mark(name):
+                nonlocal stage_started
+                now = time.monotonic()
+                phase_times[name] = round(now - stage_started, 3)
+                stage_started = now
             if refresh:
                 self.refresh()
             self.invalidate_unavailable()
+            mark('controller_refresh_s')
             self.reconcile(recover_oom=execute)
+            mark('controller_reconcile_s')
             from .execution_profiles import tick as execution_tick
             execution_tick(self, execute=execute)
+            mark('controller_execution_s')
             from .resources import tick as resource_tick
             resource_tick(self, execute=execute)
+            mark('controller_resources_s')
             from .datasets import tick as dataset_tick
             dataset_tick(self, execute=execute)
+            mark('controller_datasets_s')
             from .artifacts import tick as artifact_tick
             # Reconciliation/transfers may take longer than the launch TTL.
             # Refresh expired observations instead of returning an all-stale
@@ -543,9 +618,11 @@ class Controller:
             # as model admission, not the stale samples from before reconcile.
             artifact_tick(self, execute=execute)
             refresh_expired()
+            mark('controller_artifacts_s')
             plan = self.plan()
+            mark('controller_plan_s')
             if not execute:
-                return {"mode": "dry-run", "plan": plan, "launches": []}
+                return {"mode": "dry-run", "plan": plan, "launches": [], "phase_times": phase_times}
             launches, skipped = [], set()
             batch_revalidations = 0
             current = plan
@@ -616,7 +693,10 @@ class Controller:
                 current = self.plan()
             # Reap work that ended during preparation/planning/launch RPCs now,
             # rather than leaving it active until the next long dispatch cycle.
+            mark('controller_launch_s')
             self.reconcile(recover_oom=execute, exclude_attempts={p.get('attempt') for p in launches})
+            mark('controller_final_reconcile_s')
             final_plan = current
             return {"mode": "execute", "launched": launches[0] if launches else None,
-                    "launches": launches, "plan": plan, "final_plan": final_plan}
+                    "launches": launches, "plan": plan, "final_plan": final_plan,
+                    "phase_times": phase_times}

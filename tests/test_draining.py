@@ -2,7 +2,8 @@ import copy
 import json
 import unittest
 from test_scheduler import node,job,plan,reservation
-from research_scheduler.draining import source_upload_allowed,epoch_publication_allowed
+from research_scheduler.draining import (source_upload_allowed,epoch_publication_allowed,
+                                         publication_probe_due,publication_probe_health)
 from research_scheduler.draining import host_resource_reservations
 
 
@@ -42,6 +43,34 @@ class DrainingTests(unittest.TestCase):
         self.assertFalse(source_upload_allowed(a,n,'download'))
         n['target']='new-container'
         self.assertFalse(source_upload_allowed(a,n,'upload'))
+
+    def test_gpu_quarantine_allows_only_original_source_publication(self):
+        n,a=self.fixture()
+        n['labels'].pop('drain_upload_only')
+        self.assertFalse(source_upload_allowed(a,n,'upload'))
+        n['labels']['gpu_runtime_quarantine']={'boot_id':'faulted-boot'}
+        self.assertTrue(source_upload_allowed(a,n,'upload'))
+        self.assertFalse(source_upload_allowed(a,n,'download'))
+        n['target']='another-container'
+        self.assertFalse(source_upload_allowed(a,n,'upload'))
+
+    def test_quarantined_source_recovers_publication_without_gpu_readmission(self):
+        n,_=self.fixture()
+        n['policy']['stable_polls']=3
+        n['labels'].pop('drain_upload_only')
+        old={'phase':'unavailable','reason':'SSH/response recovery budget exhausted'}
+        self.assertFalse(publication_probe_due(n,dict(old,next_publication_probe_at=100),99))
+        self.assertFalse(publication_probe_due(n,old,0))
+        n['labels']['gpu_runtime_quarantine']={'boot_id':'faulted-boot'}
+        self.assertTrue(publication_probe_due(n,old,0))
+        waiting=publication_probe_health(n,old,1,True,10)
+        self.assertEqual(waiting['phase'],'unavailable')
+        self.assertEqual(waiting['next_publication_probe_at'],12)
+        restored=publication_probe_health(n,waiting,n['policy']['stable_polls'],True,12)
+        self.assertEqual(restored['phase'],'publication_only')
+        self.assertFalse(n['enabled'])
+        self.assertEqual(publication_probe_health(n,restored,0,True,73)['phase'],'publication_only')
+        self.assertEqual(publication_probe_health(n,restored,0,False,73)['phase'],'unavailable')
 
     def test_scientific_jobs_stay_drained(self):
         n,_=self.fixture()
