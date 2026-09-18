@@ -61,6 +61,7 @@ class OverviewTests(unittest.TestCase):
             summary=reader.attempts(summary=True)
             self.assertNotIn('experiment_spec',summary[0]['spec'])
             self.assertIs(reader.attempts(summary=True)[0],summary[0])
+            self.assertIs(reader.attempts(planning=True)[0],summary[0])
             self.assertEqual(summary[0]['spec']['attempt_dir'],raw['attempt_dir'])
             self.assertFalse(any(q=='SELECT * FROM attempts' for q in queries))
             self.assertEqual(reader.attempts()[0]['spec']['experiment_spec'],raw['experiment_spec'])
@@ -143,6 +144,34 @@ class OverviewTests(unittest.TestCase):
     def test_iteration_counter_is_not_claimed_as_optimizer_updates(self):
         p=self.read_progress_fixture({'TRAIN_PROGRESS.json':dict(epoch=1,training_iterations_executed=100)})
         self.assertIsNone(p['optimizer_steps_executed'])
+
+    def test_worker_supplied_steps_per_epoch_is_preserved(self):
+        p=self.read_progress_fixture({'TRAIN_PROGRESS.json':dict(
+            epoch=1, planned_epochs=5, optimizer_steps_executed=21,
+            step_in_epoch=21, steps_per_epoch=1789)})
+        self.assertEqual(p['steps_per_epoch'],1789)
+
+    def test_constant_epoch_length_is_recovered_from_consistent_counters(self):
+        p=self.read_progress_fixture({'TRAIN_PROGRESS.json':dict(
+            epoch=3, planned_epochs=5, optimizer_steps_executed=3778,
+            step_in_epoch=200)})
+        self.assertEqual(p['steps_per_epoch'],1789)
+
+    def test_inconsistent_epoch_counters_do_not_invent_a_denominator(self):
+        p=self.read_progress_fixture({'TRAIN_PROGRESS.json':dict(
+            epoch=3, planned_epochs=5, optimizer_steps_executed=3779,
+            step_in_epoch=200)})
+        self.assertIsNone(p['steps_per_epoch'])
+
+    def test_root_eval_progress_exposes_phase_and_batches(self):
+        p=self.read_progress_fixture({'PROGRESS.json':dict(phase='w8a8',batches=2050,config='percentile')})
+        self.assertEqual((p['phase'],p['batches'],p['config']),('w8a8',2050,'percentile'))
+
+    def test_eval_progress_contract_supplies_stable_denominator(self):
+        p=self.read_progress_fixture({
+            'PROGRESS.json':dict(phase='w8a8',batches=2050,config='percentile'),
+            'PROGRESS_CONTRACT.json':dict(planned_batches=9913)})
+        self.assertEqual(p['planned_batches'],9913)
 
     def test_invalid_progress_is_explicit(self):
         self.assertIn('error',self.read_progress_fixture({'TRAIN_PROGRESS.json':'{broken'}))

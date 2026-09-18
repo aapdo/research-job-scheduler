@@ -412,7 +412,10 @@ class Store:
             ids = []
             transfer_query = ("SELECT attempt,node,direction,report FROM artifact_transfers "
                               "WHERE status='succeeded' ORDER BY created")
-        for row in self.db.execute(transfer_query, ids):
+        transfer_rows = list(self.db.execute(transfer_query, ids))
+        # Publication manifests can be newer and more complete than an early
+        # speculative local relay. Load them first regardless of creation order.
+        for row in transfer_rows:
             attempt = by_id.get(row['attempt'])
             if attempt is None or attempt['status'] != 'succeeded':
                 continue
@@ -420,8 +423,24 @@ class Store:
             if not receipt: continue
             if row['direction'] == 'upload':
                 attempt['report']['hf_artifact'] = receipt
-            else:
-                attempt.setdefault('artifact_locations', {})[row['node']] = receipt
+        for row in transfer_rows:
+            if row['direction'] != 'download': continue
+            attempt = by_id.get(row['attempt'])
+            if attempt is None or attempt['status'] != 'succeeded': continue
+            receipt = json.loads(row['report']).get('artifact')
+            if not receipt: continue
+            report=attempt['report']
+            job_spec=attempt.get('spec',{}).get('job_spec',{})
+            declared=job_spec.get('dependency_artifacts',job_spec.get('hf_artifacts',[]))
+            published=report.get('hf_artifact',{})
+            if declared and not report.get('dependency_artifacts') and published.get('attempt') != attempt['id']:
+                continue
+            required=(report.get('dependency_artifacts') or
+                      report.get('hf_artifact',{}).get('files') or report.get('outputs',{}))
+            # Old output-only relays must not shadow a complete checkpoint
+            # manifest published later by the same immutable attempt.
+            if not set(required).issubset(receipt.get('files',{})): continue
+            attempt.setdefault('artifact_locations', {})[row['node']] = receipt
         return result
 
     def prioritize(self, job_id, priority):

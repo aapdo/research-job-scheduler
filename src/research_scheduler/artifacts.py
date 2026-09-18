@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path, PurePosixPath
 
-from . import agent, hf_worker
+from . import agent, hf_worker, relay_worker
 from .schema import check, fields
 from .store import ACTIVE, dumps
 from .draining import source_upload_allowed
@@ -16,7 +16,13 @@ from .draining import source_upload_allowed
 
 def hf_spec(raw):
     h = dict(raw)
-    fields(h, 'repo_id repo_type revision path_prefix archive_payload commit_interval_s')
+    fields(h, 'repo_id repo_type revision path_prefix archive_payload commit_interval_s enabled')
+    if 'enabled' in h:
+        check(type(h['enabled']) is bool, 'HF enabled must be boolean')
+    else:
+        default=os.environ.get('RS_HF_UPLOAD_DEFAULT','1')
+        check(default in ('0','1'), 'RS_HF_UPLOAD_DEFAULT must be 0 or 1')
+        h['enabled']=default=='1'
     if 'archive_payload' in h:
         check(type(h['archive_payload']) is bool, 'archive_payload must be boolean')
     if 'commit_interval_s' in h:
@@ -51,7 +57,7 @@ def reservations(store):
 
 
 def campaign_for(experiment, campaigns):
-    matches = [c for c in campaigns.values() if c.get('hf') and c['enabled'] and not c['external']
+    matches = [c for c in campaigns.values() if c.get('hf',{}).get('enabled') is True and c['enabled'] and not c['external']
                and (experiment['id'] in c['experiments'] or experiment['project'] in c['projects'])]
     # A focused upload monitor may overlap its parent scientific campaign. Both
     # observe the same receipt; only one deterministic owner creates the upload.
@@ -70,6 +76,8 @@ def retry_history(history):
 
 def retry_possible(history, now=None, check_time=True):
     history = retry_history(history)
+    if not history:
+        return True
     if any(t['status'] != 'failed' for t in history):
         return False
     rate_limited = [t for t in history if t['report'].get('rate_limit')]
@@ -130,6 +138,65 @@ def start(controller, attempt, node, direction, config):
         controller.transport.call(node, 'launch', request)
     except Exception:
         pass  # Lost ACK: reconcile the same immutable transfer, never duplicate it.
+    return key
+
+
+def start_local_relay(controller, attempt, source_node, destination_node):
+    """Stage declared dependency outputs/artifacts through a bounded local relay."""
+    store = controller.store
+    relay_node = store.specs('nodes').get('resource-control')
+    check(relay_node is not None and relay_node.get('transport') == 'local',
+          'resource-control local relay node is not configured')
+    report = attempt.get('report', {})
+    outputs = report.get('outputs', {})
+    artifacts = report.get('dependency_artifacts')
+    job_spec = attempt.get('spec', {}).get('job_spec', {})
+    declared = job_spec.get('dependency_artifacts', job_spec.get('hf_artifacts', []))
+    if not artifacts:
+        published = report.get('hf_artifact', {})
+        artifacts = published.get('files') if published.get('attempt') == attempt['id'] else None
+    # A legacy successful attempt may predate dependency_artifacts collection.
+    # Never turn its small success-output receipt into a supposedly complete
+    # checkpoint relay when the immutable job declared additional artifacts.
+    check(not declared or artifacts,
+          'dependency artifact manifest missing; repair the legacy attempt before relay')
+    artifacts = artifacts or outputs
+    check(bool(outputs), 'dependency has no declared successful outputs to relay')
+    check(set(outputs).issubset(artifacts), 'dependency artifact receipt omits successful outputs')
+    files = {}
+    source_root = Path(attempt['spec']['attempt_dir'])
+    for name, item in artifacts.items():
+        rel = PurePosixPath(name)
+        check(not rel.is_absolute() and '..' not in rel.parts and '\\' not in name,
+              'unsafe dependency output path')
+        files[name] = {'sha256': item['sha256'], 'bytes': item['bytes']}
+    manifest_sha = hashlib.sha256(dumps(files).encode()).hexdigest()
+    key = 'relay-' + uuid.uuid4().hex
+    directory = str(Path(relay_node['work_root'], 'artifact-transfers', key))
+    destination = str(Path(destination_node['work_root'], 'artifact-relays', key, 'payload'))
+    config = dict(source_attempt=attempt['id'], source_target=(source_node['target']
+                  if source_node['transport'] == 'ssh' else '@local'), source_root=str(source_root),
+                  destination_target=(destination_node['target']
+                  if destination_node['transport'] == 'ssh' else '@local'),
+                  destination_root=destination, files=files, manifest_sha256=manifest_sha)
+    request = dict(id=key, job=attempt['job'], node_spec=relay_node, attempt_dir=directory,
+                   argv=[relay_node['python'], '-c', Path(relay_worker.__file__).read_text()],
+                   cwd=directory, env={}, config=config, input_files=[], outputs=['HF_RECEIPT.json'],
+                   resources=dict(gpu_count=0, vram_mib=0, gpu_mode='exclusive', cpu=2, ram_mib=1024),
+                   startup_group='', gpus=[])
+    request['runner_sha256'] = hashlib.sha256(Path(agent.__file__).read_bytes()).hexdigest()
+    request['spec_sha256'] = hashlib.sha256(dumps(request).encode()).hexdigest()
+    with store.db:
+        store.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                         (key, attempt['id'], destination_node['id'], 'download', 'starting',
+                          dumps(request), '{}', time.time()))
+        store.event('artifact_transfer_reserved', key,
+                    dict(attempt=attempt['id'], node=destination_node['id'],
+                         direction='download', transport='controller-local-relay'))
+    try:
+        controller.transport.call(relay_node, 'launch', request)
+    except Exception:
+        pass
     return key
 
 
@@ -207,8 +274,10 @@ def tick(controller, execute):
     experiments = store.specs('experiments')
     from .model_vram_policy import normalize
     jobs = {k:dict(j,spec=normalize(j['spec'])) for k,j in jobs.items()}
+    # Dependency staging is an internal scheduler guarantee, independent of
+    # whether a campaign publishes long-term results to HF. This also covers
+    # future campaigns that only declare ordinary depends_on outputs.
     ready_queued = [j for j in jobs.values() if j['status'] == 'queued'
-                    and campaign_for(experiments[j['experiment']],campaigns)
                     and all(jobs[d]['status'] == 'succeeded' for d in j['spec']['depends_on'])]
     detailed_jobs = {d for j in ready_queued for d in j['spec']['depends_on']}
     detailed_jobs.update(r[0] for r in store.db.execute(
@@ -228,7 +297,7 @@ def tick(controller, execute):
                 if a['status'] in ACTIVE else a for a in attempts]
 
     pause_cache = {}
-    def eligible(a, n, direction, repair_revision=None):
+    def eligible(a, n, direction, repair_revision=None, require_hf=True):
         if direction == 'upload':
             owner = campaign_for(experiments[jobs[a['job']]['experiment']], campaigns)
             if owner:
@@ -238,7 +307,8 @@ def tick(controller, execute):
                     pause_cache[identity] = upload_pause(owner, transfers, campaigns)
                 if pause_cache[identity]:
                     return False
-        if ('hf' not in n or (not n['enabled'] and not source_upload_allowed(a,n,direction))
+        if ((require_hf and 'hf' not in n)
+                or (not n['enabled'] and not source_upload_allowed(a,n,direction))
                 or any(r['node'] == n['id'] for r in live)):
             return False
         if health.get(n['id'], {}).get('phase') in ('ssh_retrying', 'unavailable'):
@@ -279,6 +349,7 @@ def tick(controller, execute):
             a=next((v for v in attempts if v['id']==pending['attempt'] and v['status']=='succeeded'),None)
             if not a:continue
             cfg=json.loads(pending['config'])
+            if not hf_spec(cfg.get('hf',{})).get('enabled',False):continue
             if any(t['attempt']==a['id'] and t['direction']=='upload' and (t['status']=='succeeded' or t['spec']['config'].get('repair_revision')==cfg['repair_revision']) for t in transfers):
                 with store.db:store.db.execute("UPDATE artifact_repair_queue SET state='submitted' WHERE attempt=?",(a['id'],))
                 continue
@@ -310,21 +381,25 @@ def tick(controller, execute):
                 continue
             a = successful[dep]
             receipt = a['report'].get('hf_artifact')
-            if not receipt:
-                continue
             for n in staging_nodes:
                 if n['id'] == a['node'] or n['id'] in a.get('artifact_locations', {}):
                     continue
                 if n['storage_domain'] and n['storage_domain'] == a['spec']['node_spec']['storage_domain']:
                     continue
-                if not eligible(a, n, 'download'):
+                relay_node = nodes.get('resource-control')
+                local_relay = bool(a.get('report', {}).get('outputs') and relay_node
+                                   and relay_node.get('transport') == 'local')
+                if not local_relay and not receipt:
+                    continue
+                if not eligible(a, n, 'download', require_hf=not local_relay):
                     continue
                 # Copy only the location maps we change. Deep-copying every
                 # historical attempt/report per candidate can outlast the
                 # health freshness window and starve scientific dispatch.
                 hypothetical = dict(successful)
                 for d in j['spec']['depends_on']:
-                    if hypothetical[d]['report'].get('hf_artifact'):
+                    if (hypothetical[d]['report'].get('hf_artifact')
+                            or hypothetical[d]['report'].get('outputs')):
                         item = dict(hypothetical[d])
                         item['artifact_locations'] = dict(item.get('artifact_locations', {}))
                         item['artifact_locations'][n['id']] = {}
@@ -334,7 +409,12 @@ def tick(controller, execute):
                             attempts, hypothetical, groups, time.time())[0]
                         for resources in [j['spec']['resources'], *j['spec'].get('resource_variants', [])]]
                 if any(not reason for reason in fits):
-                    start(controller, a, n, 'download', dict(receipt=receipt))
+                    # Internal dependency staging prefers the controller-local
+                    # relay. HF remains the immutable publication/fallback path.
+                    if local_relay:
+                        start_local_relay(controller, a, nodes[a['node']], n)
+                    elif receipt:
+                        start(controller, a, n, 'download', dict(receipt=receipt))
                     return
     # Prioritize publications that unblock successors; successful computation stays successful.
     needed = {d for j in queued for d in j['spec']['depends_on']}
@@ -397,6 +477,8 @@ def publication_summary(store, campaign=None, snapshot=None):
     from .observation_snapshot import ObservationSnapshot
     snapshot = snapshot if snapshot is not None else ObservationSnapshot(store)
     campaigns = {campaign['id']: campaign} if campaign else campaign_specs(store)
+    if campaign and not campaign.get('hf',{}).get('enabled',False):
+        return dict(counts=dict(pending=0,published=0,error=0),errors=[],warnings=[],disabled=True)
     jobs = snapshot.jobs_by_id
     experiments, nodes = snapshot.experiments, snapshot.nodes
     from .recovery import current_campaign_jobs
@@ -405,6 +487,7 @@ def publication_summary(store, campaign=None, snapshot=None):
     transfers = snapshot.transfers
     counts = dict(pending=0, published=0, error=0)
     errors = []
+    warnings = []
     for a in snapshot.attempts:
         if a['status'] != 'succeeded' or not jobs[a['job']]['spec']['outputs']:
             continue
@@ -415,16 +498,23 @@ def publication_summary(store, campaign=None, snapshot=None):
         if a['report'].get('hf_artifact'):
             counts['published'] += 1
         elif 'hf' not in nodes.get(a['node'], {}):
-            counts['error'] += 1
-            errors.append(dict(job=a['job'], status='artifact_error', reason='HF Python/auth paths not configured on source node'))
+            counts['pending'] += 1
+            warnings.append(dict(job=a['job'], status='pending', reason='HF Python/auth paths not configured on source node'))
         elif history and all(r['status'] == 'failed' for r in history) and not retry_possible(history, check_time=False):
-            counts['error'] += 1
-            errors.append(dict(job=a['job'], status='artifact_error', reason='HF upload retry budget exhausted; training remains successful'))
+            counts['pending'] += 1
+            warnings.append(dict(job=a['job'], status='pending', reason='HF upload retry budget exhausted; computation remains successful'))
         else:
             counts['pending'] += 1
     downloads = {}
     selected = current if current is not None else {key for key,j in jobs.items() if campaign_for(experiments[j['experiment']], campaigns)}
-    needed_attempts = {a['id'] for a in snapshot.attempts if a['job'] in selected}
+    # A failed speculative copy is no longer actionable after every current
+    # consumer of that producer has completed (possibly on another node).
+    pending_dependencies = {
+        dep for key in selected if jobs[key]['status'] == 'queued'
+        for dep in jobs[key]['spec']['depends_on']
+        if dep not in jobs[key]['spec'].get('order_only_dependencies', [])}
+    needed_attempts = {a['id'] for a in snapshot.attempts
+                       if a['job'] in pending_dependencies and a['status'] == 'succeeded'}
     for r in transfers:
         if r['direction'] == 'download' and r['attempt'] in needed_attempts:
             downloads.setdefault((r['attempt'], r['node']), []).append(r)
@@ -432,4 +522,4 @@ def publication_summary(store, campaign=None, snapshot=None):
         if len(history) >= 3 and all(r['status'] == 'failed' for r in history):
             counts['error'] += 1
             errors.append(dict(job=attempt, status='artifact_error', reason='HF download retries exhausted on ' + node))
-    return dict(counts=counts, errors=errors[:8])
+    return dict(counts=counts, errors=errors[:8], warnings=warnings[:8])

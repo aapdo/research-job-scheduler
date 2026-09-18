@@ -7,6 +7,10 @@ from research_scheduler import agent
 from research_scheduler.artifacts import hf_spec,upload_pause,retry_possible
 
 class PacingTests(unittest.TestCase):
+    def test_live_default_can_disable_implicit_publication(self):
+        with patch.dict('os.environ',{'RS_HF_UPLOAD_DEFAULT':'0'}):
+            self.assertFalse(hf_spec(dict(repo_id='a/b'))['enabled'])
+            self.assertTrue(hf_spec(dict(repo_id='a/b',enabled=True))['enabled'])
     def test_scheduler_interval_overrides_campaign_and_keeps_safety(self):
         hf=hf_spec(dict(repo_id='a/b',commit_interval_s=120))
         campaign={'hf':hf}

@@ -264,6 +264,22 @@ test('evaluation shows percentage without cell counts or updates',()=>{
   assert.match(vm.runInContext('progress(j)',context),/진행률 확인 중/);
 });
 
+test('evaluation root progress stays visibly active without a known total',()=>{
+  const {context}=dashboard();
+  context.j={work_type:'eval',progress:{phase:'w8a8',batches:2050}};
+  assert.match(vm.runInContext('progress(j)',context),/eval 2,050 batch · w8a8/);
+});
+
+test('execution profile states are distinct from resource waiting',()=>{
+  const {context}=dashboard();
+  context.j={status:'queued',waiting:{category:'validation_wait'}};
+  assert.equal(vm.runInContext('jobStatus(j)',context),'validation_wait');
+  assert.match(vm.runInContext('badge(jobStatus(j))',context),/검증 대기/);
+  context.j.waiting.category='validation_failed';
+  assert.equal(vm.runInContext('jobStatus(j)',context),'validation_failed');
+  assert.match(vm.runInContext('badge(jobStatus(j))',context),/검증 실패/);
+});
+
 test('checkbox hides whole disabled servers, not individually forbidden GPUs', () => {
   const {context, get} = dashboard();
   context.fixture.health.push({id:'farm9-gui2',category:'model',enabled:false,status:'disabled'});

@@ -14,12 +14,98 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'src'))
-from research_scheduler import hf_worker
+from research_scheduler import agent, hf_worker, relay_worker
 from research_scheduler.artifacts import hf_spec, campaign_for, tick, reservations, publication_summary
 from research_scheduler.notifications import register_campaign
 from research_scheduler.controller import Controller
 from research_scheduler.store import Store, dumps
 from test_scheduler import node, snapshot, job, experiment, plan, reservation
+
+
+class LocalRelayWorkerTests(unittest.TestCase):
+    def test_remote_relay_streaming_does_not_require_rsync(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);destination=root/'payload';payload=b'checkpoint'
+            calls=[]
+            def remote(argv,**kwargs):
+                calls.append(argv)
+                kwargs['stdout'].write(payload)
+                return types.SimpleNamespace(returncode=0)
+            with patch.object(relay_worker.subprocess,'run',side_effect=remote):
+                relay_worker.stream_from_remote('farm','/attempt/model',destination)
+            self.assertEqual(destination.read_bytes(),payload)
+            self.assertFalse(any('rsync' in part for call in calls for part in call))
+
+    def test_agent_freezes_declared_checkpoint_globs_for_dependency_relay(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);(root/'run/epochs/e20').mkdir(parents=True)
+            result=root/'RESULT.json';checkpoint=root/'run/epochs/e20/model.pdparams'
+            result.write_bytes(b'result');checkpoint.write_bytes(b'checkpoint')
+            outputs={'RESULT.json':dict(path=str(result),bytes=result.stat().st_size,
+                                        sha256=hf_worker.digest(result))}
+            files=agent.dependency_artifacts(root,['run/epochs/*/*.pdparams'],outputs)
+            self.assertEqual(set(files),{'RESULT.json','run/epochs/e20/model.pdparams'})
+            self.assertEqual(files['run/epochs/e20/model.pdparams']['sha256'],hf_worker.digest(checkpoint))
+            with self.assertRaises(ValueError):agent.dependency_artifacts(root,['../escape'],outputs)
+
+    def test_local_relay_copies_and_verifies_declared_outputs(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);source=root/'source';attempt=root/'attempt';destination=root/'destination'
+            source.mkdir();attempt.mkdir();payload=b'layout-v1\n';(source/'LAYOUTS.json').write_bytes(payload)
+            sha=hashlib.sha256(payload).hexdigest()
+            config=dict(source_attempt='layout.done',source_target='@local',source_root=str(source),
+                        destination_target='@local',destination_root=str(destination),
+                        files={'LAYOUTS.json':dict(bytes=len(payload),sha256=sha)},manifest_sha256=sha)
+            (attempt/'config.json').write_text(json.dumps(config))
+            with patch.dict('os.environ',{'RS_CONFIG_PATH':str(attempt/'config.json'),
+                                           'RS_ATTEMPT_DIR':str(attempt)}):
+                relay_worker.main()
+            receipt=json.loads((attempt/'HF_RECEIPT.json').read_text())
+            self.assertEqual((destination/'LAYOUTS.json').read_bytes(),payload)
+            self.assertEqual(receipt['transport'],'controller-local-relay')
+            self.assertEqual(receipt['files']['LAYOUTS.json']['sha256'],sha)
+            self.assertFalse((attempt/'relay-staging').exists())
+
+    def test_dependency_staging_does_not_require_hf_campaign(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'db')
+            source=node(root=str(Path(root)/'source-runs'),key='source')
+            destination=node(root=str(Path(root)/'destination-runs'),key='destination')
+            relay=node(root=str(Path(root)/'relay-runs'),key='resource-control')
+            source.update(transport='ssh',target='source-host')
+            destination.update(transport='ssh',target='destination-host')
+            for n in (source,destination,relay):s.register_node(n)
+            predecessor=job('predecessor',gpu_count=0);predecessor['outputs']=['RESULT.json']
+            consumer=job('consumer',deps=['predecessor']);consumer['hosts']=['destination']
+            s.register_experiment(experiment([predecessor,consumer]))
+            register_campaign(s,dict(id='local-only',name='Local only',rq='why',projects=['general']))
+            with s.db:
+                s.db.execute("UPDATE jobs SET status='succeeded' WHERE id='predecessor'")
+                s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',
+                    ('predecessor.done','predecessor','source',
+                     dumps(dict(attempt_dir=str(Path(root)/'source'),node_spec=source,startup_group='')),
+                     'succeeded',1,dumps({'outputs':{'RESULT.json':{'sha256':'0'*64,'bytes':1}}})))
+                s.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                    ('published','predecessor.done','source','upload','succeeded','{}',dumps({'artifact':{
+                        'attempt':'predecessor.done','files':{
+                            'RESULT.json':{'sha256':'0'*64,'bytes':1},
+                            'run/epochs/e20/model.pdparams':{'sha256':'1'*64,'bytes':2}}}}),0))
+                for n in (source,destination,relay):
+                    s.db.execute('INSERT INTO snapshots VALUES(?,?)',(n['id'],dumps(snapshot(n))))
+            class Capture:
+                def __init__(self):self.requests=[]
+                def call(self,node,action,request):
+                    self.requests.append((node['id'],action,request));return {'status':'starting'}
+            transport=Capture()
+            with s.lock():tick(Controller(s,transport),execute=True)
+            self.assertEqual([(node,action) for node,action,_ in transport.requests],
+                             [('resource-control','launch')])
+            transfer=s.db.execute("SELECT node,status,spec FROM artifact_transfers WHERE direction='download'").fetchone()
+            self.assertEqual((transfer['node'],transfer['status']),('destination','starting'))
+            config=json.loads(transfer['spec'])['config']
+            self.assertEqual(config['destination_target'],'destination-host')
+            self.assertEqual(set(config['files']),{'RESULT.json','run/epochs/e20/model.pdparams'})
+            s.db.close()
 
 
 class ReservationReadTests(unittest.TestCase):
@@ -36,6 +122,26 @@ class ReservationReadTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT count(*) FROM artifact_transfers').fetchone()[0],2)
         finally:
             db.close()
+
+
+class PublicationDownloadSummaryTests(unittest.TestCase):
+    def test_completed_consumer_ignores_failed_speculative_destination_copies(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'db');n=node();n['hf']={'python':sys.executable};s.register_node(n)
+            producer=job('producer',gpu_count=0);producer['outputs']=['result']
+            consumer=job('consumer',gpu_count=0,deps=['producer'])
+            s.register_experiment(experiment([producer,consumer]))
+            campaign=register_campaign(s,dict(id='study',name='Study',rq='why',projects=['general']))
+            with s.db:
+                s.db.execute("UPDATE jobs SET status='succeeded'")
+                s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',
+                    ('producer.done','producer','a',dumps(dict(attempt_dir='/source',node_spec=n,startup_group='')),
+                     'succeeded',0,dumps({'outputs':{'result':{'sha256':'0'*64}}})))
+                for index in range(3):
+                    s.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                        ('failed-'+str(index),'producer.done','b','download','failed','{}','{}',index))
+            self.assertEqual(publication_summary(s,campaign)['counts']['error'],0)
+            s.db.close()
 
 
 class FakeAdd:
@@ -292,6 +398,50 @@ class HFWorkerTests(unittest.TestCase):
 
 
 class HFIntegrationTests(unittest.TestCase):
+    def test_legacy_output_only_relay_is_not_a_checkpoint_location(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'db');a=node();b=node(key='b');b.update(transport='ssh',target='b-host');s.register_node(a);s.register_node(b)
+            producer=job('producer',gpu_count=0);producer.update(outputs=['RESULT.json'],hf_artifacts=['run/model'])
+            s.register_experiment(experiment([producer]))
+            outputs={'RESULT.json':{'path':'/source/RESULT.json','sha256':'0'*64,'bytes':1}}
+            attempt_spec=dict(attempt_dir='/source',node_spec=a,startup_group='',job_spec=producer)
+            with s.db:
+                s.db.execute("UPDATE jobs SET status='succeeded' WHERE id='producer'")
+                s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',
+                    ('producer.done','producer','a',dumps(attempt_spec),'succeeded',0,dumps({'outputs':outputs})))
+                s.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                    ('old','producer.done','b','download','succeeded','{}',dumps({'artifact':{
+                        'root':'/b','files':outputs}}),1))
+            self.assertNotIn('artifact_locations',s.attempts()[0])
+            s.db.close()
+
+    def test_incomplete_legacy_download_cannot_shadow_published_checkpoint_manifest(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'db');a=node();b=node(key='b');b.update(transport='ssh',target='b-host');s.register_node(a);s.register_node(b)
+            producer=job('producer',gpu_count=0);producer['outputs']=['RESULT.json']
+            s.register_experiment(experiment([producer]))
+            outputs={'RESULT.json':{'path':'/source/RESULT.json','sha256':'0'*64,'bytes':1}}
+            complete={'RESULT.json':{'path':'/b/RESULT.json','sha256':'0'*64,'bytes':1},
+                      'run/model':{'path':'/b/run/model','sha256':'1'*64,'bytes':2}}
+            with s.db:
+                s.db.execute("UPDATE jobs SET status='succeeded' WHERE id='producer'")
+                s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',
+                    ('producer.done','producer','a',dumps(dict(attempt_dir='/source',node_spec=a,startup_group='')),
+                     'succeeded',0,dumps({'outputs':outputs})))
+                s.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                    ('old','producer.done','b','download','succeeded','{}',dumps({'artifact':{
+                        'root':'/b','files':{'RESULT.json':complete['RESULT.json']}}}),1))
+                s.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                    ('upload','producer.done','a','upload','succeeded','{}',dumps({'artifact':{
+                        'attempt':'producer.done','files':complete}}),2))
+            self.assertNotIn('b',s.attempts()[0].get('artifact_locations',{}))
+            with s.db:
+                s.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                    ('new','producer.done','b','download','succeeded','{}',dumps({'artifact':{
+                        'root':'/b','files':complete}}),3))
+            self.assertEqual(set(s.attempts()[0]['artifact_locations']['b']['files']),set(complete))
+            s.db.close()
+
     def test_hf_binding_allows_cross_node_only_after_download_receipt(self):
         a,b=node(),node(key='b')
         done=reservation(a,key='first');done.update(status='succeeded',released=True,report={})
@@ -396,7 +546,11 @@ class HFIntegrationTests(unittest.TestCase):
                 def call(self,*args):raise AssertionError('retry budget must prevent launch')
             with s.lock():tick(Controller(s,NoLaunch()),execute=True)
             self.assertEqual(s.jobs()[0]['status'],'succeeded')
-            self.assertEqual(publication_summary(s,campaign)['counts']['error'],1)
+            summary=publication_summary(s,campaign)
+            self.assertEqual(summary['counts']['error'],0)
+            self.assertEqual(summary['counts']['pending'],1)
+            self.assertEqual(summary['errors'],[])
+            self.assertEqual(summary['warnings'][0]['status'],'pending')
             s.db.close()
 
 

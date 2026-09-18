@@ -267,7 +267,7 @@ def experiment_spec(raw):
     check(isinstance(e["jobs"], list) and e["jobs"], "at least one job required")
     for j in e["jobs"]:
         fields(j, "id name kind purpose argv cwd env config resources depends_on order_only_dependencies priority labels hosts "
-               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem hf_artifacts hf_relocate_json resource_variants "
+               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem dependency_artifacts hf_artifacts hf_relocate_json resource_variants "
                "validation preflight_argv board_id")
         identifier(j["id"])
         check(j["kind"] in ("train", "eval", "prepare", "analysis", *RTL_KINDS), "invalid job kind")
@@ -320,7 +320,7 @@ def experiment_spec(raw):
         for out in j["outputs"]:
             check(isinstance(out, str) and out and not PurePosixPath(out).is_absolute()
                   and ".." not in PurePosixPath(out).parts, "outputs must be relative files inside attempt_dir")
-        for key in ("hf_artifacts", "hf_relocate_json"):
+        for key in ("dependency_artifacts", "hf_artifacts", "hf_relocate_json"):
             if key in j:
                 check(isinstance(j[key], list), key + " must be a list")
                 for path in j[key]:

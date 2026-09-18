@@ -337,6 +337,22 @@ class Controller:
                 if report.get("returncode") != 0 or set(report.get("outputs", {})) != set(a["spec"]["outputs"]):
                     status = "unknown"
                     report["reason"] = "success receipt is incomplete"
+                job_spec = a['spec'].get('job_spec', {})
+                declared = job_spec.get('dependency_artifacts', job_spec.get('hf_artifacts', []))
+                if status == 'succeeded' and declared and not report.get('dependency_artifacts'):
+                    try:
+                        repair_request = dict(a['spec'])
+                        current = self.store.db.execute('SELECT spec FROM jobs WHERE id=?', (a['job'],)).fetchone()
+                        current_spec = json.loads(current['spec']) if current else {}
+                        minimal = current_spec.get('dependency_artifacts')
+                        if minimal:
+                            repair_request['job_spec'] = dict(job_spec, dependency_artifacts=minimal)
+                        repaired = self.transport.call(node, 'dependency_manifest', repair_request)
+                        report['dependency_artifacts'] = repaired['dependency_artifacts']
+                    except Exception as exc:
+                        status = 'unknown'
+                        report['reason'] = ('dependency artifact manifest unavailable: '
+                                            + type(exc).__name__ + ': ' + str(exc))
                 if (a['spec'].get('job_spec', {}).get('kind') in RTL_KINDS
                         and report.get('validation', {}).get('status') != 'pass'):
                     status = 'unknown'
@@ -462,8 +478,9 @@ class Controller:
                 raise ValueError('dependency has no verified destination artifacts: ' + dep)
             substitutions["{dep:" + dep + "}"] = a["spec"]["attempt_dir"]
             # Rehash declared predecessor artifacts on the destination before launch.
+            artifacts = a["report"].get("dependency_artifacts", a["report"].get("outputs", {}))
             inputs.extend({"path": out["path"], "sha256": out["sha256"]}
-                          for out in a["report"].get("outputs", {}).values())
+                          for out in artifacts.values())
         inputs.extend(node["assets"][key] for key in spec["assets"])
 
         def expand(value):

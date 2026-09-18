@@ -56,7 +56,7 @@ class ReadStore:
         # Overview/admission need resource and lineage fields, not the full
         # frozen campaign duplicated in every historical execution request.
         # Retain full reads for explicit audit callers, never for launch RPCs.
-        if summary and 'attempts' not in self._rows:
+        if (summary or planning) and 'attempts' not in self._rows:
             if not hasattr(self, '_attempt_summary'):
                 self._attempt_summary = [dict(r, spec=json.loads(r['spec']), report=json.loads(r['report']))
                     for r in self.db.execute("SELECT id,job,node,status,created,released,ready_polls,report,"
@@ -100,6 +100,10 @@ def collect(db, *, node=None, campaign=None, job=None, hardware_index=None, live
         runtimes = {r['id']:r for r in store.rows('campaign_runtime')}
         completion_alerts, publication_times = {}, {}
         tables = {r[0] for r in store.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        validation_states = {}
+        if 'execution_preparations' in tables:
+            for r in store.db.execute('SELECT profile,state FROM execution_preparations'):
+                validation_states.setdefault(r['profile'], []).append(r['state'])
         if 'notification_outbox' in tables:
             completion_alerts = dict(store.db.execute(
                 "SELECT campaign,MAX(created) FROM notification_outbox WHERE state='complete' GROUP BY campaign"))
@@ -157,7 +161,7 @@ def collect(db, *, node=None, campaign=None, job=None, hardware_index=None, live
             hidden_campaigns.append(key)
             continue
         groups.append(dict(id=key, name=spec['name'], external=spec.get('external', False),
-            counts=summarize(selected, by_id), counts_by_type=summarize_by_type(selected, by_id), job_ids=[j['id'] for j in selected],
+            counts=summarize(selected, by_id, validation_states), counts_by_type=summarize_by_type(selected, by_id, validation_states), job_ids=[j['id'] for j in selected],
             recorded_state=runtime.get('state'), runtime_age_s=age(now, runtime.get('updated')),
             completed_at=completed_at, **registrations.get(key, registration_fields(None)),
             external_counts=runtime.get('details', {}).get('counts') if spec.get('external') else None,
@@ -171,7 +175,7 @@ def collect(db, *, node=None, campaign=None, job=None, hardware_index=None, live
         if expired_complete('complete', completed_at, now):
             hidden_campaigns.append(key)
             continue
-        groups.append(dict(id=key, name=project, counts=summarize(selected, by_id), counts_by_type=summarize_by_type(selected, by_id),
+        groups.append(dict(id=key, name=project, counts=summarize(selected, by_id, validation_states), counts_by_type=summarize_by_type(selected, by_id, validation_states),
                            job_ids=[j['id'] for j in selected], completed_at=completed_at, unregistered_project=True))
     for keys in membership.values():
         keys[:] = [key for key in keys if key not in hidden_campaigns]
@@ -186,7 +190,7 @@ def collect(db, *, node=None, campaign=None, job=None, hardware_index=None, live
         if not wanted(j): continue
         a = latest.get(j['id'])
         row = dict(id=j['id'], status=j['status'], kind=j['spec']['kind'], work_type=work_type(j['spec']), campaigns=membership[j['id']],
-                   display_status=display_status(j, by_id), waiting=waiting_detail(j, by_id),
+                   display_status=display_status(j, by_id, validation_states), waiting=waiting_detail(j, by_id, validation_states),
                    dependencies=dependency_details(j, by_id, (j['id'],)),
                    reason=j['reason'], resources=j['spec']['resources'],
                    resource_variants=j['spec'].get('resource_variants', []), plan=plans.get(j['id']),
@@ -307,7 +311,7 @@ for key,d in json.loads(sys.argv[1]):
   if p.is_file():
    with p.open('rb') as stream:raw=stream.read(131073)
    assert len(raw)<=131072
-   v=json.loads(raw);out['progress']={k:v.get(k) for k in ['epoch','planned_epochs','optimizer_steps_executed','step_in_epoch','status','member','members','training_iterations_executed']}
+   v=json.loads(raw);out['progress']={k:v.get(k) for k in ['epoch','planned_epochs','optimizer_steps_executed','step_in_epoch','steps_per_epoch','status','member','members','training_iterations_executed']}
    # Bootstrap counts actual optimizer updates per member as applied; total
    # training iterations can include skipped AMP steps and are not updates.
    if out['progress']['optimizer_steps_executed'] is None and type(v.get('applied')) is int and v['applied']>=0:
@@ -317,13 +321,28 @@ for key,d in json.loads(sys.argv[1]):
    if contract.is_file() and contract.stat().st_size<=262144:
     total=json.loads(contract.read_text()).get('updates_per_epoch')
     if type(total) is int and total>0:out['progress']['steps_per_epoch']=total
+   # Some legacy workers only persist the global and in-epoch counters.  Once
+   # the second epoch has started, recover the constant epoch length without
+   # guessing from wall time or dataset size.  Reject inconsistent counters.
+   if out['progress'].get('steps_per_epoch') is None:
+    epoch=out['progress'].get('epoch');step=out['progress'].get('step_in_epoch')
+    updates=out['progress'].get('optimizer_steps_executed')
+    if type(epoch) is int and epoch>1 and type(step) is int and step>0 and type(updates) is int and updates>=step:
+     prior=updates-step
+     if prior>0 and prior%(epoch-1)==0:
+      inferred=prior//(epoch-1)
+      if inferred>=step:out['progress']['steps_per_epoch']=inferred
    out['progress'].update(legacy_posterior_phase(root,out['progress'],time.time()))
   else:
-   marker=next((root/n for n in ['evaluation/PROGRESS.json','eval/PROGRESS.json','diagnostics/PROGRESS.json'] if (root/n).is_file()),None)
+   marker=next((root/n for n in ['PROGRESS.json','evaluation/PROGRESS.json','eval/PROGRESS.json','diagnostics/PROGRESS.json'] if (root/n).is_file()),None)
    p=root/'CHILD_STATE.json'
    if marker is not None:
     assert marker.stat().st_size<=131072
-    v=json.loads(marker.read_text());out['progress']={k:v.get(k) for k in ['completed_cells','planned_cells']}
+    v=json.loads(marker.read_text());out['progress']={k:v.get(k) for k in ['completed_cells','planned_cells','phase','batches','planned_batches','config']}
+    contract=root/'PROGRESS_CONTRACT.json'
+    if out['progress'].get('planned_batches') is None and contract.is_file() and contract.stat().st_size<=131072:
+     total=json.loads(contract.read_text()).get('planned_batches')
+     if type(total) is int and total>0:out['progress']['planned_batches']=total
     out['progress']['age_s']=round(max(0,time.time()-marker.stat().st_mtime),1)
    elif p.is_file():
     assert p.stat().st_size<=131072
@@ -354,12 +373,12 @@ def markdown(data, view='all', include_waiting=False):
     def cell(value): return str(value if value is not None else '—').replace('|', '\\|').replace('\n', ' ')
     lines = ['# Research overview', '', data['time_kst'], '']
     if view in ('all','campaign'):
-        lines += ['## Campaigns', '', '| Campaign | Type | Success | Running | Starting | 자원 대기 | 선행 대기 | Blocked/failed/unknown |', '|---|---|---:|---:|---:|---:|---:|---|']
+        lines += ['## Campaigns', '', '| Campaign | Type | Success | Running | Starting | 자원 대기 | 선행 대기 | 검증 대기 | 검증 실패 | Blocked/failed/unknown |', '|---|---|---:|---:|---:|---:|---:|---:|---:|---|']
         for g in data['campaigns']:
             c = g.get('external_counts') or g['counts']
             typed=g.get('counts_by_type') if not g.get('external') else None
             for kind,c in (typed or {'external' if g.get('external') else 'unclassified':c}).items():
-                lines.append('| ' + ' | '.join(map(cell,[campaign_label(g),kind,c.get('succeeded',c.get('complete',0)),c.get('running',0),c.get('starting',0),c.get('resource_wait',0),c.get('dependency_wait',0),f"{c.get('blocked',0)}/{c.get('failed',0)}/{c.get('unknown',0)}"])) + ' |')
+                lines.append('| ' + ' | '.join(map(cell,[campaign_label(g),kind,c.get('succeeded',c.get('complete',0)),c.get('running',0),c.get('starting',0),c.get('resource_wait',0),c.get('dependency_wait',0),c.get('validation_wait',0),c.get('validation_failed',0),f"{c.get('blocked',0)}/{c.get('failed',0)}/{c.get('unknown',0)}"])) + ' |')
         if data['hardware']:
             lines += ['', '## Hardware campaigns', '', '| Campaign | Phase | build | test: RTL | test: board |', '|---|---|---|---|---|']
             for h in data['hardware']:

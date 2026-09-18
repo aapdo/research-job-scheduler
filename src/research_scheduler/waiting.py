@@ -2,23 +2,38 @@
 from collections import Counter
 
 
-def waiting_detail(job, by_id):
+def execution_validation_state(job, validation_states=None):
+    metadata=job['spec'].get('metadata',{})
+    profile=metadata.get('execution_preparation_catalog')
+    if not profile or metadata.get('execution_profiles'):
+        return None
+    states=list((validation_states or {}).get(profile, ()))
+    failed={'failed','validation_failed','verification_failed','cancelled'}
+    return 'validation_failed' if states and all(state in failed for state in states) else 'validation_wait'
+
+
+def waiting_detail(job, by_id, validation_states=None):
     if job['status'] != 'queued':
         return None
     unmet = [dict(job=key, status=by_id.get(key, {}).get('status', 'missing'))
              for key in job['spec'].get('depends_on', [])
              if by_id.get(key, {}).get('status') != 'succeeded']
-    return dict(category='dependency_wait' if unmet else 'resource_wait',
-                label='선행 대기' if unmet else '자원 대기', dependencies=unmet)
+    if unmet:
+        return dict(category='dependency_wait',label='선행 대기',dependencies=unmet)
+    validation=execution_validation_state(job,validation_states)
+    if validation:
+        return dict(category=validation,label='검증 실패' if validation=='validation_failed' else '검증 대기',
+                    dependencies=[])
+    return dict(category='resource_wait',label='자원 대기',dependencies=[])
 
 
-def display_status(job, by_id):
-    detail = waiting_detail(job, by_id)
+def display_status(job, by_id, validation_states=None):
+    detail = waiting_detail(job, by_id, validation_states)
     return detail['category'] if detail else job['status']
 
 
-def summarize(jobs, by_id):
-    return dict(Counter(display_status(job, by_id) for job in jobs))
+def summarize(jobs, by_id, validation_states=None):
+    return dict(Counter(display_status(job, by_id, validation_states) for job in jobs))
 
 
 def work_type(spec):
@@ -32,8 +47,8 @@ def work_type(spec):
     return 'support'
 
 
-def summarize_by_type(jobs, by_id):
+def summarize_by_type(jobs, by_id, validation_states=None):
     groups={}
     for job in jobs:
         groups.setdefault(work_type(job['spec']),[]).append(job)
-    return {key:summarize(rows,by_id) for key,rows in groups.items()}
+    return {key:summarize(rows,by_id,validation_states) for key,rows in groups.items()}

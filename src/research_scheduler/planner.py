@@ -229,7 +229,7 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
                 and j['spec']['kind']=='prepare'
                 and j['spec']['resources']['gpu_count']>0)
     queued = sorted((j for j in jobs if j["status"] == "queued"),
-                    key=lambda j: (validation_expansion(j), -scores[j['id']][0], -scores[j['id']][1],
+                    key=lambda j: (-scores[j['id']][0], -scores[j['id']][1], validation_expansion(j),
                                    -scores[j['id']][2],
                                    j["created"], j["id"]))
     for j in queued:

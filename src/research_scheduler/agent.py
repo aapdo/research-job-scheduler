@@ -24,6 +24,32 @@ class UncertainExecution(RuntimeError):
     """Keep reservations when a launched process might still own hardware."""
 
 
+def dependency_artifacts(directory, patterns, outputs):
+    """Freeze declared publication artifacts for dependency relay.
+
+    `outputs` remain the success contract.  `hf_artifacts` are also explicit,
+    operator-registered paths and are needed by downstream jobs even before an
+    optional HF publication completes.
+    """
+    root = Path(directory).resolve()
+    files = dict(outputs)
+    for pattern in patterns:
+        rel = Path(pattern)
+        if (not pattern or rel.is_absolute() or '..' in rel.parts
+                or '\\' in pattern or '\x00' in pattern):
+            raise ValueError('unsafe dependency artifact pattern: ' + pattern)
+        matches = sorted(root.glob(pattern))
+        if not matches:
+            raise ValueError('dependency artifact pattern matched no files: ' + pattern)
+        for path in matches:
+            resolved = path.resolve()
+            if path.is_symlink() or not path.is_file() or not resolved.is_relative_to(root):
+                raise ValueError('dependency artifact escapes attempt directory: ' + pattern)
+            name = path.relative_to(root).as_posix()
+            files[name] = {'path': str(path), 'sha256': digest(path), 'bytes': path.stat().st_size}
+    return files
+
+
 def validate_rtl(directory, kind, contract):
     """Validate real attempt-local artifacts, not a producer's success flag."""
     directory = Path(directory).resolve()
@@ -829,6 +855,7 @@ def run(request):
             if request.get('validation') and group_alive(child.pid):
                 raise UncertainExecution('RTL command left live descendants; reservation retained')
             outputs = {}
+            artifacts = {}
             if code == 0:
                 if request.get('validation'):
                     state['validation'] = validate_rtl(directory, request['job_spec']['kind'], request['validation'])
@@ -837,7 +864,11 @@ def run(request):
                     if not path.resolve().is_relative_to(directory.resolve()) or not path.is_file():
                         raise ValueError("missing/escaping output file: " + name)
                     outputs[name] = {"path": str(path), "sha256": digest(path), "bytes": path.stat().st_size}
+                job_spec = request.get('job_spec', {})
+                patterns = job_spec.get('dependency_artifacts', job_spec.get('hf_artifacts', []))
+                artifacts = dependency_artifacts(directory, patterns, outputs)
             state.update(status="succeeded" if code == 0 else "failed", returncode=code, outputs=outputs,
+                         dependency_artifacts=artifacts,
                          reason='' if code == 0 else f'workload exited with code {code}')
         except Exception as exc:
             state.update(status="unknown" if isinstance(exc, UncertainExecution) else "failed",
@@ -885,6 +916,14 @@ def main():
             if digest(receipt['path']) != receipt['sha256']:
                 raise ValueError('artifact receipt changed')
             result['artifact'] = json.loads(Path(receipt['path']).read_text())
+    elif action == 'dependency_manifest':
+        result = read_status(request)
+        if result.get('status') != 'succeeded':
+            raise ValueError('dependency manifest requires a succeeded attempt')
+        job_spec = request.get('job_spec', {})
+        patterns = job_spec.get('dependency_artifacts', job_spec.get('hf_artifacts', []))
+        result['dependency_artifacts'] = dependency_artifacts(
+            request['attempt_dir'], patterns, result.get('outputs', {}))
     elif action == 'dataset_receipt':
         result = read_status(request)
         if result.get('status') == 'succeeded':

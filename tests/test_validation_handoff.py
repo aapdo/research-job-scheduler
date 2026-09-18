@@ -7,7 +7,7 @@ class ValidationHandoffTests(unittest.TestCase):
     def setup_rows(self,blocked=False):
         model=experiment([job('model',deps=['missing'] if blocked else [])],key='model-exp')
         probe=job('EXEC_VERIFY_probe');probe['kind']='prepare'
-        validation=experiment([probe],key='probe-exp');validation.update(priority=20000,project='execution-preparation')
+        validation=experiment([probe],key='probe-exp');validation.update(project='execution-preparation')
         jobs=[dict(id=j['id'],spec=j,experiment=e['id'],status='queued',created=0) for e in [validation,model] for j in e['jobs']]
         exps={e['id']:e for e in [validation,model]}
         if blocked:
@@ -25,5 +25,12 @@ class ValidationHandoffTests(unittest.TestCase):
         result=placements(jobs,exps,{'a':n},{'a':snapshot(n)},[],{})
         self.assertEqual(next(r for r in result if r['job']=='model')['decision'],'blocked')
         self.assertEqual(next(r for r in result if r['job']=='EXEC_VERIFY_probe')['decision'],'ready')
+
+    def test_higher_priority_validation_is_not_starved_by_lower_priority_consumers(self):
+        jobs,exps=self.setup_rows();n=node()
+        exps['probe-exp']['priority']=20000
+        result=placements(jobs,exps,{'a':n},{'a':snapshot(n)},[],{})
+        self.assertEqual([r['job'] for r in result],['EXEC_VERIFY_probe','model'])
+        self.assertTrue(all(r['decision']=='ready' for r in result))
 
 if __name__=='__main__':unittest.main()

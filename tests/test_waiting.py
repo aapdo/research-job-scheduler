@@ -28,6 +28,15 @@ class WaitingTests(unittest.TestCase):
     def test_missing_dependency_is_not_resource_shortage(self):
         self.assertEqual(waiting_detail(self.row('b',deps=['missing']),{})['category'],'dependency_wait')
 
+    def test_execution_profile_wait_and_failure_are_not_resource_shortage(self):
+        row=self.row('profile');row['spec']['metadata']={'execution_preparation_catalog':'runtime-v1'}
+        self.assertEqual(waiting_detail(row,{},{} )['category'],'validation_wait')
+        self.assertEqual(waiting_detail(row,{}, {'runtime-v1':['validation_queued','validation_failed']})['category'],'validation_wait')
+        detail=waiting_detail(row,{}, {'runtime-v1':['validation_failed','failed']})
+        self.assertEqual((detail['category'],detail['label']),('validation_failed','검증 실패'))
+        row['spec']['metadata']['execution_profiles']={'farm9':{}}
+        self.assertEqual(waiting_detail(row,{}, {'runtime-v1':['validation_failed']})['category'],'resource_wait')
+
     def test_notification_uses_both_labels(self):
         from research_scheduler.notifications import _message
         text=_message(dict(id='c',name='C',rq='Q'),
