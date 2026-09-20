@@ -57,6 +57,11 @@ class ExecutionPreparationTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT state FROM execution_preparations').fetchone()[0],
                          'verification_failed')
 
+    def test_retired_catalog_target_is_ignored(self):
+        with self.store.db:self.store.db.execute("DELETE FROM nodes WHERE id='b'")
+        ep.tick(self.controller,execute=True)
+        self.assertFalse(self.store.db.execute('SELECT 1 FROM execution_preparations').fetchone())
+
     def test_inline_catalog_requires_exact_wrapper_code(self):
         c=copy.deepcopy(self.catalog);code='verified wrapper'
         c['match']['inline_validation_sha256']=hashlib.sha256(code.encode()).hexdigest()

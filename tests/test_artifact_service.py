@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from research_scheduler.artifact_service import (
-    RegistrySection, UnlockedTransport, external_artifacts_enabled, cycle)
+    RegistrySection, UnlockedTransport, external_artifacts_enabled, cycle, loop_wait_s)
 from research_scheduler.artifacts import archive_source_in_use
 from research_scheduler.store import Store, dumps
 
@@ -66,6 +66,10 @@ class ArtifactServiceTests(unittest.TestCase):
             result = cycle(self.store)
         tick.assert_called_once()
         self.assertIn('registry_locked_s', result)
+
+    def test_overrun_still_yields_fair_registry_window(self):
+        self.assertEqual(loop_wait_s(5,40,False),5)
+        self.assertEqual(loop_wait_s(5,40,True),30)
 
     def test_new_reference_during_verification_protects_source(self):
         root = '/runs/source.done'

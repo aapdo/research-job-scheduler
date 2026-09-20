@@ -249,7 +249,10 @@ def tick(controller, execute=False):
         matching=[j for j in demand.get((catalog['match']['cwd'],catalog['match']['dataset']),[])
                   if matches(j,catalog)]
         for target,recipe in catalog['targets'].items():
-            node=nodes[target]
+            # Execution catalogs are immutable audit contracts and can retain
+            # targets after an executor is retired from the live registry.
+            node=nodes.get(target)
+            if node is None:continue
             if node.get('target')!=recipe['target']:continue
             if not node['enabled'] or not any(g['enabled'] and g['uuid'] not in node['policy'].get('disabled_gpu_uuids',[]) for g in node['gpus']):continue
             consumers=[j for j in matching if j['spec']['kind'] in recipe['resources']
@@ -268,7 +271,8 @@ def tick(controller, execute=False):
                     if jobs.get(completed_id,{}).get('status')!='succeeded':continue
             if not record:
                 if active>=catalog['max_parallel']:continue
-                coordinator=nodes[catalog['coordinator']]
+                coordinator=nodes.get(catalog['coordinator'])
+                if coordinator is None:continue
                 if not coordinator['enabled']:continue
                 job_id='EXEC_PREP_'+digest(dict(profile=catalog['id'],node=target,recipe=recipe))[:24]
                 from . import execution_worker

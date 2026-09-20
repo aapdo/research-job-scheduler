@@ -79,6 +79,9 @@ def tick(controller,execute=False):
     for c in catalogs:
         locations={r['node']:dict(r) for r in store.db.execute('SELECT * FROM resource_locations WHERE resource=?',(c['id'],))}
         for n,location in locations.items():
+            # Keep historical location receipts, but never reconcile them
+            # against an executor removed from the live node registry.
+            if n not in nodes:continue
             if location['state']=='ready':
                 snap=snapshots.get(n,{})
                 m=marker(c['id'],c['manifest_sha256'])
@@ -131,7 +134,8 @@ def tick(controller,execute=False):
                     store.db.execute("UPDATE jobs SET spec=? WHERE id=? AND status='queued'",(dumps(spec),j['id']));j['spec']=spec
         active=sum(bool(r['job']) and jobs[r['job']]['status'] in (*ACTIVE,'queued') for r in locations.values())
         for n,root in c['destinations'].items():
-            node=nodes[n];old=locations.get(n)
+            node=nodes.get(n);old=locations.get(n)
+            if node is None:continue
             if not node['enabled'] or active>=c['max_parallel']:continue
             previous=[j for j in jobs.values() if j['spec'].get('config',{}).get('resource')==c['id'] and j['spec'].get('config',{}).get('node')==n and j['id'].startswith('RESOURCE_')]
             if old and old['job']:
@@ -144,9 +148,10 @@ def tick(controller,execute=False):
             known=dict(c['sources'])
             known.update({k:r['path'] for k,r in locations.items() if r['state']=='ready'})
             sources=[dict(node=k,target=target(nodes[k]),root=p)
-                     for k,p in known.items() if nodes[k]['enabled'] and k!=n]
+                     for k,p in known.items() if k in nodes and nodes[k]['enabled'] and k!=n]
             sources.sort(key=lambda s:(locations.get(s['node'],{}).get('state')!='ready',s['node']))
-            control=nodes[c['coordinator']]
+            control=nodes.get(c['coordinator'])
+            if control is None:continue
             if not control['enabled']:continue
             key='RESOURCE_'+digest(dict(resource=c['id'],node=n,retry=len(previous)))[:24]
             from . import resource_worker

@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import contextlib
 import tempfile
 import time
@@ -145,6 +146,106 @@ def stream_between_remotes(source_target, source_root, destination_target, desti
         raise subprocess.CalledProcessError(
             source_code or consumer.returncode, 'direct remote attempt stream',
             stderr=(source_error + destination_error).decode(errors='replace'))
+
+
+def _pipe_processes(producer, consumer, payload=None):
+    if payload is not None:
+        producer.stdin.write(payload)
+        producer.stdin.close()
+    producer.stdout.close()
+    _, destination_error = consumer.communicate()
+    source_error = producer.stderr.read()
+    source_code = producer.wait()
+    if source_code or consumer.returncode:
+        raise subprocess.CalledProcessError(
+            source_code or consumer.returncode, 'uncompressed tar relay stream',
+            stderr=source_error + destination_error)
+
+
+def stream_tar_tree(source_target, source_root, destination_target, destination_root, names):
+    """Send many regular files through one uncompressed tar/SSH stream."""
+    source_script = (
+        'import json,pathlib,sys,tarfile\n'
+        'root=pathlib.Path(sys.argv[1]).resolve();names=json.load(sys.stdin)\n'
+        'with tarfile.open(fileobj=sys.stdout.buffer,mode="w|") as out:\n'
+        ' for name in names:\n'
+        '  rel=pathlib.PurePosixPath(name);p=(root/name).resolve()\n'
+        '  assert name and not rel.is_absolute() and ".." not in rel.parts and p.is_relative_to(root)\n'
+        '  assert p.is_file() and not p.is_symlink()\n'
+        '  out.add(p,arcname=name,recursive=False)\n')
+    extract_script = (
+        'import pathlib,shutil,sys,tarfile\n'
+        'root=pathlib.Path(sys.argv[1]).resolve();root.mkdir(parents=True,exist_ok=False);seen=set()\n'
+        'with tarfile.open(fileobj=sys.stdin.buffer,mode="r|") as src:\n'
+        ' for item in src:\n'
+        '  name=item.name;rel=pathlib.PurePosixPath(name);p=(root/name).resolve()\n'
+        '  assert name and not rel.is_absolute() and ".." not in rel.parts and p.is_relative_to(root)\n'
+        '  assert item.isfile() and name not in seen;seen.add(name);p.parent.mkdir(parents=True,exist_ok=True)\n'
+        '  incoming=src.extractfile(item);assert incoming is not None\n'
+        '  with p.open("xb") as out:shutil.copyfileobj(incoming,out,4194304)\n')
+    source_command = ([sys.executable, '-c', source_script, str(source_root)]
+                      if source_target == '@local' else
+                      ['ssh', '-o', 'BatchMode=yes', source_target,
+                       shlex.join(['python3', '-c', source_script, str(source_root)])])
+    producer = subprocess.Popen(source_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+    consumer = subprocess.Popen(
+        ['ssh', '-o', 'BatchMode=yes', destination_target,
+         shlex.join(['python3', '-c', extract_script, str(destination_root)])],
+        stdin=producer.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _pipe_processes(producer, consumer, json.dumps(sorted(names)).encode())
+
+
+def stream_tar_bundle(source_target, source_root, destination_target, bundle_path, names):
+    """Create one uncompressed tar file on a remote staging node."""
+    source_script = (
+        'import json,pathlib,sys,tarfile\n'
+        'root=pathlib.Path(sys.argv[1]).resolve();names=json.load(sys.stdin)\n'
+        'with tarfile.open(fileobj=sys.stdout.buffer,mode="w|") as out:\n'
+        ' for name in names:\n'
+        '  rel=pathlib.PurePosixPath(name);p=(root/name).resolve()\n'
+        '  assert name and not rel.is_absolute() and ".." not in rel.parts and p.is_relative_to(root)\n'
+        '  assert p.is_file() and not p.is_symlink();out.add(p,arcname=name,recursive=False)\n')
+    writer_script = (
+        'import pathlib,shutil,sys\n'
+        'p=pathlib.Path(sys.argv[1]);assert not p.exists();p.parent.mkdir(parents=True,exist_ok=True)\n'
+        'with p.open("xb") as out:shutil.copyfileobj(sys.stdin.buffer,out,4194304)\n')
+    source_command = ([sys.executable, '-c', source_script, str(source_root)]
+                      if source_target == '@local' else
+                      ['ssh', '-o', 'BatchMode=yes', source_target,
+                       shlex.join(['python3', '-c', source_script, str(source_root)])])
+    producer = subprocess.Popen(source_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+    consumer = subprocess.Popen(
+        ['ssh', '-o', 'BatchMode=yes', destination_target,
+         shlex.join(['python3', '-c', writer_script, str(bundle_path)])],
+        stdin=producer.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _pipe_processes(producer, consumer, json.dumps(sorted(names)).encode())
+
+
+def extract_remote_tar(source_target, bundle_path, destination_target, destination_root):
+    source_script = ('import pathlib,shutil,sys\n'
+                     'p=pathlib.Path(sys.argv[1]);assert p.is_file() and not p.is_symlink()\n'
+                     'with p.open("rb") as src:shutil.copyfileobj(src,sys.stdout.buffer,4194304)\n')
+    extract_script = (
+        'import pathlib,shutil,sys,tarfile\n'
+        'root=pathlib.Path(sys.argv[1]).resolve();root.mkdir(parents=True,exist_ok=False);seen=set()\n'
+        'with tarfile.open(fileobj=sys.stdin.buffer,mode="r|") as src:\n'
+        ' for item in src:\n'
+        '  name=item.name;rel=pathlib.PurePosixPath(name);p=(root/name).resolve()\n'
+        '  assert name and not rel.is_absolute() and ".." not in rel.parts and p.is_relative_to(root)\n'
+        '  assert item.isfile() and name not in seen;seen.add(name);p.parent.mkdir(parents=True,exist_ok=True)\n'
+        '  incoming=src.extractfile(item);assert incoming is not None\n'
+        '  with p.open("xb") as out:shutil.copyfileobj(incoming,out,4194304)\n')
+    producer = subprocess.Popen(
+        ['ssh', '-o', 'BatchMode=yes', source_target,
+         shlex.join(['python3', '-c', source_script, str(bundle_path)])],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    consumer = subprocess.Popen(
+        ['ssh', '-o', 'BatchMode=yes', destination_target,
+         shlex.join(['python3', '-c', extract_script, str(destination_root)])],
+        stdin=producer.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _pipe_processes(producer, consumer)
 
 
 @contextlib.contextmanager
@@ -338,8 +439,55 @@ def publish(config, staging):
             for name, expected in config['files'].items()}
 
 
+def verify_and_commit_remote(config, temporary, destination):
+    checks = [(str(temporary / str(relative(name))), expected['bytes'], expected['sha256'])
+              for name, expected in config['files'].items()]
+    verify = (
+        'import hashlib,pathlib\n'
+        'checks=' + repr(checks) + '\n'
+        'root=pathlib.Path(' + repr(str(temporary)) + ').resolve();expected=set()\n'
+        'for name,size,sha in checks:\n'
+        ' p=pathlib.Path(name);expected.add(p.resolve().relative_to(root).as_posix());h=hashlib.sha256()\n'
+        ' with p.open("rb") as f:\n'
+        '  for chunk in iter(lambda:f.read(4194304),b""):h.update(chunk)\n'
+        ' assert p.is_file() and p.stat().st_size==size and h.hexdigest()==sha\n'
+        'actual={p.resolve().relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}\n'
+        'assert actual==expected\n')
+    run(['ssh', '-o', 'BatchMode=yes', config['destination_target'], 'python3', '-'], input_text=verify)
+    run(['ssh', '-o', 'BatchMode=yes', config['destination_target'], 'sh', '-s', '--',
+         str(temporary), str(destination)], input_text='set -eu; mv -- "$1" "$2"')
+
+
+def publish_tar_direct(config, bundle_target=None, bundle_path=None):
+    """Publish a manifest as one uncompressed tar stream and verify every file."""
+    target = config['destination_target']
+    if target == '@local':
+        raise ValueError('tar relay destination must be remote')
+    destination = Path(config['destination_root'])
+    temporary = Path(str(destination) + '.staging')
+    check = 'set -eu; test ! -e "$1"; test ! -e "$2"; mkdir -p "$(dirname "$2")"'
+    run(['ssh', '-o', 'BatchMode=yes', target, 'sh', '-s', '--',
+         str(destination), str(temporary)], input_text=check)
+    try:
+        if bundle_target is None:
+            stream_tar_tree(config['source_target'], config['source_root'],
+                            target, temporary, config['files'])
+        else:
+            extract_remote_tar(bundle_target, bundle_path, target, temporary)
+        verify_and_commit_remote(config, temporary, destination)
+    except Exception:
+        subprocess.run(['ssh', '-o', 'BatchMode=yes', target, 'sh', '-s', '--', str(temporary)],
+                       input='rm -rf -- "$1"', text=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        raise
+    return {name: dict(path=str(destination / str(relative(name))), **expected)
+            for name, expected in config['files'].items()}
+
+
 def publish_direct(config):
     """Stream source files to LAB4 without a controller-local disk copy."""
+    if config.get('transport_route') == 'direct-stream' and len(config['files']) > 1:
+        return publish_tar_direct(config)
     target = config['destination_target']
     if target == '@local':
         raise ValueError('direct archive destination must be remote')
@@ -393,6 +541,34 @@ def publish_direct(config):
             for name, expected in config['files'].items()}
 
 
+def publish_via_cps1(config):
+    """Use CPS1 disk as the bounded bridge across the FARM/LAB firewall."""
+    staging_target = config['staging_target']
+    staging = Path(config['staging_root'])
+    total = sum(item['bytes'] for item in config['files'].values())
+    prepare = (
+        'import pathlib,shutil,sys\n'
+        'p=pathlib.Path(sys.argv[1]);need=int(sys.argv[2])\n'
+        'assert p.name.startswith("relay-") and p.parent.name=="artifact-relay-staging"\n'
+        'assert not p.exists() and shutil.disk_usage(p.parent.parent).free>need\n'
+        'p.mkdir(parents=True)\n')
+    run(['ssh', '-o', 'BatchMode=yes', staging_target, 'python3', '-',
+         str(staging), str(config['staging_min_free_bytes'] + total)], input_text=prepare)
+    try:
+        bundle = staging / 'payload.tar'
+        stream_tar_bundle(config['source_target'], config['source_root'],
+                          staging_target, bundle, config['files'])
+        return publish_tar_direct(config, staging_target, bundle)
+    finally:
+        cleanup = (
+            'import pathlib,shutil,sys\n'
+            'p=pathlib.Path(sys.argv[1])\n'
+            'assert p.name.startswith("relay-") and p.parent.name=="artifact-relay-staging"\n'
+            'shutil.rmtree(p,ignore_errors=True)\n')
+        subprocess.run(['ssh', '-o', 'BatchMode=yes', staging_target, 'python3', '-', str(staging)],
+                       input=cleanup, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def main():
     config = json.loads(Path(os.environ['RS_CONFIG_PATH']).read_text())
     attempt_dir = Path(os.environ['RS_ATTEMPT_DIR'])
@@ -407,6 +583,8 @@ def main():
     if config.get('mode') == 'attempt-archive' and reuse_verified_archive(config):
         files = {name: dict(path=str(Path(config['destination_root']) / name), **value)
                  for name, value in config['files'].items()}
+    elif config.get('transport_route') == 'cps1-staging':
+        files = publish_via_cps1(config)
     elif config.get('transport_route') in ('direct-stream', 'server-direct', 'lab4-local'):
         files = publish_direct(config)
     else:

@@ -9,18 +9,29 @@ from .draining import epoch_publication_allowed, host_resource_reservations
 
 
 TRAIN_DENSE_NODES=('rp2','cps2-model','cps1-model','farm9-gui2')
-TRAIN_SECONDARY_NODES=('lab1','farm8-gui2','farm6','farm7')
+TRAIN_SECONDARY_NODES=('lab1','farm8-gui2','farm6','farm7','lab3','lab8')
 TRAIN_PREFERRED_NODES=TRAIN_DENSE_NODES+TRAIN_SECONDARY_NODES
-EVAL_PREFERRED_NODES=('lab2','lab3','lab4','lab8','lab6')
+EVAL_PREFERRED_NODES=('lab2','lab4','lab6')
+RETIRED_MODEL_NODES=('rp1','rp3','farm1','farm2')
 
 
-def workload_node_allowed(kind,node_id):
+def workload_node_allowed(kind,node_id,job=None,successful=None):
     """Keep model train/eval execution inside its configured GPU pool."""
+    if node_id in RETIRED_MODEL_NODES:return False
     # Generic/library nodes used outside the managed model fleet have no pool
     # contract here. Every production model GPU is listed in exactly one set.
     if node_id not in set(TRAIN_PREFERRED_NODES)|set(EVAL_PREFERRED_NODES):return True
     if kind=='train':return node_id in TRAIN_PREFERRED_NODES
-    if kind=='eval':return node_id in EVAL_PREFERRED_NODES
+    if kind=='eval':
+        if node_id in EVAL_PREFERRED_NODES:return True
+        # A user-approved, job-scoped exception may keep an evaluation beside
+        # its exact successful training attempt. It does not open the train
+        # pool generally and cannot select a different producer/server.
+        dependency=(job or {}).get('metadata',{}).get('same_host_eval_dependency')
+        source=(successful or {}).get(dependency)
+        return bool(dependency and dependency in (job or {}).get('depends_on',[])
+                    and source and source.get('status')=='succeeded'
+                    and source.get('node')==node_id)
     return True
 
 
@@ -34,11 +45,11 @@ def workload_node_rank(kind,node_id):
     return 3,999
 
 
-def workload_round_candidates(kind, rows, nodes, held):
+def workload_round_candidates(kind, rows, nodes, held, job=None, successful=None):
     """Select the configured breadth/depth round before pressure scoring.
 
-    Train fills every eligible primary-pool GPU to depth one before packing a
-    second train, then visits the secondary train pool. Eval remains in the
+    Train fills every eligible GPU in server-priority order to depth one before
+    packing a second train anywhere in the train pool. Eval remains in the
     eval pool. There is no cross-pool execution fallback. Dependency artifacts
     may still relay from their producer pool to the consumer's permitted pool.
     Only candidates that already passed fit() participate, so an unhealthy or
@@ -46,7 +57,7 @@ def workload_round_candidates(kind, rows, nodes, held):
     """
     if kind not in ('train','eval'):
         return rows,lambda row:()
-    rows=[row for row in rows if workload_node_allowed(kind,row[1])]
+    rows=[row for row in rows if workload_node_allowed(kind,row[1],job,successful)]
     if not rows:return [],lambda row:()
     def depth(row):
         counts=[]
@@ -63,15 +74,9 @@ def workload_round_candidates(kind, rows, nodes, held):
             return (order.index(node_id),node_id)
         return (-nodes[node_id].get('admission_priority',0),node_id)
     if kind=='train':
-        primary=[row for row in rows if row[1] in TRAIN_DENSE_NODES and depth(row)<1]
-        if primary:
-            return primary,lambda row:(depth(row),)
-        primary=[row for row in rows if row[1] in TRAIN_DENSE_NODES and depth(row)<2]
-        if primary:
-            return primary,lambda row:(depth(row),)
-        secondary=[row for row in rows if row[1] in TRAIN_SECONDARY_NODES and depth(row)<1]
-        if secondary:
-            return secondary,lambda row:(depth(row),*rank(row))
+        coverage=[row for row in rows if row[1] in TRAIN_PREFERRED_NODES and depth(row)<1]
+        if coverage:
+            return coverage,lambda row:(depth(row),*rank(row))
     else:
         eval_pool=[row for row in rows if row[1] in EVAL_PREFERRED_NODES and depth(row)<1]
         if eval_pool:
@@ -285,6 +290,22 @@ def lineage_error(key, by_id, latest, lineage_cache):
     return reason
 
 
+def dependency_missing_for_node(spec, node_id, successful, nodes):
+    """Return the science dependencies not yet verified at one destination."""
+    missing=[]
+    for dep in (d for d in spec['depends_on'] if d not in spec.get('order_only_dependencies', [])):
+        a=successful.get(dep)
+        if a is None:
+            continue
+        same=(node_id == a['node'] or (not a.get('origin_retired')
+              and nodes.get(node_id, {}).get('storage_domain')
+              and nodes[node_id]['storage_domain'] == a['spec']['node_spec'].get('storage_domain')))
+        if same or node_id in a.get('artifact_locations', {}):
+            continue
+        missing.append(dep)
+    return missing
+
+
 def dependency_pool_candidates(spec, nodes, snapshots, held, history, successful, groups, now):
     """Return policy-selected hosts, including hosts needing only artifact relay.
 
@@ -321,11 +342,11 @@ def dependency_pool_candidates(spec, nodes, snapshots, held, history, successful
                 break
     if not rows:
         return None
-    preferred, _ = workload_round_candidates(spec['kind'], rows, nodes, held)
+    preferred, _ = workload_round_candidates(spec['kind'], rows, nodes, held, spec, successful)
     return {row[1]: missing_by_node[row[1]] for row in preferred}
 
 
-def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
+def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None, relay_intents=None):
     """Return simulated placements with reasons; never mutate runtime or launch jobs."""
     now = time.time() if now is None else now
     from .model_vram_policy import normalize
@@ -333,6 +354,7 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
     from .gpu_recovery import quarantine_snapshots
     snapshots = quarantine_snapshots(snapshots, attempts)
     by_id = {j["id"]: j for j in jobs}
+    relay_intents = relay_intents or {}
     active = [dict(a, admission_ram_mib=admission_ram(a, by_id.get(a.get('job'), {}), now),
                    admission_vram_mib=admission_vram(a, by_id.get(a.get('job'), {}), now))
               if a.get('job') in by_id else a
@@ -369,6 +391,17 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
         if waiting:
             plan.append({"job": j["id"], "decision": "blocked", "reason": "dependencies not successful: " + ", ".join(waiting)})
             continue
+        relay_intent=relay_intents.get(j['id'])
+        relay_destination=None
+        if relay_intent and relay_intent.get('state') == 'pending':
+            candidate=relay_intent.get('node')
+            if candidate in nodes and nodes[candidate].get('enabled') and (not spec['hosts'] or candidate in spec['hosts']):
+                missing=dependency_missing_for_node(spec,candidate,successful,nodes)
+                if missing:
+                    plan.append({'job': j['id'], 'decision': 'waiting',
+                                 'reasons': {candidate: 'dependency relay pending at reserved destination: ' + ', '.join(missing)}})
+                    continue
+                relay_destination=candidate
         relay_pool = dependency_pool_candidates(spec, nodes, snapshots, held, attempts,
                                                 successful, groups, now)
         if relay_pool and all(relay_pool.values()):
@@ -380,6 +413,9 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
         stabilizing = []
         for node_id, node in sorted(nodes.items()):
             reasons = []
+            if relay_destination and node_id != relay_destination:
+                failures[node_id] = ['dependency relay reserved destination: ' + relay_destination]
+                continue
             for index, resources in enumerate([spec['resources'], *spec.get('resource_variants', [])]):
                 from .hardware_resources import effective_resources
                 resources = effective_resources(spec, node, resources)
@@ -440,7 +476,8 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
                     "primary_train_pool":"GPU execution validation in progress; secondary pool held"}})
                 continue
         combined=[('ready',row) for row in candidates]+[('stabilizing',row) for row in stabilizing]
-        eligible,round_key=workload_round_candidates(spec['kind'],[row for _,row in combined],nodes,held)
+        eligible,round_key=workload_round_candidates(
+            spec['kind'],[row for _,row in combined],nodes,held,spec,successful)
         allowed={id(row) for row in eligible}
         combined=[item for item in combined if id(item[1]) in allowed]
         state,best=min(combined,key=lambda item:(*round_key(item[1]),*item[1][0]))
@@ -505,7 +542,7 @@ def fit(job, node, snap, held, history, successful, groups, now):
         return 'invalid execution profile', []
     p, req = node["policy"], job["resources"]
     if (req['gpu_count'] and job['kind'] in ('train','eval')
-            and not workload_node_allowed(job['kind'],node['id'])):
+            and not workload_node_allowed(job['kind'],node['id'],job,successful)):
         return ('workload pool restriction: '+job['kind']+' requires its '
                 +job['kind']+' pool'), []
     runtime_hold = node.get('labels', {}).get('gpu_runtime_quarantine', {})
@@ -565,11 +602,11 @@ def fit(job, node, snap, held, history, successful, groups, now):
             return "missing/unverified frozen asset: " + key, []
     # Dependency paths can only cross hosts in an explicitly shared storage domain.
     for dep in job["depends_on"]:
+        if dep in job.get("order_only_dependencies", []):
+            continue
         a = successful.get(dep)
         if a is None:
             return "missing successful dependency receipt: " + dep, []
-        if dep in job.get("order_only_dependencies", []):
-            continue
         if a.get('origin_retired') or (a["node"] != node["id"] and not (node["storage_domain"] and
                 a["spec"]["node_spec"]["storage_domain"] == node["storage_domain"])):
             if node['id'] not in a.get('artifact_locations', {}):

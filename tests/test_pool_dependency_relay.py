@@ -58,6 +58,22 @@ class PoolDependencyRelayTests(unittest.TestCase):
         self.assertIn('rp2', decision['reasons'])
         self.assertIn('producer', demand)
 
+    def test_pending_relay_pins_consumer_to_its_reserved_destination(self):
+        self.setup_case('train')
+        result=placements(list(self.jobs.values()), {'e':self.exp}, self.nodes,
+                          self.snaps, [self.producer], {}, self.now,
+                          relay_intents={'consumer':{'node':'rp2','state':'pending'}})
+        decision=next(row for row in result if row['job']=='consumer')
+        self.assertEqual(decision['decision'],'waiting')
+        self.assertEqual(list(decision['reasons']),['rp2'])
+        self.assertIn('reserved destination',decision['reasons']['rp2'])
+        self.producer['artifact_locations']={'rp2':{'root':'/verified'}}
+        result=placements(list(self.jobs.values()), {'e':self.exp}, self.nodes,
+                          self.snaps, [self.producer], {}, self.now,
+                          relay_intents={'consumer':{'node':'rp2','state':'pending'}})
+        decision=next(row for row in result if row['job']=='consumer')
+        self.assertEqual((decision['decision'],decision['node']),('ready','rp2'))
+
     def test_full_eval_gpu_slots_do_not_fallback_to_train_pool(self):
         self.setup_case()
         self.held = [reservation(self.nodes['lab4'], key='busy'+str(i), gpu=i) for i in range(2)]

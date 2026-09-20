@@ -186,6 +186,11 @@ class OverviewTests(unittest.TestCase):
         p=self.read_progress_fixture({'PROGRESS.json':dict(phase='w8a8',batches=2050,config='percentile')})
         self.assertEqual((p['phase'],p['batches'],p['config']),('w8a8',2050,'percentile'))
 
+    def test_root_eval_progress_exposes_image_cursor(self):
+        p=self.read_progress_fixture({'PROGRESS.json':dict(
+            phase='head_cache',completed_images=5064,planned_images=195244)})
+        self.assertEqual((p['completed_images'],p['planned_images']),(5064,195244))
+
     def test_eval_progress_contract_supplies_stable_denominator(self):
         p=self.read_progress_fixture({
             'PROGRESS.json':dict(phase='w8a8',batches=2050,config='percentile'),

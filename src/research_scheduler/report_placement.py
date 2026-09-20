@@ -6,6 +6,46 @@ import copy
 from .schema import check
 
 
+SAFE_REPORT_IMPORTS = {'json', 'gzip', 'os', 'pathlib', 'math', 'statistics', 'csv', 'collections',
+                       'itertools', 'datetime', 're', 'typing'}
+HOST_PATH_PREFIXES = ('/home/', '/data/', '/tmp/', '/opt/', '/workspace/', '/root/', '/usr/', '/var/')
+
+
+def portable_inline_report(job, argv):
+    """Whether an inline report needs no release working directory."""
+    if (job.get('input_files') or job.get('assets') or job.get('env')
+            or job.get('dataset') or job.get('dataset_path')):
+        return False
+    try:
+        index = argv.index('-c')
+    except (ValueError, AttributeError):
+        return False
+    if index + 2 != len(argv):
+        return False
+    try:
+        tree = ast.parse(argv[index + 1])
+    except (SyntaxError, TypeError):
+        return False
+    imports = {alias.name.split('.')[0] for item in ast.walk(tree)
+               if isinstance(item, ast.Import) for alias in item.names}
+    imports.update((item.module or '').split('.')[0] for item in ast.walk(tree)
+                   if isinstance(item, ast.ImportFrom))
+    if not imports <= SAFE_REPORT_IMPORTS:
+        return False
+    if any(isinstance(item, ast.Constant) and isinstance(item.value, str)
+           and item.value.startswith(HOST_PATH_PREFIXES) for item in ast.walk(tree)):
+        return False
+    def absolute_values(obj):
+        if isinstance(obj, str):
+            return obj.startswith('/')
+        if isinstance(obj, dict):
+            return any(absolute_values(v) for v in obj.values())
+        if isinstance(obj, list):
+            return any(absolute_values(v) for v in obj)
+        return False
+    return not absolute_values(job.get('config', {}))
+
+
 def is_report_job(job):
     metadata = job.get("metadata", {})
     return (job.get("kind") == "analysis" and (
@@ -29,6 +69,9 @@ def validate_report_policy(job):
               'LAB4 report profile must pin argv, cwd and resources')
         check(profile['resource_contract'] == job['resources'], 'report resource contract differs')
         check(job['resources']['gpu_count'] == 0, 'report is a CPU job')
+        if metadata.get('report_attempt_cwd'):
+            check(portable_inline_report(job, profile['argv']),
+                  'attempt-local report must be a self-contained inline report')
         return job
     exception = metadata.get("control_report_exception")
     if exception is not None:
@@ -67,34 +110,22 @@ def on_archive_host(job, node=None):
     profile = metadata.get('execution_profiles', {}).get('lab4')
     if profile is None:
         argv = value.get('argv', [])
-        check(len(argv) == 3 and argv[1] == '-c' and 'python' in argv[0].split('/')[-1]
-              and not value.get('input_files') and not value.get('assets')
-              and not value.get('env') and not value.get('dataset') and not value.get('dataset_path'),
+        check(portable_inline_report(value, argv),
               'report requires a prepared LAB4 runtime profile')
-        tree = ast.parse(argv[2])
-        safe = {'json', 'gzip', 'os', 'pathlib', 'math', 'statistics', 'csv', 'collections',
-                'itertools', 'datetime', 're', 'typing'}
-        imports = {alias.name.split('.')[0] for item in ast.walk(tree)
-                   if isinstance(item, ast.Import) for alias in item.names}
-        imports.update((item.module or '').split('.')[0] for item in ast.walk(tree)
-                       if isinstance(item, ast.ImportFrom))
-        check(imports <= safe, 'report requires a prepared LAB4 runtime profile')
-        check(not any(isinstance(item, ast.Constant) and isinstance(item.value, str)
-                      and item.value.startswith('/') for item in ast.walk(tree)),
-              'report contains host-local literals; prepare a LAB4 profile')
-        def absolute_values(obj):
-            if isinstance(obj, str):
-                return obj.startswith('/')
-            if isinstance(obj, dict):
-                return any(absolute_values(v) for v in obj.values())
-            if isinstance(obj, list):
-                return any(absolute_values(v) for v in obj)
-            return False
-        check(not absolute_values(value.get('config', {})),
-              'report inputs must use dependency placeholders or a LAB4 profile')
-        profile = dict(argv=[(node or {}).get('python', 'python3'), '-c', argv[2]],
+        index = argv.index('-c')
+        profile = dict(argv=[(node or {}).get('python', 'python3'), '-c', argv[index + 1]],
                        cwd=(node or {}).get('work_root', '/tmp'),
                        resource_contract=copy.deepcopy(value['resources']))
+    else:
+        profile = copy.deepcopy(profile)
+    if portable_inline_report(value, profile.get('argv', [])):
+        # The runner creates the attempt directory before launching the child.
+        # Inline reports consume only verified dependency paths, so a mutable or
+        # retired release directory must never be their launch prerequisite.
+        profile['cwd'] = (node or {}).get('work_root', profile['cwd'])
+        metadata['report_attempt_cwd'] = True
+    else:
+        metadata.pop('report_attempt_cwd', None)
     metadata.pop('control_report_exception', None)
     metadata.pop('report_execution_dependency', None)
     metadata.update(report_role='report', report_execution='archive_host',
@@ -102,6 +133,19 @@ def on_archive_host(job, node=None):
                     execution_profiles={'lab4': copy.deepcopy(profile)})
     value['hosts'] = ['lab4']
     return validate_report_policy(value)
+
+
+def attempt_cwd(job, attempt_dir):
+    """Resolve the launch cwd for an already validated report contract."""
+    if job.get('metadata', {}).get('report_attempt_cwd'):
+        # Registration validated portability before the per-node profile was
+        # overlaid.  The overlay may add runtime env paths; those do not make
+        # the inline program depend on its retired release cwd.
+        check(job.get('kind') == 'analysis'
+              and job.get('metadata', {}).get('report_execution') == 'archive_host',
+              'attempt-local cwd is restricted to archive-host reports')
+        return attempt_dir
+    return job['cwd']
 
 
 def on_dependency_host(job, dependency, profiles):

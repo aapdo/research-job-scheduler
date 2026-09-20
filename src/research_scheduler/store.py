@@ -59,10 +59,58 @@ class Store:
                 id TEXT PRIMARY KEY, attempt TEXT NOT NULL, node TEXT NOT NULL,
                 direction TEXT NOT NULL, status TEXT NOT NULL, spec TEXT NOT NULL,
                 report TEXT NOT NULL DEFAULT '{}', created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS relay_intents(
+                consumer_job TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+                node TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
+                updated REAL NOT NULL, last_transfer TEXT NOT NULL DEFAULT '');
+            CREATE TABLE IF NOT EXISTS attempt_archive_index(
+                attempt TEXT PRIMARY KEY REFERENCES attempts(id) ON DELETE CASCADE,
+                finished REAL NOT NULL, root TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT '');
+            CREATE TABLE IF NOT EXISTS scheduler_migrations(
+                name TEXT PRIMARY KEY, complete INTEGER NOT NULL DEFAULT 0);
+            INSERT OR IGNORE INTO scheduler_migrations(name,complete)
+                VALUES('attempt_archive_index_v1',0);
+            CREATE TRIGGER IF NOT EXISTS attempts_archive_index_insert
+            AFTER INSERT ON attempts
+            WHEN NEW.status IN ('succeeded','failed')
+            BEGIN
+                INSERT INTO attempt_archive_index(attempt,finished,root,kind)
+                VALUES(NEW.id,
+                       COALESCE(CAST(json_extract(NEW.report,'$.finished') AS REAL),NEW.created),
+                       COALESCE(json_extract(NEW.spec,'$.attempt_dir'),''),
+                       COALESCE(json_extract(NEW.spec,'$.job_spec.kind'),''))
+                ON CONFLICT(attempt) DO UPDATE SET
+                    finished=excluded.finished,root=excluded.root,kind=excluded.kind;
+            END;
+            CREATE TRIGGER IF NOT EXISTS attempts_archive_index_update
+            AFTER UPDATE OF status,spec,report ON attempts
+            WHEN NEW.status IN ('succeeded','failed')
+            BEGIN
+                INSERT INTO attempt_archive_index(attempt,finished,root,kind)
+                VALUES(NEW.id,
+                       COALESCE(CAST(json_extract(NEW.report,'$.finished') AS REAL),NEW.created),
+                       COALESCE(json_extract(NEW.spec,'$.attempt_dir'),''),
+                       COALESCE(json_extract(NEW.spec,'$.job_spec.kind'),''))
+                ON CONFLICT(attempt) DO UPDATE SET
+                    finished=excluded.finished,root=excluded.root,kind=excluded.kind;
+            END;
+            CREATE TRIGGER IF NOT EXISTS attempts_archive_index_delete_nonterminal
+            AFTER UPDATE OF status ON attempts
+            WHEN NEW.status NOT IN ('succeeded','failed')
+            BEGIN
+                DELETE FROM attempt_archive_index WHERE attempt=NEW.id;
+            END;
             CREATE INDEX IF NOT EXISTS attempts_status_job_idx ON attempts(status,job);
             CREATE INDEX IF NOT EXISTS attempts_created_job_idx ON attempts(created,job);
             CREATE INDEX IF NOT EXISTS artifact_transfers_attempt_status_created_idx
                 ON artifact_transfers(attempt,status,created);
+            CREATE INDEX IF NOT EXISTS artifact_transfers_attempt_direction_status_idx
+                ON artifact_transfers(attempt,direction,status);
+            CREATE INDEX IF NOT EXISTS relay_intents_state_node_idx
+                ON relay_intents(state,node);
+            CREATE INDEX IF NOT EXISTS attempt_archive_index_finished_idx
+                ON attempt_archive_index(finished,attempt);
         """)
         os.chmod(self.path, 0o600)
 

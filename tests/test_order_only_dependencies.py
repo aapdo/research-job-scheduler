@@ -21,6 +21,13 @@ class OrderOnlyDependenciesTests(unittest.TestCase):
         kwargs['statuses']['first']='failed'
         self.assertEqual(plan([job('first'),child],**kwargs)[0]['decision'],'blocked')
 
+    def test_completed_order_only_job_needs_no_attempt_receipt(self):
+        b=node(key='b');child=job('child',deps=['first'])
+        child['order_only_dependencies']=['first']
+        row=plan([job('first'),child],nodes={'b':b},snaps={'b':snapshot(b)},
+                 statuses={'first':'succeeded'})[0]
+        self.assertEqual(row['decision'],'ready')
+
     def test_order_only_cannot_reference_remote_artifact(self):
         child=job('child',deps=['first']);child['order_only_dependencies']=['first']
         for field,value in [('argv',['cat','{dep:first}/weights']),('config',{'nested':['{dep:first}']})]:
@@ -43,6 +50,17 @@ class OrderOnlyDependenciesTests(unittest.TestCase):
             r=Controller(s).request({'job':'child','node':'b','gpus':[]})
             self.assertEqual(r['input_files'],[])
             self.assertNotIn('/a/private',json.dumps(r['config']))
+            s.db.close()
+
+    def test_order_only_request_does_not_require_historical_attempt_row(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'state.db');s.register_node(node(key='b'))
+            first=job('first');child=job('child',deps=['first'])
+            child['order_only_dependencies']=['first']
+            s.register_experiment(experiment([first,child]))
+            with s.db:s.db.execute("UPDATE jobs SET status='succeeded' WHERE id='first'")
+            request=Controller(s).request({'job':'child','node':'b','gpus':[]})
+            self.assertEqual(request['input_files'],[])
             s.db.close()
 
 

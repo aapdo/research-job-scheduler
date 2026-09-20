@@ -69,5 +69,24 @@ class DatasetPreparationTests(unittest.TestCase):
     def test_existing_verified_replica_reused_without_prepare(self):self.run_case(reuse=True)
     def test_wrong_identity_never_overwritten_or_admitted(self):self.run_case(wrong=True)
 
+    def test_retired_replica_is_preserved_but_not_reconciled(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);store=Store(root/'db');n=node(str(root/'runs'));store.register_node(n)
+            j=job('consumer',gpu_count=0,vram=0);store.register_experiment(experiment([j]))
+            data=root/'retired-data'
+            catalog=dict(id='retired-demo',version='v1',identity_file='IDENTITY',
+                identity_sha256=hashlib.sha256(b'version1').hexdigest(),asset_name='',metadata_files=[],
+                replicas={'a':dict(path=str(data),cwd=str(root),prepare_argv=[sys.executable,'-c','pass'],
+                    verify_argv=[sys.executable,'-c','pass'],max_attempts=1)})
+            register(store,catalog)
+            with store.db:
+                store.db.execute("INSERT INTO dataset_preparations(dataset,node,job,state) VALUES(?,?,?,?)",
+                                 ('retired-demo','a','consumer','cancelled'))
+                store.db.execute("DELETE FROM nodes WHERE id='a'")
+            Controller(store,Probe()).tick(execute=True,refresh=False,warmup=False)
+            row=store.db.execute("SELECT state FROM dataset_preparations WHERE dataset='retired-demo'").fetchone()
+            self.assertEqual(row['state'],'cancelled')
+            store.db.close()
+
 
 if __name__=='__main__':unittest.main()

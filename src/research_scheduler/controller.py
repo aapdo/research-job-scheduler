@@ -200,9 +200,12 @@ class Controller:
         # not depend on the shared cold-start backend. fit() applies this fault
         # only when that particular job still has an effective startup group.
         nodes={key:dict(n,_blocked_startup_groups=blocked_groups) for key,n in nodes.items()}
+        relay_intents = {row['consumer_job']: dict(row) for row in self.store.db.execute(
+            "SELECT consumer_job,node,state,created,updated,last_transfer FROM relay_intents "
+            "WHERE state='pending'")}
         return placements(jobs, self.store.specs("experiments"), nodes,
                           snapshots, self._planning_attempts(jobs, groups, now) + reservations(self.store),
-                          groups, now)
+                          groups, now, relay_intents=relay_intents)
 
     def _planning_attempts(self, jobs, groups, now):
         """Load only attempts needed by live admission, lineage, and recent starts."""
@@ -455,6 +458,7 @@ class Controller:
         if profile and resources!=profile.get('resource_contract'):
             raise ValueError('placement differs from validated execution profile')
         spec=for_node(spec,node['id'])
+        resource_roots = {}
         if spec.get('metadata',{}).get('required_resources'):
             import copy
             from .resources import marker
@@ -464,6 +468,10 @@ class Controller:
                 if not asset or asset['sha256']!=m['sha256']:
                     raise ValueError('resource not verified on selected node: '+rid)
                 spec['input_files'].append(copy.deepcopy(asset))
+                marker_path = Path(asset['path'])
+                if marker_path.parent.name != '.resource-ready' or marker_path.name != rid:
+                    raise ValueError('resource marker path does not identify its replica root: '+rid)
+                resource_roots[rid] = str(marker_path.parent.parent)
         from .hardware_resources import effective_resources
         resources = effective_resources(spec, node, resources)
         if resources not in [effective_resources(spec, node, r) for r in [spec['resources'], *spec.get('resource_variants', [])]]:
@@ -487,15 +495,16 @@ class Controller:
         substitutions = {"{attempt_dir}": directory, "{config_path}": directory + "/config.json",
                          "{gpu_count}": str(len(placement["gpus"])), "{gpus}": ",".join(placement["gpus"]),
                          "{dataset_path}": dataset_path, "{filesystem}": filesystem}
+        substitutions.update({"{resource:" + rid + "}": root for rid, root in resource_roots.items()})
         inputs = list(spec["input_files"])
         for contract in spec.get("dataset_files", []):
             relative = PurePosixPath(contract["path"])
             inputs.append({"path": str(Path(dataset_path).joinpath(*relative.parts)),
                            "sha256": contract["sha256"]})
         for dep in spec["depends_on"]:
-            a = successful[dep]
             if dep in spec.get("order_only_dependencies", []):
                 continue
+            a = successful[dep]
             cached = a.get('artifact_locations', {}).get(node['id'])
             local = not a.get('origin_retired') and (a['node'] == node['id'] or (node['storage_domain'] and
                     a['spec']['node_spec']['storage_domain'] == node['storage_domain']))
@@ -522,6 +531,8 @@ class Controller:
                 value = value.replace(key, replacement)
             if "{dep:" in value:
                 raise ValueError("unresolved dependency placeholder: " + value)
+            if "{resource:" in value:
+                raise ValueError("unresolved resource placeholder: " + value)
             return value
 
         def expand_config(value):
@@ -534,10 +545,11 @@ class Controller:
             return value
 
         from .startup import startup_group
+        from .report_placement import attempt_cwd
         request = dict(id=attempt_id, job=job["id"], experiment=job["experiment"],
                        experiment_spec=context['experiments'][job['experiment']],
                        job_spec=spec, node_spec=node, attempt_dir=directory,
-                       argv=[expand(v) for v in spec["argv"]], cwd=expand(spec["cwd"]),
+                       argv=[expand(v) for v in spec["argv"]], cwd=expand(attempt_cwd(spec,directory)),
                        env={k: expand(v) for k, v in spec["env"].items()}, config=expand_config(spec["config"]),
                        dataset=dataset, dataset_path=dataset_path,
                        filesystem_request=filesystem_request, filesystem=filesystem,

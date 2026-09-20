@@ -91,9 +91,22 @@ LAB4 archive가 완전하게 검증된 뒤에도 바로 삭제하지 않는다. 
 `artifact_runtime/CLEANUP.json`에 기록한다. 삭제 RPC가 느려도 전송 큐는 다음 요청을 처리할 수 있다.
 별도 서비스는 전송 처리만 하며 모델 배정·GPU probe·실험 등록을 수행하지 않는다. 전송 계획 계산에는
 공용 잠금을 사용하므로 DB 계산 자체의 비용은 여전히 측정 대상이다.
+transfer lane은 주기 후 최소 5초, cleanup lane은 최소 30초 양보하며 `registry_wait_s`와
+`registry_locked_s`를 별도로 기록해 잠금 대기와 실제 점유를 구분한다.
+완료 transfer의 대형 file map은 계획 스캔에서 제외하고 실제 소비 attempt를 읽을 때만 receipt를 해석한다.
 HF 비활성 상태에서는 전송 계획이 queued 작업·직접 선행·활성 attempt의 작업 profile만 읽는다.
+terminal attempt의 `finished`, `attempt_dir`, `kind`는 `attempt_archive_index`에 상태 전이 시 한 번만
+materialize한다. 기존 DB는 `attempt_archive_index_v1` migration을 한 번 수행하고, 이후 trigger가
+인덱스를 갱신한다. archive 후보 선택은 이 인덱스를 사용하며 전체 attempt report/spec JSON을 반복
+역직렬화하지 않는다. HF 비활성 주기에는 활성 transfer만 일괄 조회하고, 실패 재시도 이력은 실제
+dependency relay 후보에 대해서만 조회한다.
+dependency relay는 전역 및 목적지별 최대 24개이며 같은 attempt→destination 중복은 금지한다.
+archive는 별도 8개 lane을 사용한다. FARM↔LAB dependency는 controller-local bounded
+staging을 사용하고 검증 성공 후 staging을 삭제한다. 그 외 dependency 전송은 제어 머신
+disk copy 없는 direct stream을 사용한다. 다중 파일 dependency와 FARM attempt archive는 무압축 tar
+stream/단일 tar staging으로 전달하며 목적지에서 안전 해제 후 per-file SHA manifest를 전부 검증한다.
 종료된 전송은 worker 실행 코드(argv)를 제외하고 조회한다. 목표 주기를 초과하더라도 다음 전송 주기
-전에 최소 1초를 양보하며, controller는 짧은 registry 경합을 최대 15초 기다린다.
+전에 최소 5초를 양보하며, controller는 짧은 registry 경합을 최대 15초 기다린다.
 
 원복 시에는 먼저 artifact 서비스를 중지하고 공용 registry 잠금 아래 `artifact_service_config.enabled=0`으로
 바꾼다. 새 controller는 그때만 artifact tick을 재개한다. 서비스 장애를 이유로 DB나 두 번째 모델
@@ -103,5 +116,6 @@ controller를 생성하지 않는다.
 
 새 report는 LAB4에서 작성한다. `report_placement.on_archive_host()` 또는 공용 등록의 자동 변환을 통해
 `report_execution=archive_host`와 LAB4 실행 profile을 고정한다. 기존 producer-host 정책은 이전 frozen
-attempt의 해석을 위해 남기며 신규 등록 정책은 LAB4를 따른다. LAB4 profile이 없는 비표준 runtime은
-다른 host로 fallback하지 않고 명시적 준비를 요구한다.
+attempt의 해석을 위해 남기며 신규 등록 정책은 LAB4를 따른다. self-contained inline report는 생성된
+attempt 디렉터리를 cwd로 사용하고 dependency receipt만 입력으로 삼는다. LAB4 profile이 없는 비표준
+runtime은 다른 host로 fallback하지 않고 명시적 준비를 요구한다.

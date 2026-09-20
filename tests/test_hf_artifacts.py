@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'src'))
 from research_scheduler import agent, hf_worker, relay_worker
 from research_scheduler.artifacts import (hf_spec, campaign_for, tick, reservations,
     publication_summary, cleanup_archived_sources, start_attempt_archive,
-    urgent_archive_destination_staging)
+    urgent_archive_destination_staging, rows)
 from research_scheduler.notifications import register_campaign
 from research_scheduler.controller import Controller
 from research_scheduler.store import Store, dumps
@@ -243,8 +243,9 @@ class LocalRelayWorkerTests(unittest.TestCase):
             s=Store(Path(root)/'db')
             farm=node(root=str(Path(root)/'farm'),key='farm9-gui2');farm.update(transport='ssh',target='farm9')
             lab4=node(root=str(Path(root)/'lab4'),key='lab4');lab4.update(transport='ssh',target='lab4')
+            cps1=node(root=str(Path(root)/'cps1'),key='cps1-model');cps1.update(transport='ssh',target='cps1')
             relay=node(root=str(Path(root)/'relay'),key='resource-control')
-            for n in (farm,lab4,relay):s.register_node(n)
+            for n in (farm,lab4,cps1,relay):s.register_node(n)
             class Capture:
                 def __init__(self):self.requests=[]
                 def call(self,node,action,request):self.requests.append((node,action,request));return {'status':'starting'}
@@ -255,7 +256,8 @@ class LocalRelayWorkerTests(unittest.TestCase):
             start_attempt_archive(controller,attempt,farm,lab4,['campaign-a','campaign-b'])
             config=json.loads(s.db.execute(
                 "SELECT spec FROM artifact_transfers WHERE direction='archive'").fetchone()[0])['config']
-            self.assertEqual(config['transport_route'],'controller-local-staging')
+            self.assertEqual(config['transport_route'],'cps1-staging')
+            self.assertEqual(config['staging_target'],'cps1')
             self.assertTrue(config['destination_root'].endswith(
                 '/attempt-archive/campaign-a/experiment/job/attempt.done'))
             self.assertEqual(config['campaigns'],['campaign-a','campaign-b'])
@@ -304,6 +306,23 @@ class LocalRelayWorkerTests(unittest.TestCase):
 
 
 class ReservationReadTests(unittest.TestCase):
+    def test_compact_terminal_transfer_omits_large_file_maps(self):
+        with tempfile.TemporaryDirectory() as root:
+            store=Store(Path(root)/'db')
+            huge={'x'+str(i):{'bytes':i,'sha256':'a'*64} for i in range(100)}
+            with store.db:
+                store.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',(
+                    'done','attempt','lab4','download','succeeded',
+                    dumps({'argv':['large'], 'config':{'files':huge,'repair_revision':'r1'}}),
+                    dumps({'artifact':{'root':'/archive','files':huge}}),1))
+            item=rows(store,compact=True)[0]
+            self.assertNotIn('files',item['spec']['config'])
+            self.assertEqual(item['spec']['config']['repair_revision'],'r1')
+            self.assertNotIn('files',item['report']['artifact'])
+            self.assertEqual(item['report']['artifact']['root'],'/archive')
+            self.assertEqual(rows(store,compact=True,active_only=True),[])
+            store.db.close()
+
     def test_terminal_transfer_requests_are_not_decoded(self):
         db=sqlite3.connect(':memory:');db.row_factory=sqlite3.Row
         try:

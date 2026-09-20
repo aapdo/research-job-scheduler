@@ -60,9 +60,18 @@ def tick(controller,execute=False):
     catalogs={r['id']:json.loads(r['spec']) for r in store.db.execute('SELECT * FROM dataset_catalog')}
     if not catalogs:return
     jobs={j['id']:j for j in store.jobs()};nodes=store.specs('nodes')
-    pending=store.db.execute("SELECT * FROM dataset_preparations WHERE state!='ready'").fetchall()
+    # Retired nodes keep their preparation rows as audit history.  A cancelled
+    # historical row must not be reconciled against the current node registry.
+    pending=store.db.execute(
+        "SELECT * FROM dataset_preparations WHERE state NOT IN ('ready','cancelled')").fetchall()
     successful={a['job']:a for a in store.attempts(job_ids={r['job'] for r in pending}) if a['status']=='succeeded'}
     for row in pending:
+        if row['node'] not in nodes or row['job'] not in jobs:
+            with store.db:
+                store.db.execute("UPDATE dataset_preparations SET state='cancelled' "
+                                 "WHERE dataset=? AND node=?",(row['dataset'],row['node']))
+                store.event('dataset_preparation_retired',row['dataset'],dict(node=row['node']))
+            continue
         j=jobs[row['job']];state=j['status']
         if state=='succeeded':
             a=successful[j['id']]
@@ -94,7 +103,10 @@ def tick(controller,execute=False):
         count=sum(jobs[r['job']]['status'] in (*ACTIVE,'queued') for r in records.values() if r['dataset']==c['id'])
         for node_id,recipe in c['replicas'].items():
             if count>=c['max_parallel_prepares']:break
-            n=nodes[node_id]
+            # Immutable catalogs can outlive a retired executor.  Preserve the
+            # catalog contract, but only prepare replicas on current nodes.
+            n=nodes.get(node_id)
+            if n is None:continue
             if not n['enabled'] or (c['id'],node_id) in records:continue
             consumers=[j for j in jobs.values() if j['status']=='queued' and j['spec'].get('dataset')==c['id']
                        and (not j['spec']['hosts'] or node_id in j['spec']['hosts'])

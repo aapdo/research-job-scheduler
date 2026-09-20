@@ -19,11 +19,12 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(server.gpu_pool('lab1'),('train',5))
         self.assertEqual(server.gpu_pool('farm6'),('train',7))
         self.assertEqual(server.gpu_pool('farm7'),('train',8))
+        self.assertEqual(server.gpu_pool('lab3'),('train',9))
         self.assertEqual(server.gpu_pool('rp1'),('other',999))
         self.assertEqual(server.gpu_pool('rp3'),('other',999))
         self.assertEqual(server.gpu_pool('farm1'),('other',999))
         self.assertEqual(server.gpu_pool('lab2'),('eval',1))
-        self.assertEqual(server.gpu_pool('lab6'),('eval',5))
+        self.assertEqual(server.gpu_pool('lab6'),('eval',4))
 
     def test_dashboard_compact_gzip_preserves_campaign_details(self):
         import gzip

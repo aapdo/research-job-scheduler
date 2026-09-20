@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from research_scheduler.report_placement import (
-    on_dependency_host, required_dependency_host, validate_report_policy,
+    attempt_cwd, on_archive_host, on_dependency_host, required_dependency_host, validate_report_policy,
 )
 from research_scheduler.schema import experiment_spec
 from research_scheduler.store import Store
@@ -69,6 +69,32 @@ class ReportPlacementTests(unittest.TestCase):
                     store.register_experiment(dict(id="fixed", name="fixed", rq="fixed", jobs=[fixed]))
             finally:
                 store.db.close()
+
+    def test_existing_portable_lab4_profile_uses_attempt_directory(self):
+        value = report({"execution_profiles": {"lab4": profile("/retired/release")}}, hosts=["lab4"])
+        fixed = on_archive_host(value, {"python": "/lab4/python", "work_root": "/lab4/runs"})
+        self.assertTrue(fixed["metadata"]["report_attempt_cwd"])
+        self.assertEqual(fixed["metadata"]["execution_profiles"]["lab4"]["cwd"], "/lab4/runs")
+        self.assertEqual(attempt_cwd(fixed, "/lab4/runs/attempts/report.1"),
+                         "/lab4/runs/attempts/report.1")
+        resolved = copy.deepcopy(fixed)
+        resolved.setdefault("env", {})["LD_LIBRARY_PATH"] = "/lab4/runtime/lib"
+        self.assertEqual(attempt_cwd(resolved, "/lab4/runs/attempts/report.2"),
+                         "/lab4/runs/attempts/report.2")
+
+    def test_label_suffix_is_not_mistaken_for_a_host_path(self):
+        value = report({"execution_profiles": {"lab4": {
+            **profile("/retired/release"),
+            "argv": ["/lab4/python", "-c", "label='x/int8/e5'; print(label.endswith('/int8/e5'))"],
+        }}}, hosts=["lab4"])
+        fixed = on_archive_host(value, {"python": "/lab4/python", "work_root": "/lab4/runs"})
+        self.assertTrue(fixed["metadata"]["report_attempt_cwd"])
+
+    def test_inline_host_path_requires_a_prepared_profile(self):
+        value = report(hosts=["lab4"])
+        value["argv"] = ["python3", "-c", "from pathlib import Path; print(Path('/home/jy/input'))"]
+        with self.assertRaisesRegex(ValueError, "LAB4 runtime profile"):
+            on_archive_host(value, {"python": "/lab4/python", "work_root": "/lab4/runs"})
 
 
 if __name__ == "__main__":

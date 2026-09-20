@@ -45,13 +45,18 @@ def hf_spec(raw):
     return h
 
 
-def rows(store, compact=False):
+def rows(store, compact=False, active_only=False):
     if compact:
+        where = (" WHERE status IN ('starting','running','unknown')"
+                 if active_only else '')
         return [dict(r, spec=json.loads(r['spec']), report=json.loads(r['report']))
                 for r in store.db.execute(
-                    "SELECT id,attempt,node,direction,status,created,report,CASE WHEN status IN "
-                    "('starting','running','unknown') THEN spec ELSE json_remove(spec,'$.argv') END AS spec "
-                    "FROM artifact_transfers ORDER BY created")]
+                    "SELECT id,attempt,node,direction,status,created,"
+                    "CASE WHEN status IN ('starting','running','unknown') THEN report "
+                    "ELSE json_remove(report,'$.artifact.files') END AS report,"
+                    "CASE WHEN status IN ('starting','running','unknown') THEN spec "
+                    "ELSE json_remove(spec,'$.argv','$.config.files') END AS spec "
+                    "FROM artifact_transfers" + where + " ORDER BY created")]
     return [dict(r, spec=json.loads(r['spec']), report=json.loads(r['report']))
             for r in store.db.execute('SELECT * FROM artifact_transfers ORDER BY created')]
 
@@ -63,6 +68,12 @@ def reservations(store):
     query='SELECT * FROM artifact_transfers WHERE status IN ('+','.join('?' for _ in states)+') ORDER BY created'
     return [dict(r, spec=json.loads(r['spec']), report=json.loads(r['report']), released=False)
             for r in store.db.execute(query, states)]
+
+
+def dependency_relay_available(live, attempt_id, node_id, limit=24):
+    """Allow distinct artifacts to share a destination, never duplicate one."""
+    rows = [r for r in live if r['direction'] != 'archive' and r['node'] == node_id]
+    return len(rows) < limit and not any(r['attempt'] == attempt_id for r in rows)
 
 
 def campaign_for(experiment, campaigns):
@@ -122,11 +133,27 @@ def upload_pause(config, transfers, campaigns, now=None):
     return now-last < interval
 
 
-def start(controller, attempt, node, direction, config):
+def _reserve_relay_intent(store, consumer_job, node_id, transfer_id):
+    if not consumer_job:
+        return
+    now=time.time()
+    existing=store.db.execute("SELECT node,state FROM relay_intents WHERE consumer_job=?", (consumer_job,)).fetchone()
+    if existing and existing['state']=='pending' and existing['node'] != node_id:
+        return False
+    store.db.execute(
+        "INSERT INTO relay_intents(consumer_job,node,state,created,updated,last_transfer) VALUES(?,?, 'pending',?,?,?) "
+        "ON CONFLICT(consumer_job) DO UPDATE SET node=excluded.node,state='pending',updated=excluded.updated,last_transfer=excluded.last_transfer",
+        (consumer_job,node_id,now,now,transfer_id))
+    return True
+
+
+def start(controller, attempt, node, direction, config, consumer_job=None):
     store = controller.store
     key = 'hf-' + uuid.uuid4().hex
     directory = str(Path(node['work_root'], 'artifact-transfers', key))
     config = dict(config, direction=direction, token_file=node['hf'].get('token_file', ''))
+    if consumer_job:
+        config['consumer_job']=consumer_job
     if direction == 'download':
         config['destination'] = directory + '/payload'
     request = dict(id=key, job=attempt['job'], node_spec=node, attempt_dir=directory,
@@ -140,6 +167,8 @@ def start(controller, attempt, node, direction, config):
     request['runner_sha256'] = hashlib.sha256(Path(agent.__file__).read_bytes()).hexdigest()
     request['spec_sha256'] = hashlib.sha256(dumps(request).encode()).hexdigest()
     with store.db:
+        if direction == 'download' and not _reserve_relay_intent(store, consumer_job, node['id'], key):
+            return None
         store.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
                          (key, attempt['id'], node['id'], direction, 'starting', dumps(request), '{}', time.time()))
         store.event('artifact_transfer_reserved', key, dict(attempt=attempt['id'], node=node['id'], direction=direction))
@@ -150,7 +179,27 @@ def start(controller, attempt, node, direction, config):
     return key
 
 
-def start_local_relay(controller, attempt, source_node, destination_node, source_receipt=None):
+def dependency_relay_route(source_node, destination_node):
+    """Choose a topology-safe dependency transfer route.
+
+    FARM and LAB cannot initiate connections to each other, so that boundary
+    uses bounded controller-local staging. Other node pairs are streamed
+    through the controller without a local disk copy; this uses the controller's
+    already verified SSH identities and does not require peer SSH configuration.
+    """
+    source = source_node['id'].lower()
+    destination = destination_node['id'].lower()
+    source_zone = 'farm' if source.startswith('farm') else 'lab' if source.startswith('lab') else 'other'
+    destination_zone = ('farm' if destination.startswith('farm') else
+                        'lab' if destination.startswith('lab') else 'other')
+    if {source_zone, destination_zone} == {'farm', 'lab'}:
+        return 'controller-local-staging'
+    if source_node['id'] == destination_node['id']:
+        return 'lab4-local' if destination_node['id'] == 'lab4' else 'direct-stream'
+    return 'direct-stream'
+
+
+def start_local_relay(controller, attempt, source_node, destination_node, source_receipt=None, consumer_job=None):
     """Stage declared dependency outputs/artifacts through a bounded local relay."""
     store = controller.store
     relay_node = store.specs('nodes').get('resource-control')
@@ -188,14 +237,15 @@ def start_local_relay(controller, attempt, source_node, destination_node, source
     key = 'relay-' + uuid.uuid4().hex
     directory = str(Path(relay_node['work_root'], 'artifact-transfers', key))
     destination = str(Path(destination_node['work_root'], 'artifact-relays', key, 'payload'))
+    route = dependency_relay_route(source_node, destination_node)
     config = dict(source_attempt=attempt['id'], source_target=(source_node['target']
                   if source_node['transport'] == 'ssh' else '@local'), source_root=str(source_root),
                   destination_target=(destination_node['target']
                   if destination_node['transport'] == 'ssh' else '@local'),
-                  destination_root=destination, files=files, manifest_sha256=manifest_sha)
-    if destination_node['id'] == 'lab4' and not source_node['id'].lower().startswith('farm'):
-        config['transport_route'] = ('lab4-local' if source_node['id'] == 'lab4' else
-                                     'direct-stream' if source_node['transport'] == 'local' else 'server-direct')
+                  destination_root=destination, files=files, manifest_sha256=manifest_sha,
+                  transport_route=route, consumer_job=consumer_job)
+    if route == 'controller-local-staging':
+        config['controller_min_free_bytes']=relay_node['policy']['min_free_disk_mib'] * 1024**2
     request = dict(id=key, job=attempt['job'], node_spec=relay_node, attempt_dir=directory,
                    argv=[relay_node['python'], '-c', Path(relay_worker.__file__).read_text()],
                    cwd=directory, env={}, config=config, input_files=[], outputs=['HF_RECEIPT.json'],
@@ -204,6 +254,8 @@ def start_local_relay(controller, attempt, source_node, destination_node, source
     request['runner_sha256'] = hashlib.sha256(Path(agent.__file__).read_bytes()).hexdigest()
     request['spec_sha256'] = hashlib.sha256(dumps(request).encode()).hexdigest()
     with store.db:
+        if not _reserve_relay_intent(store, consumer_job, destination_node['id'], key):
+            return None
         store.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
                          (key, attempt['id'], destination_node['id'], 'download', 'starting',
                           dumps(request), '{}', time.time()))
@@ -234,7 +286,7 @@ def start_attempt_archive(controller, attempt, source_node, archive_node, campai
     primary_campaign = campaign_ids[0]
     destination = str(Path(archive_node['work_root'], 'attempt-archive', primary_campaign,
                            experiment, attempt['job'], attempt['id']))
-    route = ('controller-local-staging' if source_node['id'].lower().startswith('farm')
+    route = ('cps1-staging' if source_node['id'].lower().startswith('farm')
              else 'lab4-local' if source_node['id'] == archive_node['id']
              else 'direct-stream' if source_node['transport'] == 'local' else 'server-direct')
     config = dict(mode='attempt-archive', source_attempt=attempt['id'],
@@ -247,6 +299,14 @@ def start_attempt_archive(controller, attempt, source_node, archive_node, campai
                   campaigns=campaign_ids, experiment=experiment, job=attempt['job'],
                   destination_min_free_bytes=archive_node['policy']['min_free_disk_mib'] * 1024**2,
                   controller_min_free_bytes=relay_node['policy']['min_free_disk_mib'] * 1024**2)
+    if route == 'cps1-staging':
+        staging_node = store.specs('nodes').get('cps1-model')
+        check(staging_node is not None and staging_node.get('enabled')
+              and staging_node.get('transport') == 'ssh',
+              'CPS1 archive staging node is unavailable')
+        config.update(staging_target=staging_node['target'],
+                      staging_root=str(Path(staging_node['work_root'], 'artifact-relay-staging', key)),
+                      staging_min_free_bytes=staging_node['policy']['min_free_disk_mib'] * 1024**2)
     request = dict(id=key, job=attempt['job'], node_spec=relay_node, attempt_dir=directory,
                    argv=[relay_node['python'], '-c', Path(relay_worker.__file__).read_text()],
                    cwd=directory, env={}, config=config, input_files=[], outputs=['HF_RECEIPT.json'],
@@ -337,6 +397,28 @@ def attempt_archive_policy(store):
                 experiment_campaigns=experiment_campaigns)
 
 
+def ensure_attempt_archive_index(store):
+    """Backfill terminal-attempt archive metadata once; triggers keep it current."""
+    row = store.db.execute(
+        "SELECT complete FROM scheduler_migrations WHERE name='attempt_archive_index_v1'"
+    ).fetchone()
+    if row and row[0]:
+        return False
+    with store.db:
+        store.db.execute(
+            "INSERT OR REPLACE INTO attempt_archive_index(attempt,finished,root,kind) "
+            "SELECT id,COALESCE(CAST(json_extract(report,'$.finished') AS REAL),created),"
+            "COALESCE(json_extract(spec,'$.attempt_dir'),''),"
+            "COALESCE(json_extract(spec,'$.job_spec.kind'),'') FROM attempts "
+            "WHERE status IN ('succeeded','failed')")
+        store.db.execute(
+            "UPDATE scheduler_migrations SET complete=1 "
+            "WHERE name='attempt_archive_index_v1'")
+        store.event('attempt_archive_index_backfilled', 'attempt_archive_index_v1', {
+            'rows': store.db.execute('SELECT count(*) FROM attempt_archive_index').fetchone()[0]})
+    return True
+
+
 def urgent_archive_destination_staging(store, archive_node_id):
     """Prioritize explicitly LAB4-hosted report inputs over more archives."""
     for row in store.db.execute("SELECT id,spec FROM jobs WHERE status='queued' ORDER BY id"):
@@ -372,9 +454,11 @@ def archive_source_in_use(store, root, idle_s):
     """Recheck live references under the registry lock after an unlocked RPC."""
     cutoff = time.time() - idle_s
     queries = [
-        ("SELECT json_remove(spec,'$.experiment_spec') FROM attempts WHERE status IN "
-         "('starting','running','unknown') OR created>=? OR "
-         "COALESCE(json_extract(report,'$.finished'),0)>=?", (cutoff, cutoff)),
+        ("SELECT json_remove(spec,'$.experiment_spec') FROM attempts "
+         "WHERE status IN ('starting','running','unknown') UNION "
+         "SELECT json_remove(spec,'$.experiment_spec') FROM attempts WHERE created>=? UNION "
+         "SELECT json_remove(a.spec,'$.experiment_spec') FROM attempt_archive_index i "
+         "JOIN attempts a ON a.id=i.attempt WHERE i.finished>=?", (cutoff, cutoff)),
         ("SELECT spec FROM artifact_transfers WHERE status IN ('starting','running','unknown') "
          "OR created>=? OR COALESCE(json_extract(report,'$.finished'),0)>=?", (cutoff, cutoff)),
         ("SELECT spec FROM jobs WHERE status='queued'", ()),
@@ -389,8 +473,11 @@ def cleanup_archived_sources(controller, nodes, policy):
     store = controller.store
     cutoff = time.time() - policy['delete_after_idle_s']
     protected_specs = [json.loads(r['spec']) for r in store.db.execute(
-        "SELECT json_remove(spec,'$.experiment_spec') AS spec FROM attempts WHERE status IN ('starting','running','unknown') "
-        "OR created>=? OR COALESCE(json_extract(report,'$.finished'),0)>=?", (cutoff, cutoff))]
+        "SELECT json_remove(spec,'$.experiment_spec') AS spec FROM attempts "
+        "WHERE status IN ('starting','running','unknown') UNION "
+        "SELECT json_remove(spec,'$.experiment_spec') AS spec FROM attempts WHERE created>=? UNION "
+        "SELECT json_remove(a.spec,'$.experiment_spec') AS spec FROM attempt_archive_index i "
+        "JOIN attempts a ON a.id=i.attempt WHERE i.finished>=?", (cutoff, cutoff))]
     protected_transfers = [json.loads(r['spec']) for r in store.db.execute(
         "SELECT spec FROM artifact_transfers WHERE status IN ('starting','running','unknown') "
         "OR created>=? OR COALESCE(json_extract(report,'$.finished'),0)>=?", (cutoff, cutoff))]
@@ -492,8 +579,10 @@ def start_pending_attempt_archive(controller, nodes, snapshots, health, live, po
     cutoff = time.time() - policy['delete_after_idle_s']
     protected = [json.loads(r[0]) for r in store.db.execute(
         "SELECT json_remove(spec,'$.experiment_spec') FROM attempts "
-        "WHERE status IN ('starting','running','unknown') OR created>=? "
-        "OR COALESCE(json_extract(report,'$.finished'),0)>=?", (cutoff, cutoff))]
+        "WHERE status IN ('starting','running','unknown') UNION "
+        "SELECT json_remove(spec,'$.experiment_spec') FROM attempts WHERE created>=? UNION "
+        "SELECT json_remove(a.spec,'$.experiment_spec') FROM attempt_archive_index i "
+        "JOIN attempts a ON a.id=i.attempt WHERE i.finished>=?", (cutoff, cutoff))]
     protected.extend(json.loads(r[0]) for r in store.db.execute(
         "SELECT spec FROM artifact_transfers WHERE status IN ('starting','running','unknown') "
         "OR created>=? OR COALESCE(json_extract(report,'$.finished'),0)>=?", (cutoff, cutoff)))
@@ -503,13 +592,14 @@ def start_pending_attempt_archive(controller, nodes, snapshots, health, live, po
         'WHEN ? THEN ' + str(index) for index, _ in enumerate(backfill_nodes))
         + " ELSE " + str(len(backfill_nodes)) + " END," if backfill_nodes else '')
     candidates = store.db.execute(
-        "SELECT a.id,a.node,j.experiment AS experiment_id,json_extract(a.spec,'$.attempt_dir') AS root "
-        "FROM attempts a JOIN jobs j ON j.id=a.job "
+        "SELECT a.id,a.node,j.experiment AS experiment_id,i.root "
+        "FROM attempt_archive_index i JOIN attempts a ON a.id=i.attempt "
+        "JOIN jobs j ON j.id=a.job "
         "WHERE a.status IN ('succeeded','failed') AND (j.experiment IN ("
         + ','.join('?' for _ in backfill) + ")" + node_selection
-        + " OR a.created>=? OR json_extract(a.report,'$.finished')>=?) "
-        "AND COALESCE(json_extract(a.spec,'$.job_spec.kind'),'') NOT IN ('rtl_sim','rtl_build','rtl_ooc','board_test') "
-        "AND COALESCE(json_extract(a.report,'$.finished'),a.created)<? "
+        + " OR a.created>=? OR i.finished>=?) "
+        "AND i.kind NOT IN ('rtl_sim','rtl_build','rtl_ooc','board_test') "
+        "AND i.finished<? "
         "AND NOT EXISTS (SELECT 1 FROM artifact_transfers t "
         "WHERE t.attempt=a.id AND t.direction='archive' AND t.status IN "
         "('starting','running','unknown','succeeded')) ORDER BY " + node_order + "a.created",
@@ -632,41 +722,59 @@ def runnable_stage_demand(queued, jobs, experiments, nodes, snapshots, attempts,
 
 
 def reserve_transfer_slots(live, start_dependency, start_archive, archive_urgent=False,
-                           refresh_live=None):
-    """Fill the two transfer slots without letting retention starve consumers.
+                           refresh_live=None, max_total=32, max_dependency=24, max_archive=8):
+    """Fill bounded transfer capacity while reserving eight archive lanes.
 
-    Dependency staging owns at most one slot and is considered first. Complete
-    attempt archival owns at most one other slot. This keeps retention moving
-    without allowing a continuously non-empty archive backlog to return before
-    the runnable-successor path on every controller cycle.
+    Dependency staging is considered first and may use up to 24 slots.
+    Complete attempt archival owns at most eight separate slots. The dependency
+    cap remains 24 even when archive candidates are temporarily absent.
     """
     live = list(live)
     launched = []
-    if len(live) >= 2:
+    if max_total <= 0 or len(live) >= max_total:
         return launched
-    if not any(t['direction'] != 'archive' for t in live):
+    def include_reserved(current, key, direction):
+        refreshed = list(refresh_live()) if refresh_live else []
+        if any(t.get('id') == key for t in refreshed):
+            return refreshed
+        base = refreshed if refresh_live else current
+        return [*base, {'id': key, 'node': '', 'direction': direction, 'status': 'starting'}]
+    archive_limit=min(max_archive, max(0, max_total-max_dependency))
+    dependency_limit = min(max_dependency, max_total if archive_urgent else max(0, max_total - archive_limit))
+    while (len(live) < max_total
+           and sum(t['direction'] != 'archive' for t in live) < dependency_limit):
         key = start_dependency(live)
-        if key:
-            launched.append(key)
-            live = (list(refresh_live()) if refresh_live else
-                    [*live, {'id': key, 'node': '', 'direction': 'download', 'status': 'starting'}])
-    if (len(live) < 2 and not archive_urgent
-            and not any(t['direction'] == 'archive' for t in live)):
+        if not key:
+            break
+        launched.append(key)
+        live = include_reserved(live, key, 'download')
+    archive_count=sum(t['direction'] == 'archive' for t in live)
+    while len(live) < max_total and not archive_urgent and archive_count < archive_limit:
         key = start_archive(live)
-        if key:
-            launched.append(key)
+        if not key:break
+        launched.append(key)
+        live = include_reserved(live, key, 'archive')
+        archive_count += 1
     return launched
 
 
 def tick(controller, execute):
-    """Called with scheduler lock. At most two cluster transfers, one per node."""
+    """Called with scheduler lock. Ten dependency relays plus one archive lane."""
     from .notifications import campaign_specs, campaign_processing_due
-    from .planner import base_health, fit, dependency_priorities
+    from .planner import base_health, fit, dependency_priorities, dependency_missing_for_node
     store = controller.store
+    phase_times = {}; phase_started = time.monotonic()
+    def mark(name):
+        nonlocal phase_started
+        now=time.monotonic();phase_times[name]=round(now-phase_started,4);phase_started=now
+        controller.artifact_phase_times=phase_times
     campaigns = {key:value for key,value in campaign_specs(store).items()
                  if campaign_processing_due(store,value)}
     health = controller.node_health()
-    transfers = rows(store, compact=True)
+    mark('campaigns_health_s')
+    hf_enabled = any(c.get('hf', {}).get('enabled') is True for c in campaigns.values())
+    transfers = rows(store, compact=True, active_only=not hf_enabled)
+    mark('transfer_rows_s')
     for r in transfers:
         if r['status'] not in ACTIVE or health.get(r['node'], {}).get('phase') in ('ssh_retrying', 'unavailable'):
             continue
@@ -682,19 +790,25 @@ def tick(controller, execute):
         with store.db:
             store.db.execute('UPDATE artifact_transfers SET status=?,report=? WHERE id=?',
                              (state, dumps(report), r['id']))
+            consumer=r['spec'].get('config', {}).get('consumer_job')
+            if consumer and state == 'failed':
+                store.db.execute("UPDATE relay_intents SET state='failed',updated=? WHERE consumer_job=? AND last_transfer=?",
+                                 (time.time(),consumer,r['id']))
             if state != r['status']:
                 store.event('artifact_transfer_' + state, r['id'], dict(attempt=r['attempt'], direction=r['direction']))
         r.update(status=state, report=report)
+    mark('transfer_reconcile_s')
     if not execute:
         return
     nodes, snapshots = store.specs('nodes'), controller.snapshots()
     live = [r for r in transfers if r['status'] in ACTIVE]
     archive_policy = attempt_archive_policy(store)
+    mark('nodes_policy_s')
     if archive_policy and not getattr(controller, 'artifact_cleanup_deferred', False):
         cleanup_archived_sources(controller, nodes, archive_policy)
-    if len(live) >= 2:
+    transfer_capacity = 32  # 24 dependency relays plus eight independent archive lanes.
+    if len(live) >= transfer_capacity:
         return
-    hf_enabled = any(c.get('hf', {}).get('enabled') is True for c in campaigns.values())
     if hf_enabled:
         jobs = {j['id']: j for j in store.jobs()}
     else:
@@ -714,14 +828,18 @@ def tick(controller, execute):
             batch = ids[offset:offset+500]
             for r in store.db.execute('SELECT * FROM jobs WHERE id IN ('+','.join('?' for _ in batch)+')', batch):
                 jobs[r['id']] = dict(r, spec=json.loads(r['spec']))
+    mark('jobs_s')
     experiments = {r['id']:json.loads(r['spec']) for r in store.db.execute(
         "SELECT id,json_remove(spec,'$.jobs') AS spec FROM experiments")}
+    mark('experiments_s')
     from .model_vram_policy import normalize
     jobs = {k:dict(j,spec=normalize(j['spec'])) for k,j in jobs.items()}
     # Dependency staging is an internal scheduler guarantee, independent of
     # whether a campaign publishes long-term results to HF. This also covers
     # future campaigns that only declare ordinary depends_on outputs.
     ready_queued = [j for j in jobs.values() if j['status'] == 'queued'
+                    and not j['spec'].get('metadata',{}).get('operator_hold')
+                    and not j['spec'].get('labels',{}).get('operator_hold')
                     and all(jobs[d]['status'] == 'succeeded' for d in j['spec']['depends_on'])]
     detailed_jobs = {d for j in ready_queued for d in j['spec']['depends_on']}
     detailed_jobs.update(r[0] for r in store.db.execute(
@@ -736,9 +854,12 @@ def tick(controller, execute):
         detailed_jobs.update(r[0] for r in store.db.execute(
             'SELECT DISTINCT job FROM attempts WHERE created>=?', (time.time()-max_interval,)))
     attempts = store.attempts(summary=True, job_ids=detailed_jobs)
+    mark('attempts_s')
     from .planner import admission_vram
     attempts = [dict(a, admission_vram_mib=admission_vram(a, jobs.get(a.get('job'),{}), time.time()))
                 if a['status'] in ACTIVE else a for a in attempts]
+    relay_intents={row['consumer_job']:dict(row) for row in store.db.execute(
+        "SELECT consumer_job,node,state,last_transfer FROM relay_intents WHERE state='pending'")}
 
     pause_cache = {}
     def eligible(a, n, direction, repair_revision=None, require_hf=True):
@@ -751,9 +872,12 @@ def tick(controller, execute):
                     pause_cache[identity] = upload_pause(owner, transfers, campaigns)
                 if pause_cache[identity]:
                     return False
+        destination_busy = (not dependency_relay_available(live, a['id'], n['id'])
+                            if direction == 'download' else
+                            any(r['node'] == n['id'] for r in live))
         if ((require_hf and 'hf' not in n)
                 or (not n['enabled'] and not source_upload_allowed(a,n,direction))
-                or any(r['node'] == n['id'] for r in live)):
+                or destination_busy):
             return False
         if health.get(n['id'], {}).get('phase') in ('ssh_retrying', 'unavailable'):
             return False
@@ -776,8 +900,14 @@ def tick(controller, execute):
             last = max((x['created'] for x in attempts + transfers if x['spec']['startup_group'] == group), default=0)
             if time.time() - last < store.specs('groups_')[group]['min_start_interval_s']:
                 return False
-        history = [r for r in transfers if r['attempt'] == a['id'] and r['node'] == n['id']
-                   and r['direction'] == direction]
+        if not hf_enabled and direction == 'download':
+            history = [dict(r, spec=json.loads(r['spec']), report=json.loads(r['report']))
+                       for r in store.db.execute(
+                           "SELECT * FROM artifact_transfers WHERE attempt=? AND node=? "
+                           "AND direction=? ORDER BY created", (a['id'], n['id'], direction))]
+        else:
+            history = [r for r in transfers if r['attempt'] == a['id'] and r['node'] == n['id']
+                       and r['direction'] == direction]
         if repair_revision:
             if any(r['status'] in ACTIVE or r['status']=='succeeded' for r in history):return False
             history=[r for r in history if r['spec']['config'].get('repair_revision')==repair_revision]
@@ -797,7 +927,10 @@ def tick(controller, execute):
             if any(t['attempt']==a['id'] and t['direction']=='upload' and (t['status']=='succeeded' or t['spec']['config'].get('repair_revision')==cfg['repair_revision']) for t in transfers):
                 with store.db:store.db.execute("UPDATE artifact_repair_queue SET state='submitted' WHERE attempt=?",(a['id'],))
                 continue
-            n=nodes[a['node']]
+            # A repair request may outlive a retired source node.  Keep the
+            # audit row pending; it can only be submitted from a current node.
+            n=nodes.get(a['node'])
+            if n is None:continue
             if eligible(a,n,'upload',cfg['repair_revision']):
                 key=start(controller,a,n,'upload',cfg)
                 with store.db:
@@ -812,6 +945,7 @@ def tick(controller, execute):
                     key=lambda j: -(experiments[j['experiment']]['priority'] + j['spec']['priority']))
     demand = runnable_stage_demand(queued, jobs, experiments, nodes, snapshots,
                                    attempts + live, successful, groups, time.time())
+    mark('demand_scan_s')
     def start_dependency(_live):
         from .planner import dependency_pool_candidates
         for j in queued:
@@ -820,9 +954,13 @@ def tick(controller, execute):
             # Stage onto the same pool order the consumer planner will use. This
             # prevents a low-priority node from becoming the only eligible host
             # merely because generic relay balancing copied an artifact there first.
-            pool = dependency_pool_candidates(j['spec'], nodes, snapshots,
-                [a for a in attempts if a['status'] in ACTIVE] + reservations(store),
-                attempts, successful, groups, time.time())
+            intent=relay_intents.get(j['id'])
+            if intent and intent['node'] in nodes:
+                pool={intent['node']: dependency_missing_for_node(j['spec'], intent['node'], successful, nodes)}
+            else:
+                pool = dependency_pool_candidates(j['spec'], nodes, snapshots,
+                    [a for a in attempts if a['status'] in ACTIVE] + reservations(store),
+                    attempts, successful, groups, time.time())
             if pool is not None and any(not missing for missing in pool.values()):
                 continue
             staging_nodes = sorted((n for n in nodes.values() if pool is None or n['id'] in pool), key=lambda n:
@@ -835,6 +973,8 @@ def tick(controller, execute):
                 a = successful[dep]
                 receipt = a['report'].get('hf_artifact')
                 for n in staging_nodes:
+                    if not dependency_relay_available(_live, a['id'], n['id']):
+                        continue
                     if (n['id'] == a['node'] and not a.get('origin_retired')) or n['id'] in a.get('artifact_locations', {}):
                         continue
                     if not a.get('origin_retired') and n['storage_domain'] and n['storage_domain'] == a['spec']['node_spec']['storage_domain']:
@@ -869,13 +1009,16 @@ def tick(controller, execute):
                         if local_relay:
                             archive_sources = [(node_id, receipt) for node_id, receipt
                                                in a.get('artifact_locations', {}).items()
-                                               if receipt.get('complete_attempt')]
+                                               if node_id in nodes and receipt.get('complete_attempt')]
                             if archive_sources:
                                 source_id, source_receipt = sorted(archive_sources)[0]
-                                return start_local_relay(controller, a, nodes[source_id], n, source_receipt)
-                            return start_local_relay(controller, a, nodes[a['node']], n)
+                                return start_local_relay(controller, a, nodes[source_id], n, source_receipt,
+                                                         consumer_job=j['id'])
+                            source = nodes.get(a['node'])
+                            if source is not None:
+                                return start_local_relay(controller, a, source, n, consumer_job=j['id'])
                         if receipt:
-                            return start(controller, a, n, 'download', dict(receipt=receipt))
+                            return start(controller, a, n, 'download', dict(receipt=receipt), consumer_job=j['id'])
                     warmed = warmed_staging_snapshot(n, snapshot, time.time())
                     if warmed:
                         warm_fits = [fit(dict(j['spec'], resources=resources), n, warmed,
@@ -898,7 +1041,8 @@ def tick(controller, execute):
             controller, nodes, snapshots, health, current, archive_policy)
             if archive_policy else None),
         archive_urgent=bool(urgent_lab4_staging),
-        refresh_live=lambda: reservations(store))
+        refresh_live=lambda: reservations(store), max_total=transfer_capacity, max_dependency=24, max_archive=8)
+    mark('dependency_reserve_s')
     if launched or not hf_enabled:
         return
     # Prioritize publications that unblock successors; successful computation stays successful.

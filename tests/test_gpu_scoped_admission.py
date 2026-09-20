@@ -10,6 +10,7 @@ class GPUScopedAdmissionTests(unittest.TestCase):
         self.assertLess(workload_node_rank('train','cps2-model'),workload_node_rank('train','cps1-model'))
         self.assertLess(workload_node_rank('train','cps1-model'),workload_node_rank('train','farm9-gui2'))
         self.assertLess(workload_node_rank('train','farm9-gui2'),workload_node_rank('train','lab1'))
+        self.assertLess(workload_node_rank('train','lab3'),workload_node_rank('train','lab8'))
         self.assertLess(workload_node_rank('train','farm7'),workload_node_rank('train','lab2'))
         self.assertLess(workload_node_rank('eval','lab2'),workload_node_rank('eval','rp2'))
 
@@ -117,7 +118,7 @@ class GPUScopedAdmissionTests(unittest.TestCase):
         row=plan([self.candidate('train')],nodes=nodes,snaps=snaps,attempts=active)[0]
         self.assertEqual(row['node'],'farm9-gui2')
 
-    def test_dense_train_pool_reaches_depth_two_before_secondary_pool(self):
+    def test_all_train_servers_reach_depth_one_before_any_second_train(self):
         rp2=self.shared_node('rp2')
         cps2=self.shared_node('cps2-model');farm9=self.shared_node('farm9-gui2')
         cps1=self.shared_node('cps1-model');lab1=self.shared_node('lab1')
@@ -126,8 +127,7 @@ class GPUScopedAdmissionTests(unittest.TestCase):
         active=[]
         for n in (rp2,cps2,cps1,farm9):
             for gpu in range(2):
-                active.extend(self.active(n,gpu,'train',n['id']+str(gpu)+'-'+str(copy_))
-                              for copy_ in range(2))
+                active.append(self.active(n,gpu,'train',n['id']+str(gpu)))
         row=plan([self.candidate('train')],nodes=nodes,snaps=snaps,attempts=active)[0]
         self.assertEqual(row['node'],'lab1')
 
@@ -147,13 +147,13 @@ class GPUScopedAdmissionTests(unittest.TestCase):
                  attempts=[self.active(rp2,0,'train','first')])[0]
         self.assertEqual((row['node'],row['gpus']),('cps2-model',['GPU-cps2-model-0']))
 
-    def test_primary_second_train_precedes_secondary_pool(self):
+    def test_secondary_empty_gpu_precedes_primary_second_train(self):
         rp2=self.shared_node('rp2');rp2['gpus']=rp2['gpus'][:1];rp2['admission_priority']=600
         lab1=self.shared_node('lab1');lab1['gpus']=lab1['gpus'][:1];lab1['admission_priority']=440
         row=plan([self.candidate('train')],nodes={'rp2':rp2,'lab1':lab1},
                  snaps={'rp2':snapshot(rp2),'lab1':snapshot(lab1)},
                  attempts=[self.active(rp2,0,'train','first')])[0]
-        self.assertEqual((row['node'],row['gpus']),('rp2',['GPU-rp2-0']))
+        self.assertEqual((row['node'],row['gpus']),('lab1',['GPU-lab1-0']))
 
     def test_stabilizing_empty_primary_gpu_blocks_packing_and_secondary_for_180s(self):
         now=time.time()
@@ -231,17 +231,37 @@ class GPUScopedAdmissionTests(unittest.TestCase):
         self.assertIn('workload pool restriction',row['reasons']['lab2'])
 
     def test_eval_remains_in_eval_pool_after_first_coverage_round(self):
-        lab2=self.shared_node('lab2');lab3=self.shared_node('lab3')
+        lab2=self.shared_node('lab2');lab4=self.shared_node('lab4')
         farm9=self.shared_node('farm9-gui2')
-        nodes={n['id']:n for n in (lab2,lab3,farm9)}
+        nodes={n['id']:n for n in (lab2,lab4,farm9)}
         snaps={key:snapshot(value) for key,value in nodes.items()}
         active=[self.active(lab2,0,'eval','l20')]
         row=plan([self.candidate('eval')],nodes=nodes,snaps=snaps,attempts=active)[0]
         self.assertEqual((row['node'],row['gpus']),('lab2',['GPU-lab2-1']))
         active=[self.active(n,gpu,'eval',n['id']+str(gpu))
-                for n in (lab2,lab3) for gpu in range(2)]
+                for n in (lab2,lab4) for gpu in range(2)]
         row=plan([self.candidate('eval')],nodes=nodes,snaps=snaps,attempts=active)[0]
         self.assertEqual(row['node'],'lab2')
+
+    def test_lab3_is_train_only(self):
+        lab3=self.shared_node('lab3')
+        train=plan([self.candidate('train')],nodes={'lab3':lab3},
+                   snaps={'lab3':snapshot(lab3)})[0]
+        self.assertEqual(train['decision'],'ready')
+        evaluation=plan([self.candidate('eval')],nodes={'lab3':lab3},
+                        snaps={'lab3':snapshot(lab3)})[0]
+        self.assertEqual(evaluation['decision'],'waiting')
+        self.assertIn('workload pool restriction',evaluation['reasons']['lab3'])
+
+    def test_lab8_is_train_only(self):
+        lab8=self.shared_node('lab8')
+        train=plan([self.candidate('train')],nodes={'lab8':lab8},
+                   snaps={'lab8':snapshot(lab8)})[0]
+        self.assertEqual(train['decision'],'ready')
+        evaluation=plan([self.candidate('eval')],nodes={'lab8':lab8},
+                        snaps={'lab8':snapshot(lab8)})[0]
+        self.assertEqual(evaluation['decision'],'waiting')
+        self.assertIn('workload pool restriction',evaluation['reasons']['lab8'])
 
     def test_eval_never_runs_in_train_pool(self):
         rp2=self.shared_node('rp2')
@@ -249,6 +269,37 @@ class GPUScopedAdmissionTests(unittest.TestCase):
                  snaps={'rp2':snapshot(rp2)})[0]
         self.assertEqual(row['decision'],'waiting')
         self.assertIn('workload pool restriction',row['reasons']['rp2'])
+
+    def test_scoped_eval_may_follow_only_its_successful_train_host(self):
+        farm9=self.shared_node('farm9-gui2');rp2=self.shared_node('rp2')
+        producer=self.active(farm9,0,'train','train-attempt')
+        producer.update(job='producer',status='succeeded',released=True)
+        producer['spec'].update(node_spec=farm9,attempt_dir='/runs/producer')
+        producer['report']={'outputs':{'TRAIN_RESULT.json':{
+            'path':'/runs/producer/TRAIN_RESULT.json','sha256':'a'*64,'bytes':1}}}
+        base=self.candidate('eval');base.update(id='evaluation',depends_on=['producer'],hosts=['farm9-gui2'])
+        statuses={'producer':'succeeded'}
+        blocked=plan([job('producer'),base],nodes={'farm9-gui2':farm9,'rp2':rp2},
+            snaps={'farm9-gui2':snapshot(farm9),'rp2':snapshot(rp2)},attempts=[producer],statuses=statuses)[0]
+        self.assertEqual(blocked['decision'],'waiting')
+        base['metadata']={'same_host_eval_dependency':'producer'}
+        allowed=plan([job('producer'),base],nodes={'farm9-gui2':farm9,'rp2':rp2},
+            snaps={'farm9-gui2':snapshot(farm9),'rp2':snapshot(rp2)},attempts=[producer],statuses=statuses)[0]
+        self.assertEqual((allowed['decision'],allowed['node']),('ready','farm9-gui2'))
+        base['hosts']=['rp2']
+        wrong=plan([job('producer'),base],nodes={'farm9-gui2':farm9,'rp2':rp2},
+            snaps={'farm9-gui2':snapshot(farm9),'rp2':snapshot(rp2)},attempts=[producer],statuses=statuses)[0]
+        self.assertEqual(wrong['decision'],'waiting')
+        self.assertIn('workload pool restriction',wrong['reasons']['rp2'])
+
+    def test_retired_node_cannot_reenter_either_pool(self):
+        for key,kind in (('rp1','train'),('rp3','train'),('farm1','eval'),('farm2','train')):
+            with self.subTest(node=key,kind=kind):
+                retired=self.shared_node(key)
+                row=plan([self.candidate(kind)],nodes={key:retired},
+                         snaps={key:snapshot(retired)})[0]
+                self.assertEqual(row['decision'],'waiting')
+                self.assertIn('workload pool restriction',row['reasons'][key])
 
     def test_warm_occupied_gpu_blocked_but_other_gpu_usable(self):
         n = node(); n['policy'].update(temperature_scope='gpu', allow_gpu_sharing=True)

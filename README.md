@@ -34,10 +34,10 @@
 변경할 때는 repository 코드와 실제 controller 배포본, 운영 DB 적용 결과를 검증한 뒤 이 절도 같은
 변경에서 갱신합니다. 실행 중 attempt의 frozen 설정과 과거 이력은 소급 변경하지 않습니다.
 
-- 1차 train pool은 `RP2 → CPS2-MODEL → CPS1-MODEL → FARM9-GUI2`, 2차 train
-  pool은 `LAB1 → FARM8-GUI2 → FARM6 → FARM7`이다. 1차 풀 전체의 배정 가능 GPU를 한 번씩 채운
-  뒤에만 두 번째 train을 배정한다. 같은 깊이에서는 빈 GPU·낮은 스케줄러 부하·VRAM·온도 조건을
-  먼저 보고 서버 순위는 동률을 해소한다. 1차 풀의 train은 기본 GPU당 두 개가 상한이며,
+- train pool 순서는 `RP2 → CPS2-MODEL → CPS1-MODEL → FARM9-GUI2 → LAB1 → FARM8-GUI2 → FARM6 → FARM7 → LAB3 → LAB8`이다.
+  각 서버의 배정 가능한 모든 GPU에 train을 하나씩 채우면 다음 순위 서버로 이동하며, 전체 train pool의
+  배정 가능한 GPU가 모두 깊이 1에 도달한 뒤에만 어느 GPU든 두 번째 train을 받을 수 있다. 같은 서버에서는
+  빈 GPU·낮은 스케줄러 부하·VRAM·온도 조건을 먼저 본다. train은 기본 GPU당 두 개가 상한이며,
   2026-09-20 사용자 승인으로 RP2만 GPU당 세 개·서버 전체 아홉 개까지 허용한다. GPU 사용률
   70% 이상·80°C 이상·VRAM/health 부적합이면 상한에 여유가 있어도 해당 GPU를 건너뛴다.
   RP1·RP3의 과거 온보딩·검증 이력은 보존하지만 두 서버는 2026-09-20 인벤토리에서 제거됐다.
@@ -49,14 +49,16 @@
   CUDA 채널로 분리 설치해 `extra-index` 선택 때문에 모든 wheel이 한 CDN으로 몰리지 않게 한다.
   대형 Paddle wheel은 해당 노드가 Paddle 공식 CDN에서 resumable HTTP range로 병렬 다운로드하고,
   공식 응답의 파일 크기·CRC32 및 wheel ZIP 무결성을 확인한 뒤 설치한다.
-  일시적으로 안정 관측을 쌓는 빈 GPU는 최대 180초 동안 기존 GPU의 두 번째 train이나 2차 풀로의
-  조기 이탈을 보류한다. 1차 풀에서 GPU execution validation이 진행 중이면 같은 계획 주기의 train을
-  2차 풀로 보내지 않고 검증 결과를 먼저 회수한다. 1차 풀에서 GPU당 두 개까지 실제로 더 받을 수 없을 때 2차 풀을 한 번씩
-  채운다. train은 두 train pool 안에서만 실행하며 eval pool로 fallback하지 않는다.
-- 모델 eval pool은 `LAB2 → LAB3 → LAB4 → LAB8 → LAB6`이다. eval은 이 풀 안에서만 실행하며
+  일시적으로 안정 관측을 쌓는 상위 서버의 빈 GPU는 최대 180초 동안 다음 서버 이동을 보류한다.
+  상위 서버에서 GPU execution validation이 진행 중이면 같은 계획 주기의 train을 다음 서버로 보내지 않고
+  검증 결과를 먼저 회수한다. train은 train pool 안에서만 실행하며 eval pool로 fallback하지 않는다.
+- 모델 eval pool은 `LAB2 → LAB4 → LAB6`이다. LAB8은 2026-09-20 사용자 요청으로 eval pool에서
+  제외하고 train pool의 후순위 서버로 전환했다. 기존 LAB8 eval attempt는 이동·중단하지 않는다. eval은 이 풀 안에서만 실행하며
   train pool로 fallback하지 않는다. 선택된 서버 안에서는 이미 작업이 있는 GPU보다 다른 GPU를 먼저 쓴다.
   이 제한은 GPU train/eval의 실행 destination에 적용한다. train pool에서 생성된 checkpoint/result를
   eval pool로 relay하거나 그 반대로 전달하는 것은 계속 허용하며, relay destination은 소비 작업의 풀을 따른다.
+  relay가 시작되면 소비 작업과 목적지를 durable intent로 묶어, 전송 완료·실패 전에는 다음 planning cycle에서
+  다른 서버를 후보로 계산하거나 중복 relay를 만들지 않는다.
   준비·smoke·analysis와 이미 실행 중인 frozen attempt는 이 변경으로 이동·중단하지 않는다.
 - 2026-09-20 사용자 요청으로 모델 노드 `RP1`, `RP3`, `FARM1`, `FARM2`를 인벤토리에서 제거했다.
   과거 attempt·전송·검증 이력은 보존하지만 신규 probe·준비·배정 대상으로 사용하지 않는다.
@@ -92,9 +94,18 @@
   처리한다. `artifact_service_config.enabled=1`이면 모델 controller는 artifact tick을 건너뛰고
   DB의 전송 예약 및 검증 receipt만 배정에 반영한다. 별도 서비스는 원격 RPC 동안 공용 registry 잠금을
   해제하고, 삭제 직전 새 참조를 재검사한다. 서비스 장애 중에도 controller가 전송을 중복 인계하지 않는다.
-  전송 슬롯 2개 중 실행 가능한 후속 작업의 dependency relay를 먼저 최대 1개 배정하고, 일반 LAB4
-  archive는 나머지 슬롯을 최대 1개 사용한다. 이미 한 종류가 실행 중이면 다른 종류가 빈 슬롯을 사용하며,
+  실행 가능한 후속 작업의 dependency relay를 최대 24개 배정하고, 같은 목적지도 서로 다른 artifact라면
+  최대 24개까지 병렬 전송한다. 같은 attempt→destination 중복은 금지한다. 일반 LAB4 archive는 별도 8개 lane을
+  사용한다. archive 후보가 없더라도 dependency relay의 상한은 24개이며,
   archive backlog가 dependency relay 선택 전에 매 주기 반환해 후속 작업을 굶기지 않게 한다.
+  transfer lane은 매 주기 뒤 최소 5초, cleanup lane은 최소 30초 공용 잠금 경쟁에서 물러난다.
+  서비스 상태에는 `registry_wait_s`와 실제 점유 `registry_locked_s`를 분리해 기록한다.
+  계획 루프는 완료 transfer의 `config.files`와 `artifact.files` 대형 manifest를 역직렬화하지 않는다.
+  terminal attempt의 archive 후보 필드(`finished`, `attempt_dir`, `kind`)는 상태 전이 때
+  `attempt_archive_index`에 한 번만 기록하며, 매 주기 전체 attempt JSON을 다시 읽지 않는다.
+  HF 업로드가 꺼져 있으면 활성 transfer만 일괄 조회하고 과거 실패 이력은 실제 relay 후보에 대해서만
+  지연 조회한다.
+  활성 transfer는 전체 frozen request를 유지하고, 특정 attempt receipt가 실제로 필요할 때만 Store가 지연 조회한다.
   여러 후보 서버 중에서는 필요한 dependency 일부가 이미 검증된 서버를 먼저 골라 한 서버의 입력을
   완성한 뒤 실행하되, train/eval GPU pool 순서가 누락 파일 수보다 먼저다. 상위 GPU 후보가 실행
   profile 등록 뒤 정상 관측을 쌓는 중이면 최대 180초 기다리고, 그동안 낮은 pool로 relay해 실행 위치를
@@ -103,22 +114,36 @@
   같은 train/eval pool 라운드를 적용한다. 상위 pool에서 전송만 기다리면 하위 pool의 기존 복제본으로
   먼저 실행하지 않고 `preferred GPU pool dependency relay pending`으로 표시하며 해당 pool에 relay한다.
   eval dependency는 producer가 RP/train pool에 있어도 eval pool destination으로 relay한다.
+  단, 작업 metadata에 `same_host_eval_dependency`가 사용자 승인으로 명시된 eval은 그 정확한 선행
+  학습의 성공 attempt가 실행된 서버 하나에서만 평가를 허용한다. 이 작업별 예외는 다른 eval이나
+  일반적인 train-pool fallback을 허용하지 않는다.
   같은 역할의 상위 서버가 VRAM·온도·동시성·host/profile·fresh health 조건에 부적합하면 같은 pool의
   다음 서버로 넘어가며 반대 역할 pool을 실행 destination으로 사용하지 않는다.
   같은 우선 라운드에서 이미 입력과 자원이 준비된 후보가 있으면 추가 복제 없이 배정한다.
   전송 가정은 후보 비교에만 사용하며 실제 실행은 기존 verified receipt가 있어야 한다.
+- 2026-09-20 사용자 요청으로 `CPS1-MODEL`은 모델 신규 배정에서 drain한다. 기존 pool 순서의 CPS1
+  위치는 비활성 노드로 건너뛰며 자동 재활성화하지 않는다. 당시 실행 중이던
+  `TQPAIR_I3_FP32_B010_QAT_V1`은 완료 epoch 2의 model·optimizer·LR·RNG checkpoint를 검증해
+  FARM9 전용 다음 attempt로 재개했다.
+  FARM↔LAB dependency 전송은 방화벽 경계를 직접 넘지 않고 controller-local bounded staging을 사용한 뒤
+  검증 성공 시 staging을 삭제한다. CPS1의 사용 가능 여부는 dependency relay의 조건이 아니다. RP/CPS가 포함되거나 같은 영역 안의 전송은 제어 머신 디스크에
+  적재하지 않는 direct stream을 사용한다. 다중 파일은 압축하지 않은 tar stream 하나로 전송하고,
+  목적지에서 안전하게 해제한 뒤 기존 per-file SHA manifest 전체를 검증한다. FARM attempt archive도
+  파일 하나짜리 tar를 CPS1에 임시 저장한 뒤 LAB4로 전달하고 검증 후 삭제한다.
 - 신규 attempt 예약 이벤트에는 선택 당시의 전체 eligible 서버와 서버별 rejection 사유를
   `placement_audit`으로 보존한다. 이후 실행 중인 서버만 보고 과거 배정 이유를 추정하지 않는다.
 - 새 report job은 `report_execution=archive_host`, `hosts=[lab4]`로 LAB4에서 생성한다. 표준 Python만
   사용하는 self-contained report는 등록 시 자동 변환하고, 별도 runtime이 필요한 report는 LAB4 실행
   profile을 준비해야 등록된다. 결과는 검증된 dependency 위치에서 읽으며 새 중간 report gate를 추가하지
-  않는다. 실행 중 attempt와 완료 이력은 유지한다.
+  않는다. self-contained inline report의 cwd는 runner가 생성한 해당 attempt 디렉터리로 고정하여
+  과거 release 디렉터리 삭제가 report 완료를 막지 않게 한다. 실행 중 attempt와 완료 이력은 유지한다.
   사용자가 LAB4를 영구 집계 위치로 명시한 cross-node report는 `report_storage=lab4-direct-relay`와
   운영 예외 사유를 기록한다. 이 report의 결과 relay가 대기 중이면 같은 LAB4를 사용하는 다음
   retention archive보다 먼저 처리해 archive backlog가 report를 영구 차단하지 않게 한다.
 - 정식 progress marker가 없는 legacy Paddle eval은 최대 128 KiB의 `stdout.log` 끝부분에서
   `Eval iter`만 읽어 관측 batch와 fp32/quantized 단계를 표시한다. 이를 완료율이나 예상 시간으로
-  확대하지 않으며, 새 worker revision은 `PROGRESS.json`을 직접 기록해야 한다.
+  확대하지 않으며, 새 worker revision은 `PROGRESS.json`을 직접 기록해야 한다. 이미지 단위 평가 worker는
+  `completed_images`와 `planned_images`를 기록하며 dashboard는 이를 eval 백분율로 표시한다.
 
 ## 목차
 

@@ -393,7 +393,7 @@ for key,d in json.loads(sys.argv[1]):
    p=root/'CHILD_STATE.json'
    if marker is not None:
     assert marker.stat().st_size<=131072
-    v=json.loads(marker.read_text());out['progress']={k:v.get(k) for k in ['completed_cells','planned_cells','phase','batches','planned_batches','config']}
+    v=json.loads(marker.read_text());out['progress']={k:v.get(k) for k in ['completed_cells','planned_cells','completed_images','planned_images','phase','batches','planned_batches','config']}
     contract=root/'PROGRESS_CONTRACT.json'
     if out['progress'].get('planned_batches') is None and contract.is_file() and contract.stat().st_size<=131072:
      total=json.loads(contract.read_text()).get('planned_batches')

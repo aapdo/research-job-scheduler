@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 from test_scheduler import node, snapshot, job, experiment, plan, reservation
 from research_scheduler import relay_worker
-from research_scheduler.artifacts import attempt_archive_policy, start_pending_attempt_archive
+from research_scheduler.artifacts import (attempt_archive_policy, ensure_attempt_archive_index,
+                                           start_pending_attempt_archive)
 from research_scheduler.controller import Controller
 from research_scheduler.notifications import register_campaign
 from research_scheduler.report_placement import on_archive_host, required_dependency_host
@@ -17,6 +18,47 @@ from research_scheduler.store import Store, dumps
 
 
 class ArchiveLifecycleTests(unittest.TestCase):
+    def test_terminal_attempt_archive_index_backfill_and_triggers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            s = Store(Path(folder) / 'state.db')
+            try:
+                n = node(key='source'); s.register_node(n)
+                s.register_experiment(experiment([job('first')]))
+                spec = dict(attempt_dir='/runs/first', node_spec=n,
+                            job_spec={'kind': 'train'})
+                with s.db:
+                    s.db.execute("UPDATE jobs SET status='succeeded' WHERE id='first'")
+                    s.db.execute(
+                        'INSERT INTO attempts(id,job,node,spec,status,created,report) '
+                        'VALUES(?,?,?,?,?,?,?)',
+                        ('first.done','first','source',dumps(spec),'succeeded',10,
+                         dumps({'finished': 20})))
+                indexed = s.db.execute(
+                    'SELECT finished,root,kind FROM attempt_archive_index '
+                    "WHERE attempt='first.done'").fetchone()
+                self.assertEqual(tuple(indexed), (20, '/runs/first', 'train'))
+
+                # Simulate an existing database created before the index.
+                with s.db:
+                    s.db.execute('DELETE FROM attempt_archive_index')
+                    s.db.execute(
+                        "UPDATE scheduler_migrations SET complete=0 "
+                        "WHERE name='attempt_archive_index_v1'")
+                self.assertTrue(ensure_attempt_archive_index(s))
+                self.assertFalse(ensure_attempt_archive_index(s))
+                self.assertEqual(s.db.execute(
+                    "SELECT count(*) FROM attempt_archive_index WHERE attempt='first.done'"
+                ).fetchone()[0], 1)
+
+                with s.db:
+                    s.db.execute(
+                        "UPDATE attempts SET status='running' WHERE id='first.done'")
+                self.assertEqual(s.db.execute(
+                    "SELECT count(*) FROM attempt_archive_index WHERE attempt='first.done'"
+                ).fetchone()[0], 0)
+            finally:
+                s.db.close()
+
     def test_retired_origin_cannot_be_used_even_on_original_server(self):
         origin = node()
         done = reservation(origin, key='first', status='succeeded')
@@ -117,7 +159,26 @@ class ArchiveLifecycleTests(unittest.TestCase):
                 patch.object(relay_worker,'stream_between_remotes') as stream:
             with self.assertRaises(RuntimeError):
                 relay_worker.publish_direct(config)
-        stream.assert_not_called()
+            stream.assert_not_called()
+
+    def test_farm_lab_dependency_uses_cps1_staging_and_cleans_it(self):
+        config=dict(source_target='farm',source_root='/farm/attempt',
+                    destination_target='lab',destination_root='/lab/relay',
+                    staging_target='cps1',staging_root='/data/TT/jy/artifact-relay-staging/relay-test',
+                    staging_min_free_bytes=1024,
+                    files={'RESULT.json':{'bytes':1,'sha256':'a'*64}})
+        expected={'RESULT.json':{'path':'/lab/relay/RESULT.json','bytes':1,'sha256':'a'*64}}
+        with patch.object(relay_worker,'run'), \
+                patch.object(relay_worker,'stream_tar_bundle') as stream, \
+                patch.object(relay_worker,'publish_tar_direct',return_value=expected) as publish, \
+                patch.object(relay_worker.subprocess,'run') as cleanup:
+            self.assertEqual(relay_worker.publish_via_cps1(config),expected)
+        stream.assert_called_once_with('farm','/farm/attempt','cps1',
+                                       Path('/data/TT/jy/artifact-relay-staging/relay-test/payload.tar'),
+                                       config['files'])
+        self.assertEqual(publish.call_args.args[1:3],
+                         ('cps1',Path('/data/TT/jy/artifact-relay-staging/relay-test/payload.tar')))
+        cleanup.assert_called_once()
 
 
 if __name__ == '__main__':

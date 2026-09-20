@@ -25,9 +25,12 @@ class RegistrySection:
         self.file = None
         self.held = False
         self.locked_s = 0.0
+        self.waited_s = 0.0
 
     def acquire(self):
+        started = time.monotonic()
         fcntl.flock(self.file, fcntl.LOCK_EX)
+        self.waited_s += time.monotonic() - started
         self.held = True
         self.since = time.monotonic()
 
@@ -68,10 +71,12 @@ class UnlockedTransport:
 
 
 def cycle(store, cleanup=False):
-    from .artifacts import tick, attempt_archive_policy, cleanup_archived_sources
+    from .artifacts import (tick, attempt_archive_policy, cleanup_archived_sources,
+                            ensure_attempt_archive_index)
     with RegistrySection(store) as section:
         if not external_artifacts_enabled(store):
             raise RuntimeError('external artifact ownership is not enabled')
+        ensure_attempt_archive_index(store)
         transport = UnlockedTransport(section)
         controller = Controller(store, transport)
         if cleanup:
@@ -81,7 +86,15 @@ def cycle(store, cleanup=False):
         else:
             controller.artifact_cleanup_deferred = True
             tick(controller, execute=True)
-    return dict(registry_locked_s=section.locked_s, remote_rpc_s=transport.rpc_s)
+    return dict(registry_wait_s=section.waited_s,
+                registry_locked_s=section.locked_s, remote_rpc_s=transport.rpc_s,
+                artifact_phases=getattr(controller,'artifact_phase_times',{}))
+
+
+def loop_wait_s(interval, elapsed, cleanup=False):
+    """Guarantee other controller/registration operations a fair lock window."""
+    minimum_yield = 30 if cleanup else max(5, interval)
+    return max(minimum_yield, interval - elapsed)
 
 
 def run_loop(args, stop, cleanup=False):
@@ -105,7 +118,7 @@ def run_loop(args, stop, cleanup=False):
             print(json.dumps(result), flush=True)
             # Always yield a scheduling opportunity even if a transfer cycle
             # exceeds its target interval; retention must not spin on the lock.
-            stop.wait(max(1, args.interval-result['elapsed_s']))
+            stop.wait(loop_wait_s(args.interval, result['elapsed_s'], cleanup))
     finally:
         if store:
             store.db.close()

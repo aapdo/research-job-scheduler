@@ -249,7 +249,7 @@ def payload(db=DB, rtl_db=RTL_DB, index=INDEX):
         row['recovered']=job['id'] in failed_jobs and job['status'] in ('running','succeeded')
         if row.get('progress'):
             row['progress'] = select(row['progress'], 'epoch planned_epochs optimizer_steps_executed '
-                                      'step_in_epoch steps_per_epoch completed_cells planned_cells batches planned_batches config status phase age_s unavailable error member members training_iterations_executed phase_inferred phase_elapsed_s phase_evidence')
+                                      'step_in_epoch steps_per_epoch completed_cells planned_cells completed_images planned_images batches planned_batches config status phase age_s unavailable error member members training_iterations_executed phase_inferred phase_elapsed_s phase_evidence')
         jobs.append(row)
     by_id = {j['id']: j for j in jobs}
     upload_activity = {}

@@ -98,3 +98,37 @@ class ResourceTests(unittest.TestCase):
         resources.tick(Controller(store),execute=True)
         self.assertEqual(len(store.jobs()),1);self.assertFalse(store.specs('nodes')['b']['enabled'])
         store.db.close()
+
+    def test_retired_source_and_destination_are_ignored(self):
+        store=Store(self.root/'retired-db')
+        for key in ('b','control','retired'):
+            n=node(str(self.root/key),key=key);n['target']=key
+            if key=='control':n['gpus']=[]
+            store.register_node(n)
+        j=job('consumer');j.update(cwd=str(self.dest),hosts=['b'])
+        store.register_experiment(experiment([j]))
+        resources.register(store,dict(id='demo-v1',manifest_file=str(self.manifest),
+            manifest_sha256=self.sha,sources={'retired':str(self.source)},
+            destinations={'b':str(self.dest),'retired':str(self.root/'retired')},
+            coordinator='control',match={'cwd':str(self.dest)},max_parallel=1))
+        with store.db:store.db.execute("DELETE FROM nodes WHERE id='retired'")
+        resources.tick(Controller(store),execute=True)
+        row=store.db.execute("SELECT spec FROM jobs WHERE id LIKE 'RESOURCE_%'").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(json.loads(row['spec'])['config']['sources'],[])
+        store.db.close()
+
+    def test_verified_resource_placeholder_resolves_to_replica_root(self):
+        store=Store(self.root/'placeholder-db')
+        n=node(str(self.root/'runs'),key='b');n['target']='b'
+        m=resources.marker('demo-v1',self.sha)
+        n['assets'][m['name']]={'path':str(self.dest/'.resource-ready'/'demo-v1'),'sha256':m['sha256']}
+        store.register_node(n)
+        j=job('consumer',gpu_count=0,vram=0)
+        j['config']={'root':'{resource:demo-v1}'}
+        j['metadata']={'required_resources':{'demo-v1':self.sha}}
+        store.register_experiment(experiment([j]))
+        request=Controller(store).request({'job':'consumer','node':'b','gpus':[]})
+        self.assertEqual(request['config']['root'],str(self.dest))
+        self.assertEqual(request['input_files'][-1]['path'],str(self.dest/'.resource-ready'/'demo-v1'))
+        store.db.close()

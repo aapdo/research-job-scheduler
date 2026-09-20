@@ -21,6 +21,11 @@ Local dashboard at port 30091. This is **not a scheduler controller**.
 
 Service: `research-dashboard.service` (user systemd, port 30091).
 Source entrypoint: `scheduler/dashboard/server.py`.
+
+Training progress can derive the in-epoch cursor from the recorded global
+iteration/update count, epoch and steps-per-epoch when `step_in_epoch` is absent.
+Inconsistent or missing counters remain unknown; elapsed time is not used to
+invent progress. Evaluation accepts cells, images or batch numerator/denominator.
 Inbox: `/home/jy/experiments/research_dashboard_20260911/inbox.db`.
 
 GPU telemetry health and server admission health are distinct. A green GPU badge

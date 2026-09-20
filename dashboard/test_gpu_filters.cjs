@@ -322,6 +322,22 @@ test('evaluation shows percentage without cell counts or updates',()=>{
   assert.match(vm.runInContext('progress(j)',context),/진행률 확인 중/);
 });
 
+test('evaluation image cursor is rendered as a percentage',()=>{
+  const {context}=dashboard();
+  context.j={work_type:'eval',progress:{phase:'head_cache',completed_images:5064,planned_images:195244}};
+  assert.match(vm.runInContext('progress(j)',context),/eval 2.6%/);
+});
+
+test('training derives current epoch cursor from recorded global steps',()=>{
+  const {context}=dashboard();
+  context.j={work_type:'train',progress:{epoch:2,planned_epochs:5,optimizer_steps_executed:125,steps_per_epoch:100}};
+  assert.match(vm.runInContext('progress(j)',context),/train 25%/);
+  context.j.progress.optimizer_steps_executed=90;
+  assert.match(vm.runInContext('progress(j)',context),/진행률 확인 중/);
+  context.j.progress.training_iterations_executed=150;
+  assert.match(vm.runInContext('progress(j)',context),/train 50%/);
+});
+
 test('evaluation root progress stays visibly active without a known total',()=>{
   const {context}=dashboard();
   context.j={work_type:'eval',progress:{phase:'w8a8',batches:2050}};

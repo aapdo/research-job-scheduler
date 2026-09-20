@@ -3,7 +3,7 @@ import time
 import unittest
 from test_scheduler import node, snapshot, job, experiment
 from research_scheduler.artifacts import (
-    dependency_staging_node_key, missing_dependency_count, runnable_stage_demand,
+    dependency_relay_available, dependency_relay_route, dependency_staging_node_key, missing_dependency_count, runnable_stage_demand,
     reserve_transfer_slots, warmed_staging_snapshot)
 from research_scheduler.planner import fit
 
@@ -47,27 +47,61 @@ class StageDemandTests(unittest.TestCase):
     def test_unfinished_dependency_is_not_promoted(self):
         self.assertFalse(self.demand(lambda j,s,b: b['producer'].update(status='running')))
 
-    def test_dependency_relay_precedes_archive_and_each_owns_one_slot(self):
+    def test_dependency_relays_precede_single_archive_lane(self):
         calls = []
         def dependency(live):
             calls.append(('dependency', [x['direction'] for x in live]))
-            return 'relay'
+            return 'relay-'+str(len(calls))
         def archive(live):
             calls.append(('archive', [x['direction'] for x in live]))
             return 'archive'
-        self.assertEqual(reserve_transfer_slots([], dependency, archive), ['relay', 'archive'])
-        self.assertEqual(calls, [('dependency', []), ('archive', ['download'])])
+        self.assertEqual(reserve_transfer_slots([], dependency, archive, max_total=4, max_dependency=3),
+                         ['relay-1', 'relay-2', 'relay-3', 'archive'])
+        self.assertEqual([kind for kind,_ in calls], ['dependency','dependency','dependency','archive'])
 
     def test_existing_archive_leaves_other_slot_for_dependency(self):
         live = [{'id':'archive-live','direction':'archive','status':'running'}]
-        self.assertEqual(reserve_transfer_slots(live, lambda _: 'relay', lambda _: 'extra'), ['relay'])
+        count=iter(range(3))
+        self.assertEqual(reserve_transfer_slots(live, lambda _: 'relay-'+str(next(count)), lambda _: 'extra',
+                                                max_total=4, max_dependency=3),
+                         ['relay-0','relay-1','relay-2'])
 
     def test_existing_dependency_leaves_other_slot_for_archive(self):
         live = [{'id':'relay-live','direction':'download','status':'running'}]
-        self.assertEqual(reserve_transfer_slots(live, lambda _: 'extra', lambda _: 'archive'), ['archive'])
+        count=iter(range(2))
+        self.assertEqual(reserve_transfer_slots(live, lambda _: 'extra-'+str(next(count)), lambda _: 'archive',
+                                                max_total=4, max_dependency=3),
+                         ['extra-0','extra-1','archive'])
 
     def test_urgent_lab4_dependency_does_not_compete_with_archive(self):
-        self.assertEqual(reserve_transfer_slots([], lambda _: 'relay', lambda _: 'archive', True), ['relay'])
+        count=iter(range(4))
+        self.assertEqual(reserve_transfer_slots([], lambda _: 'relay-'+str(next(count)), lambda _: 'archive', True,
+                                                max_total=4, max_dependency=4),
+                         ['relay-0','relay-1','relay-2','relay-3'])
+
+    def test_dependency_route_respects_farm_lab_firewall(self):
+        nodes={key:node(key=key) for key in ('farm9-gui2','lab4','rp2','cps1-model')}
+        self.assertEqual(dependency_relay_route(nodes['farm9-gui2'],nodes['lab4']),
+                         'controller-local-staging')
+        self.assertEqual(dependency_relay_route(nodes['lab4'],nodes['farm9-gui2']),
+                         'controller-local-staging')
+        self.assertEqual(dependency_relay_route(nodes['rp2'],nodes['farm9-gui2']),'direct-stream')
+        self.assertEqual(dependency_relay_route(nodes['cps1-model'],nodes['lab4']),'direct-stream')
+
+    def test_default_transfer_capacity_is_twenty_four_dependencies_plus_eight_archives(self):
+        counter=iter(range(24))
+        archive=iter(range(8))
+        result=reserve_transfer_slots([],lambda _: 'relay-'+str(next(counter)),lambda _: 'archive-'+str(next(archive)))
+        self.assertEqual(len(result),32)
+        self.assertEqual(result[-8:],['archive-'+str(i) for i in range(8)])
+
+    def test_destination_accepts_twenty_four_distinct_relays_but_not_duplicates(self):
+        live=[{'id':'r'+str(i),'attempt':'a'+str(i),'node':'lab4',
+               'direction':'download','status':'running'} for i in range(23)]
+        self.assertTrue(dependency_relay_available(live,'new','lab4'))
+        self.assertFalse(dependency_relay_available(live,'a1','lab4'))
+        live.append({'id':'r23','attempt':'a23','node':'lab4','direction':'download','status':'running'})
+        self.assertFalse(dependency_relay_available(live,'new','lab4'))
 
     def test_candidate_with_partial_verified_inputs_is_completed_first(self):
         source=node(key='source')
@@ -135,3 +169,21 @@ class StageDemandTests(unittest.TestCase):
             {'ready':snapshot(ready,now),'empty':snapshot(empty,now)},[],
             {'producer':attempt},{},now)
         self.assertEqual(result,{})
+
+    def test_retired_archive_location_is_not_a_current_relay_source(self):
+        # The source-selection invariant is covered through the public demand
+        # calculation: historical locations do not make a current destination
+        # ready and therefore cannot suppress required staging.
+        destination=node(key='destination')
+        producer=node(key='retired')
+        e=experiment([job('producer',gpu_count=0),job('consumer',deps=['producer'])])
+        jobs={j['id']:dict(id=j['id'],spec=j,experiment='e',
+              status='succeeded' if j['id']=='producer' else 'queued') for j in e['jobs']}
+        jobs['consumer']['spec']['hosts']=['destination']
+        successful={'producer':dict(node='retired',spec={'node_spec':producer},
+            report={'outputs':{'RESULT.json':{'path':'/gone','sha256':'a'*64,'bytes':1}}},
+            artifact_locations={'retired':{'root':'/gone','complete_attempt':True}})}
+        now=time.time()
+        result=runnable_stage_demand([jobs['consumer']],jobs,{'e':e},
+            {'destination':destination},{'destination':snapshot(destination,now)},[],successful,{},now)
+        self.assertIn('producer',result)
