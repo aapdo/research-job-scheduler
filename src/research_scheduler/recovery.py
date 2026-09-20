@@ -44,11 +44,24 @@ def current_campaign_jobs(jobs, experiments, campaign):
         chosen = original
         replacement = original['spec'].get('metadata', {}).get('recovery_replacement', {})
         target = by_id.get(replacement.get('job'))
+        kinds = (original['spec']['kind'], target['spec']['kind']) if target else (None, None)
+        restart = target['spec'].get('metadata', {}).get('independent_restart', {}) if target else {}
+        train_match = (kinds == ('train', 'train')
+                       and original['spec']['config'].get('plan_sha256')
+                       == target['spec']['config'].get('plan_sha256'))
+        eval_keys = ('mode', 'arm', 'epoch', 'beta_override')
+        eval_match = (kinds == ('eval', 'eval') and target['status'] == 'succeeded'
+                      and original['spec'].get('metadata', {}).get('plan_sha256')
+                      == target['spec'].get('metadata', {}).get('plan_sha256')
+                      and all(original['spec']['config'].get(key) == target['spec']['config'].get(key)
+                              for key in eval_keys)
+                      and restart.get('output_sha256'))
+        support_match = (kinds == ('analysis', 'analysis') and target['status'] == 'succeeded'
+                         and original['spec'].get('config') == target['spec'].get('config')
+                         and restart.get('output_sha256'))
         if (original['status'] == 'failed' and target and replacement.get('evidence')
-                and target['spec'].get('metadata', {}).get('independent_restart', {}).get('original_job') == original['id']
-                and original['spec']['kind'] == target['spec']['kind'] == 'train'
-                and original['spec']['config'].get('plan_sha256')
-                == target['spec']['config'].get('plan_sha256')):
+                and restart.get('original_job') == original['id']
+                and (train_match or eval_match or support_match)):
             chosen = target
         result[chosen['id']] = chosen
     return list(result.values())

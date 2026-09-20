@@ -1,4 +1,5 @@
 """Node-local dataset mapping, compatibility and real CPU execution tests."""
+import hashlib
 import json
 import sys
 import tempfile
@@ -34,6 +35,9 @@ class DatasetPathTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.data = self.root / "data with spaces"
         self.data.mkdir()
+        self.dataset_file = self.data / "manifest.json"
+        self.dataset_file.write_text("{}")
+        self.dataset_sha = hashlib.sha256(self.dataset_file.read_bytes()).hexdigest()
         self.store = Store(self.root / "state.db")
         self.n = node(str(self.root / "runs"))
         self.store.register_node(self.n)
@@ -47,6 +51,7 @@ class DatasetPathTests(unittest.TestCase):
     def named_job(self):
         j = job(gpu_count=0, vram=0)
         j.update(dataset="vehicle-v1", cwd=str(self.root), outputs=["result.json"],
+                 dataset_files=[{"path": "manifest.json", "sha256": self.dataset_sha}],
                  argv=[sys.executable, "-c", "pass", "{dataset_path}"],
                  config={"root": "{dataset_path}", "nested": [{"train": "{dataset_path}/train"}]},
                  env={"DATA_ROOT": "{dataset_path}"})
@@ -61,6 +66,16 @@ class DatasetPathTests(unittest.TestCase):
                         {"bad/name": "/data"}, {"name": "/data/\x00bad"}):
             with self.subTest(mapping=mapping), self.assertRaises(ValueError):
                 node_spec(dict(self.n, datasets=mapping))
+        for path in ("/absolute.json", "../escape.json", "bad\\path.json", ""):
+            invalid = self.named_job()
+            invalid["dataset_files"] = [{"path": path, "sha256": self.dataset_sha}]
+            with self.subTest(dataset_file=path), self.assertRaises(ValueError):
+                experiment([invalid])
+        without_mapping = self.named_job()
+        without_mapping["dataset"] = ""
+        without_mapping["dataset_path"] = str(self.data)
+        with self.assertRaisesRegex(ValueError, "logical dataset"):
+            experiment([without_mapping])
 
     def test_probe_accepts_readable_dir_file_and_symlink(self):
         self.assertTrue(dataset_status(str(self.data))["available"])
@@ -118,6 +133,8 @@ class DatasetPathTests(unittest.TestCase):
             self.assertEqual(r["env"]["DATA_ROOT"], path)
             self.assertEqual(r["config"]["nested"][0]["train"], path + "/train")
             self.assertEqual(r["job_spec"]["dataset"], "vehicle-v1")
+            self.assertEqual(r["input_files"][-1], {
+                "path": path + "/manifest.json", "sha256": self.dataset_sha})
 
     def test_editing_mapping_preserves_frozen_live_attempt(self):
         self.store.set_dataset("a", "vehicle-v1", str(self.data))

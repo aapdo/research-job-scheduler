@@ -8,7 +8,80 @@ from .build_placement import placement_key, build_pressure
 from .draining import epoch_publication_allowed, host_resource_reservations
 
 
-def gpu_placement_key(chosen, snapshot, held, node):
+TRAIN_DENSE_NODES=('rp2','cps2-model','cps1-model','farm9-gui2')
+TRAIN_SECONDARY_NODES=('lab1','farm8-gui2','farm6','farm7')
+TRAIN_PREFERRED_NODES=TRAIN_DENSE_NODES+TRAIN_SECONDARY_NODES
+EVAL_PREFERRED_NODES=('lab2','lab3','lab4','lab8','lab6')
+
+
+def workload_node_allowed(kind,node_id):
+    """Keep model train/eval execution inside its configured GPU pool."""
+    # Generic/library nodes used outside the managed model fleet have no pool
+    # contract here. Every production model GPU is listed in exactly one set.
+    if node_id not in set(TRAIN_PREFERRED_NODES)|set(EVAL_PREFERRED_NODES):return True
+    if kind=='train':return node_id in TRAIN_PREFERRED_NODES
+    if kind=='eval':return node_id in EVAL_PREFERRED_NODES
+    return True
+
+
+def workload_node_rank(kind,node_id):
+    """Pool order shared by execution placement, artifact staging and UI."""
+    if kind=='train':
+        if node_id in TRAIN_DENSE_NODES:return 0,TRAIN_DENSE_NODES.index(node_id)
+        if node_id in TRAIN_SECONDARY_NODES:return 1,TRAIN_SECONDARY_NODES.index(node_id)
+    elif kind=='eval':
+        if node_id in EVAL_PREFERRED_NODES:return 0,EVAL_PREFERRED_NODES.index(node_id)
+    return 3,999
+
+
+def workload_round_candidates(kind, rows, nodes, held):
+    """Select the configured breadth/depth round before pressure scoring.
+
+    Train fills every eligible primary-pool GPU to depth one before packing a
+    second train, then visits the secondary train pool. Eval remains in the
+    eval pool. There is no cross-pool execution fallback. Dependency artifacts
+    may still relay from their producer pool to the consumer's permitted pool.
+    Only candidates that already passed fit() participate, so an unhealthy or
+    resource-ineligible GPU can never hold a round open.
+    """
+    if kind not in ('train','eval'):
+        return rows,lambda row:()
+    rows=[row for row in rows if workload_node_allowed(kind,row[1])]
+    if not rows:return [],lambda row:()
+    def depth(row):
+        counts=[]
+        for gpu in row[2]:
+            users=[a for a in held if gpu in a['spec'].get('gpus',[])]
+            counts.append(sum(a['spec'].get('job_kind',a['spec'].get('job_spec',{}).get('kind'))==kind
+                              for a in users))
+        return max(counts,default=0)
+    def rank(row):
+        node_id=row[1]
+        order=(TRAIN_PREFERRED_NODES if node_id in TRAIN_PREFERRED_NODES
+               else EVAL_PREFERRED_NODES)
+        if node_id in order:
+            return (order.index(node_id),node_id)
+        return (-nodes[node_id].get('admission_priority',0),node_id)
+    if kind=='train':
+        primary=[row for row in rows if row[1] in TRAIN_DENSE_NODES and depth(row)<1]
+        if primary:
+            return primary,lambda row:(depth(row),)
+        primary=[row for row in rows if row[1] in TRAIN_DENSE_NODES and depth(row)<2]
+        if primary:
+            return primary,lambda row:(depth(row),)
+        secondary=[row for row in rows if row[1] in TRAIN_SECONDARY_NODES and depth(row)<1]
+        if secondary:
+            return secondary,lambda row:(depth(row),*rank(row))
+    else:
+        eval_pool=[row for row in rows if row[1] in EVAL_PREFERRED_NODES and depth(row)<1]
+        if eval_pool:
+            return eval_pool,lambda row:(depth(row),*rank(row))
+    # The permitted pool reached its configured coverage depth. Existing
+    # pressure/priority scoring chooses any additional packing within it.
+    return rows,lambda row:()
+
+
+def gpu_placement_key(chosen, snapshot, held, node, kind=None):
     """Combine configured node preference with per-GPU scheduler load.
 
     ``admission_priority`` is configured in 100-point tiers.  One eval consumes
@@ -30,10 +103,26 @@ def gpu_placement_key(chosen, snapshot, held, node):
         loads.append(units);counts.append(len(users))
     priority=node.get('admission_priority',0)
     maximum=max(loads,default=0)
+    enabled={g['uuid'] for g in node.get('gpus',[]) if g.get('enabled',True)
+             and g['uuid'] not in node.get('policy',{}).get('disabled_gpu_uuids',[])
+             and g['uuid'] not in snapshot.get('gpu_unavailable_uuids',[])}
+    node_users=[a for a in held if a.get('node')==node.get('id')
+                and a['spec'].get('gpus')]
+    server_units=sum(node_job_units(
+        a['spec'].get('job_kind',a['spec'].get('job_spec',{}).get('kind')),node)
+        for a in node_users)
+    reserved_gpus={gpu for a in node_users for gpu in a['spec'].get('gpus',[])}
+    external_units=sum(10 for gpu in snapshot.get('gpus',[])
+                       if gpu.get('uuid') in enabled and gpu.get('processes')
+                       and gpu.get('uuid') not in reserved_gpus)
+    projected_units=server_units+external_units
+    # Compare differently sized servers by average projected work per enabled
+    # GPU.  Keep integer arithmetic so placement ordering is deterministic.
+    normalized=(projected_units*100+max(1,len(enabled))-1)//max(1,len(enabled))
     # Host pressure and resource-variant preference remain in placement_key().
     # Keeping node id / chosen UUIDs out of this prefix lets those existing
     # tie-breakers decide genuinely equal GPU-load candidates.
-    return (maximum*100-priority,maximum,sum(loads),max(counts,default=0),
+    return (maximum*100-priority,normalized,maximum,sum(loads),max(counts,default=0),
             sum(counts),-priority)
 
 
@@ -90,8 +179,6 @@ def base_health(node, snap, now):
         return "CPU utilization above limit"
     if snap["ram_available_mib"] < p["min_free_ram_mib"]:
         return "insufficient host RAM headroom"
-    if snap["disk_free_mib"] < p["min_free_disk_mib"]:
-        return "insufficient work filesystem space"
     return ""
 
 
@@ -198,6 +285,46 @@ def lineage_error(key, by_id, latest, lineage_cache):
     return reason
 
 
+def dependency_pool_candidates(spec, nodes, snapshots, held, history, successful, groups, now):
+    """Return policy-selected hosts, including hosts needing only artifact relay.
+
+    Synthetic receipts exist only in this feasibility calculation. Never return
+    them to the launch path. All GPU, host, runtime and telemetry gates stay on.
+    """
+    if spec['kind'] not in ('train', 'eval') or not spec['resources']['gpu_count']:
+        return None
+    deps = [d for d in spec['depends_on'] if d not in spec.get('order_only_dependencies', [])]
+    if not deps or any(d not in successful for d in deps):
+        return None
+    rows, missing_by_node = [], {}
+    for node_id, node in nodes.items():
+        if not node['enabled'] or (spec['hosts'] and node_id not in spec['hosts']):
+            continue
+        hypothetical = dict(successful)
+        missing = []
+        for dep in deps:
+            a = successful[dep]
+            same = (node['storage_domain'] and node['storage_domain'] ==
+                    a['spec']['node_spec']['storage_domain'])
+            if (not a.get('origin_retired') and (a['node'] == node_id or same)) or node_id in a.get('artifact_locations', {}):
+                continue
+            if not (a.get('report', {}).get('outputs') or a.get('report', {}).get('hf_artifact')):
+                continue
+            hypothetical[dep] = dict(a, artifact_locations={**a.get('artifact_locations', {}), node_id: {}})
+            missing.append(dep)
+        for resources in [spec['resources'], *spec.get('resource_variants', [])]:
+            reason, gpus = fit(dict(spec, resources=resources), node, snapshots.get(node_id),
+                               held, history, hypothetical, groups, now)
+            if not reason:
+                rows.append(((), node_id, gpus, resources))
+                missing_by_node[node_id] = missing
+                break
+    if not rows:
+        return None
+    preferred, _ = workload_round_candidates(spec['kind'], rows, nodes, held)
+    return {row[1]: missing_by_node[row[1]] for row in preferred}
+
+
 def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
     """Return simulated placements with reasons; never mutate runtime or launch jobs."""
     now = time.time() if now is None else now
@@ -242,7 +369,15 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
         if waiting:
             plan.append({"job": j["id"], "decision": "blocked", "reason": "dependencies not successful: " + ", ".join(waiting)})
             continue
+        relay_pool = dependency_pool_candidates(spec, nodes, snapshots, held, attempts,
+                                                successful, groups, now)
+        if relay_pool and all(relay_pool.values()):
+            plan.append({'job': j['id'], 'decision': 'waiting',
+                         'reasons': {n: 'preferred GPU pool dependency relay pending: ' + ', '.join(deps)
+                                     for n, deps in relay_pool.items()}})
+            continue
         candidates = []
+        stabilizing = []
         for node_id, node in sorted(nodes.items()):
             reasons = []
             for index, resources in enumerate([spec['resources'], *spec.get('resource_variants', [])]):
@@ -254,22 +389,72 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None):
                     reasons.append(reason)
                 else:
                     count = sum(a["node"] == node_id for a in held)
-                    key = placement_key(node, snapshots[node_id], held, resources, now, count, index, chosen, kind=spec['kind'])
-                    if spec.get('metadata', {}).get('prefer_primary_resources'):
-                        key = (index, *key)
+                    key = placement_key(node, snapshots[node_id], held, resources, now, count, index, chosen,
+                                        kind=spec['kind'],history=attempts)
                     if resources['gpu_count']:
-                        key = (*gpu_placement_key(chosen,snapshots[node_id],held,node),*key)
+                        gpu_key=gpu_placement_key(chosen,snapshots[node_id],held,node,spec['kind'])
+                        key=((index,*gpu_key,*key) if spec.get('metadata',{}).get('prefer_primary_resources')
+                             else (*gpu_key,*key))
+                    elif spec.get('metadata', {}).get('prefer_primary_resources'):
+                        key = (index, *key)
                     candidates.append((key, node_id, chosen, resources))
                     if not resources['gpu_count']:break
+                if (reason == 'waiting for stable health polls'
+                        and resources['gpu_count'] and snapshots.get(node_id)):
+                    snap=snapshots[node_id]
+                    stable_since=snap.get('stable_since')
+                    if (isinstance(stable_since,(int,float)) and 0<=now-stable_since<180
+                            and not base_health(node,snap,now)):
+                        # Simulate only the missing independent-poll gate.  A
+                        # second fit must pass every data/runtime/resource gate
+                        # before this node is allowed to delay a ready launch.
+                        import copy
+                        warmed=copy.deepcopy(snap)
+                        warmed['stable_polls']=node['policy']['stable_polls']
+                        for gpu in warmed.get('gpus',[]):
+                            gpu['stable_polls']=max(
+                                gpu.get('stable_polls',0),node['policy']['stable_polls'])
+                        warm_reason,warm_chosen=fit(dict(spec,resources=resources),node,warmed,
+                                                    held,attempts,successful,groups,now)
+                        if not warm_reason:
+                            count=sum(a['node']==node_id for a in held)
+                            warm_key=placement_key(node,warmed,held,resources,now,count,index,
+                                                   warm_chosen,kind=spec['kind'],history=attempts)
+                            gpu_key=gpu_placement_key(warm_chosen,warmed,held,node,spec['kind'])
+                            warm_key=((index,*gpu_key,*warm_key)
+                                      if spec.get('metadata',{}).get('prefer_primary_resources')
+                                      else (*gpu_key,*warm_key))
+                            stabilizing.append((warm_key,node_id,warm_chosen,resources))
             if reasons and len(reasons) == 1 + len(spec.get('resource_variants', [])):
                 failures[node_id] = '; '.join(dict.fromkeys(reasons))
         if not candidates:
             plan.append({"job": j["id"], "decision": "waiting", "reasons": failures or {"inventory": "no nodes registered"}})
             continue
-        _, node_id, chosen, resources = min(candidates, key=lambda c: c[0])
+        if spec['kind']=='train' and not any(row[1] in TRAIN_DENSE_NODES for row in candidates):
+            primary_validations=[a for a in held if a.get('node') in TRAIN_DENSE_NODES
+                and a.get('job','').startswith('EXEC_VERIFY_')
+                and a.get('spec',{}).get('job_kind',a.get('spec',{}).get('job_spec',{}).get('kind'))=='prepare'
+                and a.get('spec',{}).get('gpus')]
+            if primary_validations:
+                plan.append({"job":j['id'],"decision":"waiting","reasons":{
+                    "primary_train_pool":"GPU execution validation in progress; secondary pool held"}})
+                continue
+        combined=[('ready',row) for row in candidates]+[('stabilizing',row) for row in stabilizing]
+        eligible,round_key=workload_round_candidates(spec['kind'],[row for _,row in combined],nodes,held)
+        allowed={id(row) for row in eligible}
+        combined=[item for item in combined if id(item[1]) in allowed]
+        state,best=min(combined,key=lambda item:(*round_key(item[1]),*item[1][0]))
+        if state=='stabilizing':
+            plan.append({"job":j['id'],"decision":"waiting",
+                         "reasons":{best[1]:
+                            "preferred lower-load node stabilizing (up to 180 seconds)"}})
+            continue
+        _, node_id, chosen, resources = best
         placement = {"job": j["id"], "decision": "ready", "node": node_id, "gpus": chosen,
                      "filesystem_request": job_filesystem(spec),
-                     "filesystem": node_filesystem(nodes[node_id])}
+                     "filesystem": node_filesystem(nodes[node_id]),
+                     "placement_audit": {"eligible_nodes": sorted({row[1] for row in candidates}),
+                                         "rejected_nodes": failures}}
         if resources.get('build_slots', 0):
             score, pressure = build_pressure(nodes[node_id], snapshots[node_id], held, resources, now)
             placement['build_placement'] = dict(policy='spread-first-v2', score=score, projected_pressure=pressure)
@@ -319,6 +504,10 @@ def fit(job, node, snap, held, history, successful, groups, now):
     except ValueError:
         return 'invalid execution profile', []
     p, req = node["policy"], job["resources"]
+    if (req['gpu_count'] and job['kind'] in ('train','eval')
+            and not workload_node_allowed(job['kind'],node['id'])):
+        return ('workload pool restriction: '+job['kind']+' requires its '
+                +job['kind']+' pool'), []
     runtime_hold = node.get('labels', {}).get('gpu_runtime_quarantine', {})
     if (req['gpu_count'] and runtime_hold.get('boot_id')
             and runtime_hold['boot_id'] == (snap or {}).get('boot_id')):
@@ -337,6 +526,10 @@ def fit(job, node, snap, held, history, successful, groups, now):
         return "node disabled/drained", []
     if job["hosts"] and node["id"] not in job["hosts"]:
         return "host constraint", []
+    from .report_placement import required_dependency_host
+    report_host = required_dependency_host(job, successful)
+    if report_host is not None and node["id"] != report_host:
+        return "report follows execution dependency: " + report_host, []
     mapping=job.get('metadata',{}).get('gpu_count_by_host')
     if mapping is not None and mapping.get(node['id'])!=req['gpu_count']:
         return 'host-specific GPU count constraint', []
@@ -377,8 +570,8 @@ def fit(job, node, snap, held, history, successful, groups, now):
             return "missing successful dependency receipt: " + dep, []
         if dep in job.get("order_only_dependencies", []):
             continue
-        if a["node"] != node["id"] and not (node["storage_domain"] and
-                a["spec"]["node_spec"]["storage_domain"] == node["storage_domain"]):
+        if a.get('origin_retired') or (a["node"] != node["id"] and not (node["storage_domain"] and
+                a["spec"]["node_spec"]["storage_domain"] == node["storage_domain"])):
             if node['id'] not in a.get('artifact_locations', {}):
                 suffix = ' (HF download pending)' if a.get('report', {}).get('hf_artifact') else ''
                 return "dependency artifacts on another local filesystem: " + dep + suffix, []
@@ -465,6 +658,7 @@ def fit(job, node, snap, held, history, successful, groups, now):
         if starts and now - max(starts) < groups[group]["min_start_interval_s"]:
             return "shared-storage start interval", []
     candidates = []
+    stabilizing_empty_gpu = False
     for gpu in snap["gpus"]:
         if gpu["uuid"] not in registered:
             continue
@@ -473,6 +667,13 @@ def fit(job, node, snap, held, history, successful, groups, now):
         # GPU inventory may move to a replacement container while old attempts
         # keep running. UUID reservations remain global across those containers.
         users = [a for a in held if gpu["uuid"] in a["spec"]["gpus"]]
+        if job['kind']=='train' and node['id'] in TRAIN_DENSE_NODES:
+            # Primary train nodes may accept a second train only while
+            # live telemetry still shows genuine compute/thermal headroom.
+            if (gpu.get('util_percent') is None or gpu['util_percent']>=70
+                    or gpu.get('temperature_c') is None
+                    or gpu['temperature_c']>=p.get('warm_gpu_temp_c',80)):
+                continue
         if (p.get("temperature_scope", "node") == "gpu"
                 and gpu.get("temperature_c") is not None
                 and gpu["temperature_c"] >= p.get("warm_gpu_temp_c", 80)
@@ -480,7 +681,14 @@ def fit(job, node, snap, held, history, successful, groups, now):
             continue
         required_polls = (p.get("shared_stable_polls", 1)
                           if req["gpu_mode"] == "shared" and users else p["stable_polls"])
-        if gpu.get("stable_polls", 0) < required_polls or not gpu_healthy(gpu, node, req["gpu_mode"]):
+        stable = gpu.get("stable_polls", 0) >= required_polls
+        healthy = gpu_healthy(gpu, node, req["gpu_mode"])
+        if (not stable and healthy and not users and not gpu.get('processes')
+                and job['kind']=='train' and node['id'] in TRAIN_DENSE_NODES):
+            total = min(gpu["memory_mib"], registered[gpu["uuid"]]["memory_mib"])
+            if req["vram_mib"] + gpu.get('used_mib', 0) + p["gpu_margin_mib"] <= total:
+                stabilizing_empty_gpu = True
+        if not stable or not healthy:
             continue
         if req["gpu_mode"] == "exclusive" and users:
             continue
@@ -491,6 +699,17 @@ def fit(job, node, snap, held, history, successful, groups, now):
         if users and any(not a.get("report", {}).get("ready", False) for a in users):
             continue
         shared_cap=p.get("max_shared_jobs_per_gpu",2)
+        if job['kind']=='train' and node['id'] in TRAIN_DENSE_NODES:
+            # Dense train nodes default to two concurrent train processes per
+            # GPU.  A node-local override is explicit so raising one large
+            # RunPod node does not relax the rest of the primary pool.
+            train_cap=node.get('labels',{}).get('max_train_jobs_per_gpu',2)
+            if type(train_cap) is not int or train_cap<1:
+                return 'invalid train GPU sharing cap', []
+            train_users=sum(a['spec'].get('job_kind',a['spec'].get('job_spec',{}).get('kind'))=='train'
+                            for a in users)
+            if train_users>=train_cap:
+                continue
         if job['kind']=='eval' and 'max_eval_jobs_per_gpu' in node.get('labels',{}):
             shared_cap=node['labels']['max_eval_jobs_per_gpu']
             if type(shared_cap) is not int or shared_cap<1:
@@ -516,8 +735,14 @@ def fit(job, node, snap, held, history, successful, groups, now):
         occupied = occupied_vram(gpu, users, p["allow_external_gpu_processes"])
         if req["vram_mib"] + occupied + p["gpu_margin_mib"] > total:
             continue
-        candidates.append((bool(users or gpu.get('processes')),len(users), occupied, gpu["temperature_c"], gpu["index"], gpu["uuid"]))
+        same_kind=sum(a['spec'].get('job_kind',a['spec'].get('job_spec',{}).get('kind'))==job['kind']
+                      for a in users)
+        candidates.append((bool(users or gpu.get('processes')),same_kind,len(users),occupied,
+                           gpu["temperature_c"],gpu["index"],gpu["uuid"]))
     candidates.sort()
+    if (stabilizing_empty_gpu and candidates and candidates[0][0]
+            and job['kind']=='train' and node['id'] in TRAIN_DENSE_NODES):
+        return "waiting for stable health polls", []
     if req["gpu_count"] > len(candidates):
         return "not enough healthy GPUs with requested per-device VRAM/ownership", []
     return "", [row[-1] for row in candidates[:req["gpu_count"]]]

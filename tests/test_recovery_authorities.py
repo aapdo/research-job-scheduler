@@ -58,3 +58,44 @@ class RecoveryAuthoritiesTests(unittest.TestCase):
         jobs, experiments, campaign = self.replacement_case()
         jobs[1]['spec']['config']['plan_sha256'] = 'other'
         self.assertEqual(current_campaign_jobs(jobs, experiments, campaign)[0]['status'], 'failed')
+
+    def test_successful_eval_replacement_is_counted_without_erasing_failure(self):
+        old = dict(id='old-eval', experiment='e', status='failed', spec=dict(kind='eval',
+            config={'mode':'eval','arm':'learned','epoch':0}, metadata={
+                'plan_sha256':'science-plan',
+                'recovery_replacement':{'job':'new-eval','evidence':'verified output'}}))
+        new = dict(id='new-eval', experiment='other', status='succeeded', spec=dict(kind='eval',
+            config={'mode':'eval','arm':'learned','epoch':0}, metadata={
+                'plan_sha256':'science-plan',
+                'independent_restart':{'original_job':'old-eval','output_sha256':'a'*64}}))
+        experiments = {'e': {'project':'main'}, 'other': {'project':'recovery'}}
+        campaign = {'projects':['main'], 'experiments':['other']}
+        before = copy.deepcopy([old, new])
+        self.assertEqual([x['id'] for x in current_campaign_jobs([old, new], experiments, campaign)], ['new-eval'])
+        self.assertEqual([old, new], before)
+
+    def test_eval_replacement_requires_success_and_matching_science(self):
+        old = dict(id='old-eval', experiment='e', status='failed', spec=dict(kind='eval',
+            config={'mode':'eval','arm':'learned','epoch':0}, metadata={
+                'plan_sha256':'science-plan',
+                'recovery_replacement':{'job':'new-eval','evidence':'verified output'}}))
+        new = dict(id='new-eval', experiment='other', status='running', spec=dict(kind='eval',
+            config={'mode':'eval','arm':'learned','epoch':0}, metadata={
+                'plan_sha256':'science-plan',
+                'independent_restart':{'original_job':'old-eval','output_sha256':'a'*64}}))
+        experiments = {'e': {'project':'main'}, 'other': {'project':'recovery'}}
+        campaign = {'projects':['main'], 'experiments':['other']}
+        self.assertEqual(current_campaign_jobs([old, new], experiments, campaign)[0]['id'], 'old-eval')
+        new['status'] = 'succeeded';new['spec']['config']['epoch'] = 5
+        self.assertEqual(current_campaign_jobs([old, new], experiments, campaign)[0]['id'], 'old-eval')
+
+    def test_successful_analysis_repair_replaces_failed_support_job(self):
+        old = dict(id='old-head', experiment='e', status='failed', spec=dict(kind='analysis',
+            config={'train_dependency':'train','eval_dependency':'eval'}, metadata={
+                'recovery_replacement':{'job':'new-head','evidence':'verified output'}}))
+        new = dict(id='new-head', experiment='other', status='succeeded', spec=dict(kind='analysis',
+            config={'train_dependency':'train','eval_dependency':'eval'}, metadata={
+                'independent_restart':{'original_job':'old-head','output_sha256':'b'*64}}))
+        experiments = {'e': {'project':'main'}, 'other': {'project':'repair'}}
+        campaign = {'projects':['main'], 'experiments':['other']}
+        self.assertEqual([x['id'] for x in current_campaign_jobs([old, new], experiments, campaign)], ['new-head'])

@@ -214,6 +214,23 @@ class Store:
             self.event("external_gpu_process_admission_changed", node_id, data)
         return {"node": node_id, "changed": True, **data}
 
+    def set_min_free_disk_mib(self, node_id, value):
+        """Change the future local-disk admission floor without touching live attempts."""
+        from .schema import number
+        number(value, "min_free_disk_mib", 1, True)
+        with self.lock(), self.db:
+            n = self.specs("nodes").get(node_id)
+            check(n is not None, "unknown node: " + node_id)
+            before = n["policy"].get("min_free_disk_mib")
+            if before == value:
+                return {"node": node_id, "min_free_disk_mib": value, "changed": False}
+            n["policy"]["min_free_disk_mib"] = value
+            self.db.execute("UPDATE nodes SET spec=? WHERE id=?", (dumps(node_spec(n)), node_id))
+            data = {"old_min_free_disk_mib": before, "min_free_disk_mib": value,
+                    "active_attempts_unchanged": True}
+            self.event("min_free_disk_policy_changed", node_id, data)
+        return {"node": node_id, "changed": True, **data}
+
     def set_gpu_packing(self, node_id, enabled, max_shared_jobs_per_gpu=2):
         """Configure future scheduler-owned sharing; active attempts stay frozen."""
         from .schema import number
@@ -327,7 +344,18 @@ class Store:
             existing = self.specs("experiments").get(e["id"])
             if existing is not None and experiment_spec(existing) == e:
                 return e  # idempotent registration, never resets completed jobs
+            from .model_priority import priority_for
+            e['priority'] = priority_for(e)
+            from .report_placement import on_archive_host
+            report_node = self.specs('nodes').get('lab4')
+            if report_node is not None:
+                e['jobs'] = [on_archive_host(job, report_node) for job in e['jobs']]
+            if existing is not None and experiment_spec(existing) == e:
+                return e
             check(existing is None, "experiment already exists; use a new revision ID")
+            from .report_placement import validate_report_policy
+            for job in e["jobs"]:
+                validate_report_policy(job)
             jobs = {j["id"]: j["spec"] for j in self.jobs()}
             for j in e["jobs"]:
                 check(j["id"] not in jobs, "job IDs are globally unique: " + j["id"])
@@ -424,10 +452,11 @@ class Store:
             if row['direction'] == 'upload':
                 attempt['report']['hf_artifact'] = receipt
         for row in transfer_rows:
-            if row['direction'] != 'download': continue
+            if row['direction'] not in ('download', 'archive'): continue
             attempt = by_id.get(row['attempt'])
             if attempt is None or attempt['status'] != 'succeeded': continue
-            receipt = json.loads(row['report']).get('artifact')
+            transfer_report = json.loads(row['report'])
+            receipt = transfer_report.get('artifact')
             if not receipt: continue
             report=attempt['report']
             job_spec=attempt.get('spec',{}).get('job_spec',{})
@@ -440,7 +469,13 @@ class Store:
             # Old output-only relays must not shadow a complete checkpoint
             # manifest published later by the same immutable attempt.
             if not set(required).issubset(receipt.get('files',{})): continue
+            if row['direction'] == 'archive' and any((receipt['files'][name].get('sha256'), receipt['files'][name].get('bytes')) !=
+                   (value.get('sha256'), value.get('bytes')) for name, value in required.items()):
+                continue
             attempt.setdefault('artifact_locations', {})[row['node']] = receipt
+            if row['direction'] == 'archive' and (transfer_report.get('origin_retired')
+                    or transfer_report.get('source_cleanup', {}).get('deleted')):
+                attempt['origin_retired'] = True
         return result
 
     def prioritize(self, job_id, priority):

@@ -82,6 +82,16 @@ class DispatchFreshnessTests(unittest.TestCase):
         self.assertEqual(result['plan'][0]['decision'], 'waiting')
         self.assertEqual(len(self.calls), 1)
 
+    def test_external_artifact_owner_leaves_model_dispatch_enabled(self):
+        with self.store.db:
+            self.store.db.execute('CREATE TABLE artifact_service_config(id INTEGER PRIMARY KEY, enabled INTEGER)')
+            self.store.db.execute('INSERT INTO artifact_service_config VALUES(1,1)')
+        with patch('research_scheduler.artifacts.tick') as artifacts, \
+                patch.object(self.controller, '_launch', side_effect=lambda p:p):
+            result = self.controller.tick(execute=True)
+        artifacts.assert_not_called()
+        self.assertEqual(len(result['launches']), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -7,6 +7,10 @@ from research_scheduler import agent
 from research_scheduler.artifacts import hf_spec,upload_pause,retry_possible
 
 class PacingTests(unittest.TestCase):
+    def test_implicit_publication_is_disabled_without_service_environment(self):
+        with patch.dict('os.environ',{},clear=True):
+            self.assertFalse(hf_spec(dict(repo_id='a/b'))['enabled'])
+
     def test_live_default_can_disable_implicit_publication(self):
         with patch.dict('os.environ',{'RS_HF_UPLOAD_DEFAULT':'0'}):
             self.assertFalse(hf_spec(dict(repo_id='a/b'))['enabled'])

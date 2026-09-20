@@ -50,6 +50,110 @@ def dependency_artifacts(directory, patterns, outputs):
     return files
 
 
+def complete_attempt_manifest(directory):
+    """Hash every regular attempt-local file; reject links and special files."""
+    root = Path(directory).resolve()
+    files = {}
+    for path in sorted(root.rglob('*')):
+        if path.is_symlink():
+            raise ValueError('attempt archive contains a symlink: ' + str(path.relative_to(root)))
+        if path.is_dir():
+            continue
+        if not path.is_file() or not path.resolve().is_relative_to(root):
+            raise ValueError('attempt archive contains a non-regular file')
+        files[path.relative_to(root).as_posix()] = {
+            'bytes': path.stat().st_size, 'sha256': digest(path)}
+    return files
+
+
+def cleanup_archived_attempt(request):
+    """Delete one terminal source only after a verified complete LAB4 receipt."""
+    archive = request.get('archive_receipt', {})
+    if (archive.get('attempt') != request.get('id') or not archive.get('attempt_archive')
+            or not archive.get('complete_attempt') or not archive.get('files')):
+        raise ValueError('complete attempt archive receipt required')
+    original = Path(request['attempt_dir'])
+    if original.is_symlink():
+        raise ValueError('attempt cleanup refuses symlink roots')
+    directory = original.resolve()
+    work_root = Path(request['node_spec']['work_root']).resolve()
+    if not directory.is_relative_to(work_root) or directory == work_root:
+        raise ValueError('attempt cleanup path escapes node work root')
+    if not directory.exists():
+        return {'deleted': True, 'already_absent': True, 'attempt': request['id']}
+    spec = json.loads((directory / 'spec.json').read_text())
+    if spec.get('id') != request['id'] or spec.get('attempt_dir') != request['attempt_dir']:
+        raise ValueError('attempt cleanup specification identity mismatch')
+    state = json.loads((directory / 'state.json').read_text())
+    if state.get('attempt') != request['id'] or state.get('status') not in ('succeeded', 'failed'):
+        raise ValueError('attempt cleanup requires a terminal matching source')
+    if state.get('child_pgid') and group_alive(state['child_pgid']):
+        raise ValueError('attempt cleanup refused while descendants are alive')
+    runner = process(state.get('runner_pid', 0))
+    if (runner and runner['start'] == state.get('runner_start') and runner['state'] != 'Z'
+            and state.get('boot_id') == Path('/proc/sys/kernel/random/boot_id').read_text().strip()):
+        raise ValueError('attempt runner is still alive')
+    grace = request.get('archive_idle_s', 1800)
+    if time.time() - state.get('finished', time.time()) < grace:
+        raise ValueError('attempt was used within archive idle grace')
+    assert_attempt_not_open(directory)
+    files = complete_attempt_manifest(directory)
+    identity = {name: {'bytes': value['bytes'], 'sha256': value['sha256']}
+                for name, value in archive['files'].items()}
+    if files != identity:
+        raise ValueError('attempt source changed after archive')
+    manifest_sha = hashlib.sha256(json.dumps(
+        files, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+    if manifest_sha != archive.get('manifest_sha256'):
+        raise ValueError('attempt archive manifest mismatch')
+    assert_attempt_not_open(directory)
+    shutil.rmtree(directory)
+    return {'deleted': True, 'already_absent': False, 'attempt': request['id'],
+            'manifest_sha256': manifest_sha, 'files': len(files), 'finished': time.time()}
+
+
+def assert_attempt_not_open(directory):
+    """Check currently open files/cwd of this UID, including unregistered users."""
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            links = [entry / 'cwd', *(entry / 'fd').iterdir()]
+            for link in links:
+                try:
+                    name = os.readlink(link).removesuffix(' (deleted)')
+                except FileNotFoundError:
+                    continue
+                if name == str(directory) or name.startswith(str(directory) + '/'):
+                    raise ValueError('attempt is open in process ' + entry.name)
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            raise ValueError('cannot verify same-UID process use of attempt')
+
+
+def verify_archived_attempt(request):
+    archive = request['archive_receipt']
+    root = Path(archive['root'])
+    work_root = Path(request['archive_work_root']).resolve()
+    if root.is_symlink() or not root.resolve().is_relative_to(work_root / 'attempt-archive'):
+        raise ValueError('invalid archive verification path')
+    spec = json.loads((root / 'spec.json').read_text())
+    if spec.get('id') != archive.get('attempt'):
+        raise ValueError('archive attempt identity mismatch')
+    files = complete_attempt_manifest(root)
+    expected = {k: {'bytes': v['bytes'], 'sha256': v['sha256']} for k, v in archive['files'].items()}
+    if files != expected:
+        raise ValueError('LAB4 archive changed before source cleanup')
+    sha = hashlib.sha256(json.dumps(files, sort_keys=True, ensure_ascii=False,
+                                   separators=(',', ':')).encode()).hexdigest()
+    if sha != archive['manifest_sha256']:
+        raise ValueError('LAB4 manifest digest mismatch')
+    return dict(verified=True, attempt=archive['attempt'], manifest_sha256=sha)
+
+
 def validate_rtl(directory, kind, contract):
     """Validate real attempt-local artifacts, not a producer's success flag."""
     directory = Path(directory).resolve()
@@ -924,6 +1028,10 @@ def main():
         patterns = job_spec.get('dependency_artifacts', job_spec.get('hf_artifacts', []))
         result['dependency_artifacts'] = dependency_artifacts(
             request['attempt_dir'], patterns, result.get('outputs', {}))
+    elif action == 'cleanup_archived_attempt':
+        result = cleanup_archived_attempt(request)
+    elif action == 'verify_archived_attempt':
+        result = verify_archived_attempt(request)
     elif action == 'dataset_receipt':
         result = read_status(request)
         if result.get('status') == 'succeeded':

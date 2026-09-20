@@ -74,6 +74,8 @@ test('campaign publication distinguishes active upload from unsent backlog', () 
   }
   context.c={recorded_state:'running',counts:{running:1},publication:{pending:47,uploading:2}};
   assert.equal(vm.runInContext('campaignStatusHtml(c)',context),'<span class="badge blue">실행 중</span>');
+  context.c={recorded_state:'running',counts:{running:1,validation_failed:1},publication:{}};
+  assert.equal(vm.runInContext('campaignStatusHtml(c)',context),'<span class="badge bad">검증 실패</span>');
 });
 
 test('RTL validation aggregates actual validation jobs, not the later build outcome', () => {
@@ -87,6 +89,62 @@ test('RTL validation aggregates actual validation jobs, not the later build outc
 test('GPU scope includes CPS', () => {
   const html = fs.readFileSync(path.join(__dirname, 'dist/index.html'), 'utf8');
   assert.match(html, /<option value="cps">CPS<\/option>/);
+});
+
+test('GPU cards and server selector follow train then eval pool priority', () => {
+  const {context,get}=dashboard();
+  context.data={gpus:[
+    {node:'lab3',index:0,enabled:true,jobs:[],placement_pool:'eval',placement_rank:4},
+    {node:'lab2',index:0,enabled:true,jobs:[],placement_pool:'eval',placement_rank:1},
+    {node:'rp1',index:0,enabled:true,jobs:[],placement_pool:'train',placement_rank:1},
+    {node:'rp2',index:0,enabled:false,jobs:[],placement_pool:'train',placement_rank:2},
+    {node:'rp3',index:0,enabled:true,jobs:[],placement_pool:'train',placement_rank:3},
+    {node:'cps2-model',index:0,enabled:true,jobs:[],placement_pool:'train',placement_rank:4},
+    {node:'farm6',index:0,enabled:true,jobs:[],placement_pool:'train',placement_rank:9},
+  ],health:[]};
+  vm.runInContext('renderGPU(data);updateGPUServers(data)',context);
+  const cards=get('gpu-content').innerHTML;
+  assert.ok(cards.indexOf('RP1')<cards.indexOf('RP2'));
+  assert.ok(cards.indexOf('RP2')<cards.indexOf('RP3'));
+  assert.ok(cards.indexOf('RP3')<cards.indexOf('CPS2-MODEL'));
+  assert.ok(cards.indexOf('CPS2-MODEL')<cards.indexOf('FARM6'));
+  assert.ok(cards.indexOf('FARM6')<cards.indexOf('LAB2'));
+  assert.ok(cards.indexOf('LAB2')<cards.indexOf('LAB3'));
+  assert.match(cards,/Train pool/);
+  assert.match(cards,/Eval pool/);
+  assert.match(cards,/RP1 · <span class="pool-tag train">Train pool<\/span>/);
+  assert.doesNotMatch(cards,/\d+순위/);
+  const options=get('gpu-server').innerHTML;
+  assert.ok(options.indexOf('rp1')<options.indexOf('rp2'));
+  assert.ok(options.indexOf('rp2')<options.indexOf('rp3'));
+  assert.ok(options.indexOf('rp3')<options.indexOf('cps2-model'));
+  assert.ok(options.indexOf('cps2-model')<options.indexOf('farm6'));
+  assert.ok(options.indexOf('farm6')<options.indexOf('lab2'));
+});
+
+test('unclassified legacy servers do not get an invented pool label', () => {
+  const {context,get}=dashboard();
+  context.data={gpus:[{node:'farm2',index:0,enabled:false,jobs:[],placement_pool:'other',placement_rank:999}],health:[]};
+  vm.runInContext('renderGPU(data);updateGPUServers(data)',context);
+  assert.doesNotMatch(get('gpu-content').innerHTML,/기타 서버/);
+  assert.doesNotMatch(get('gpu-server').innerHTML,/기타 서버/);
+});
+
+test('onboarding node stays visible while disabled-server filter is off', () => {
+  const {context,get}=dashboard();
+  context.data={gpus:[
+    {node:'rp1',index:0,enabled:false,jobs:[],placement_pool:'train',placement_rank:1},
+    {node:'farm2',index:0,enabled:false,jobs:[],placement_pool:'other',placement_rank:999},
+  ],health:[
+    {id:'rp1',category:'model',enabled:false,status:'disabled',dashboard_visible_when_disabled:true},
+    {id:'farm2',category:'model',enabled:false,status:'disabled'},
+  ]};
+  get('gpu-show-disabled').checked=false;
+  vm.runInContext('current=data;renderGPU(data);updateGPUServers(data)',context);
+  assert.match(get('gpu-content').innerHTML,/RP1/);
+  assert.doesNotMatch(get('gpu-content').innerHTML,/FARM2/);
+  assert.match(get('gpu-server').innerHTML,/rp1/);
+  assert.doesNotMatch(get('gpu-server').innerHTML,/farm2/);
 });
 
 test('CPS2 unavailable badge is distinct from ordinary disabled servers', () => {

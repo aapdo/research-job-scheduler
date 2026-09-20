@@ -51,6 +51,9 @@ def parser():
     margin = sub.add_parser("set-gpu-margin", help="set per-GPU VRAM safety margin for future placement")
     margin.add_argument("node")
     margin.add_argument("mib", type=int)
+    disk = sub.add_parser("set-min-free-disk", help="set the future local-disk admission floor")
+    disk.add_argument("node")
+    disk.add_argument("mib", type=int)
     packing = sub.add_parser("set-gpu-packing", help="configure scheduler-owned VRAM packing")
     packing.add_argument("node")
     packing.add_argument("state", choices=["enabled", "disabled"])
@@ -186,6 +189,8 @@ def main(argv=None):
             result = store.set_external_gpu_processes_allowed(args.node, args.state == "enabled")
         elif cmd == "set-gpu-margin":
             result = store.set_gpu_margin_mib(args.node, args.mib)
+        elif cmd == "set-min-free-disk":
+            result = store.set_min_free_disk_mib(args.node, args.mib)
         elif cmd == "set-gpu-packing":
             result = store.set_gpu_packing(args.node, args.state == "enabled",
                                            args.max_shared_jobs_per_gpu)

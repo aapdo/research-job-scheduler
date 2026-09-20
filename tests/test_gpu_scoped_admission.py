@@ -1,8 +1,36 @@
+import time
 import unittest
 from test_scheduler import node, snapshot, job, plan, reservation
+from research_scheduler.planner import workload_node_rank
 
 
 class GPUScopedAdmissionTests(unittest.TestCase):
+    def test_shared_workload_pool_rank(self):
+        self.assertLess(workload_node_rank('train','rp2'),workload_node_rank('train','cps2-model'))
+        self.assertLess(workload_node_rank('train','cps2-model'),workload_node_rank('train','cps1-model'))
+        self.assertLess(workload_node_rank('train','cps1-model'),workload_node_rank('train','farm9-gui2'))
+        self.assertLess(workload_node_rank('train','farm9-gui2'),workload_node_rank('train','lab1'))
+        self.assertLess(workload_node_rank('train','farm7'),workload_node_rank('train','lab2'))
+        self.assertLess(workload_node_rank('eval','lab2'),workload_node_rank('eval','rp2'))
+
+    def shared_node(self,key):
+        value=node(key=key);value['max_jobs']=20
+        value['policy'].update(allow_gpu_sharing=True,max_shared_jobs_per_gpu=4,
+                               max_shared_gpu_percent=100)
+        return value
+
+    def active(self,n,gpu,kind,key):
+        value=reservation(n,key=key,gpu=gpu)
+        value['spec']['job_kind']=kind
+        value['spec']['resources'].update(gpu_mode='shared',vram_mib=1000)
+        value['report']={'ready':True}
+        return value
+
+    def candidate(self,kind):
+        value=job('next',vram=1000);value['kind']=kind
+        value['resources']['gpu_mode']='shared'
+        return value
+
     def test_hot_or_missing_gpu_does_not_block_cool_neighbor(self):
         n = node(); n['policy']['temperature_scope'] = 'gpu'
         for temperature in (None, 80, 85, 95):
@@ -44,6 +72,183 @@ class GPUScopedAdmissionTests(unittest.TestCase):
         row=plan([candidate],nodes={'high':high,'lower':lower},
                  snaps={'high':snapshot(high),'lower':snapshot(lower)},attempts=[old])[0]
         self.assertEqual(row['node'],'lower')
+
+    def test_server_weighted_load_is_normalized_by_gpu_count(self):
+        a,b=node(key='a'),node(key='b')
+        b['gpus']=[dict(b['gpus'][0],uuid='GPU-b-'+str(i),index=i) for i in range(8)]
+        old_eval=reservation(a,key='eval',gpu=0);old_eval['spec']['job_kind']='eval'
+        old_train=reservation(b,key='train',gpu=0);old_train['spec']['job_kind']='train'
+        candidate=job('next',vram=1000);candidate['kind']='eval'
+        row=plan([candidate],nodes={'a':a,'b':b},
+                 snaps={'a':snapshot(a),'b':snapshot(b)},
+                 attempts=[old_eval,old_train])[0]
+        # Both nodes have one reservation and an empty selected GPU.  The
+        # eight-GPU node has less projected weighted work per GPU.
+        self.assertEqual(row['node'],'b')
+
+    def test_better_stabilizing_node_gets_only_bounded_grace(self):
+        ready,better=node(key='a'),node(key='b')
+        old=reservation(ready,key='old',gpu=0)
+        now=time.time()
+        ready_snap=snapshot(ready,now)
+        better_snap=snapshot(better,now)
+        better['policy']['stable_polls']=3
+        better_snap.update(stable_polls=1,stable_since=now-20)
+        for gpu in better_snap['gpus']:gpu['stable_polls']=1
+        row=plan([job('next',vram=1000)],nodes={'a':ready,'b':better},
+                 snaps={'a':ready_snap,'b':better_snap},attempts=[old])[0]
+        self.assertEqual(row['decision'],'waiting')
+        self.assertIn('stabilizing',row['reasons']['b'])
+        better_snap['stable_since']=now-181
+        row=plan([job('next',vram=1000)],nodes={'a':ready,'b':better},
+                 snaps={'a':ready_snap,'b':better_snap},attempts=[old])[0]
+        self.assertEqual(row['decision'],'ready')
+        self.assertEqual(row['node'],'a')
+
+    def test_train_pool_fills_each_server_breadth_then_second_round(self):
+        farm9=self.shared_node('farm9-gui2');lab1=self.shared_node('lab1')
+        nodes={n['id']:n for n in (farm9,lab1)}
+        snaps={key:snapshot(value) for key,value in nodes.items()}
+        active=[self.active(farm9,0,'train','f0')]
+        row=plan([self.candidate('train')],nodes=nodes,snaps=snaps,attempts=active)[0]
+        self.assertEqual((row['node'],row['gpus']),('farm9-gui2',['GPU-farm9-gui2-1']))
+        active=[self.active(n,gpu,'train',n['id']+str(gpu))
+                for n in (farm9,lab1) for gpu in range(2)]
+        row=plan([self.candidate('train')],nodes=nodes,snaps=snaps,attempts=active)[0]
+        self.assertEqual(row['node'],'farm9-gui2')
+
+    def test_dense_train_pool_reaches_depth_two_before_secondary_pool(self):
+        rp2=self.shared_node('rp2')
+        cps2=self.shared_node('cps2-model');farm9=self.shared_node('farm9-gui2')
+        cps1=self.shared_node('cps1-model');lab1=self.shared_node('lab1')
+        nodes={n['id']:n for n in (rp2,cps2,cps1,farm9,lab1)}
+        snaps={key:snapshot(value) for key,value in nodes.items()}
+        active=[]
+        for n in (rp2,cps2,cps1,farm9):
+            for gpu in range(2):
+                active.extend(self.active(n,gpu,'train',n['id']+str(gpu)+'-'+str(copy_))
+                              for copy_ in range(2))
+        row=plan([self.candidate('train')],nodes=nodes,snaps=snaps,attempts=active)[0]
+        self.assertEqual(row['node'],'lab1')
+
+    def test_dense_train_pool_uses_strict_server_priority(self):
+        nodes={key:self.shared_node(key) for key in ('rp2','cps2-model','cps1-model','farm9-gui2')}
+        for priority,key in enumerate(('farm9-gui2','cps1-model','cps2-model','rp2'),1):
+            nodes[key]['admission_priority']=priority*10
+        row=plan([self.candidate('train')],nodes=nodes,
+                 snaps={key:snapshot(value) for key,value in nodes.items()})[0]
+        self.assertEqual(row['node'],'rp2')
+
+    def test_primary_empty_gpu_beats_second_train_on_higher_priority_node(self):
+        rp2=self.shared_node('rp2');rp2['gpus']=rp2['gpus'][:1];rp2['admission_priority']=600
+        cps2=self.shared_node('cps2-model');cps2['gpus']=cps2['gpus'][:1];cps2['admission_priority']=590
+        row=plan([self.candidate('train')],nodes={'rp2':rp2,'cps2-model':cps2},
+                 snaps={'rp2':snapshot(rp2),'cps2-model':snapshot(cps2)},
+                 attempts=[self.active(rp2,0,'train','first')])[0]
+        self.assertEqual((row['node'],row['gpus']),('cps2-model',['GPU-cps2-model-0']))
+
+    def test_primary_second_train_precedes_secondary_pool(self):
+        rp2=self.shared_node('rp2');rp2['gpus']=rp2['gpus'][:1];rp2['admission_priority']=600
+        lab1=self.shared_node('lab1');lab1['gpus']=lab1['gpus'][:1];lab1['admission_priority']=440
+        row=plan([self.candidate('train')],nodes={'rp2':rp2,'lab1':lab1},
+                 snaps={'rp2':snapshot(rp2),'lab1':snapshot(lab1)},
+                 attempts=[self.active(rp2,0,'train','first')])[0]
+        self.assertEqual((row['node'],row['gpus']),('rp2',['GPU-rp2-0']))
+
+    def test_stabilizing_empty_primary_gpu_blocks_packing_and_secondary_for_180s(self):
+        now=time.time()
+        rp2=self.shared_node('rp2');rp2['policy']['stable_polls']=3;rp2['admission_priority']=600
+        lab1=self.shared_node('lab1');lab1['admission_priority']=440
+        snaps={'rp2':snapshot(rp2,now),'lab1':snapshot(lab1,now)}
+        snaps['rp2'].update(stable_polls=1,stable_since=now-20)
+        for gpu in snaps['rp2']['gpus']:gpu['stable_polls']=1
+        row=plan([self.candidate('train')],nodes={'rp2':rp2,'lab1':lab1},snaps=snaps,
+                 attempts=[self.active(rp2,0,'train','first')])[0]
+        self.assertEqual(row['decision'],'waiting')
+        self.assertIn('stabilizing',row['reasons']['rp2'])
+        snaps['rp2']['stable_since']=now-181
+        row=plan([self.candidate('train')],nodes={'rp2':rp2,'lab1':lab1},snaps=snaps,
+                 attempts=[self.active(rp2,0,'train','first')])[0]
+        self.assertEqual(row['node'],'lab1')
+
+    def test_primary_gpu_validation_blocks_secondary_train_spill(self):
+        rp2=self.shared_node('rp2');rp2['gpus']=rp2['gpus'][:1];rp2['admission_priority']=600
+        lab1=self.shared_node('lab1');lab1['gpus']=lab1['gpus'][:1];lab1['admission_priority']=440
+        validation=self.active(rp2,0,'prepare','EXEC_VERIFY_profile')
+        validation['report']={'ready':False}
+        row=plan([self.candidate('train')],nodes={'rp2':rp2,'lab1':lab1},
+                 snaps={'rp2':snapshot(rp2),'lab1':snapshot(lab1)},attempts=[validation])[0]
+        self.assertEqual(row['decision'],'waiting')
+        self.assertIn('validation in progress',row['reasons']['primary_train_pool'])
+
+    def test_dense_train_pool_skips_busy_or_warm_gpu(self):
+        rp2=self.shared_node('rp2');rp2['gpus']=rp2['gpus'][:1]
+        cps2=self.shared_node('cps2-model');cps2['gpus']=cps2['gpus'][:1]
+        snaps={'rp2':snapshot(rp2),'cps2-model':snapshot(cps2)}
+        snaps['rp2']['gpus'][0]['util_percent']=70
+        row=plan([self.candidate('train')],nodes={'rp2':rp2,'cps2-model':cps2},snaps=snaps)[0]
+        self.assertEqual(row['node'],'cps2-model')
+        snaps['rp2']['gpus'][0]['util_percent']=0
+        snaps['rp2']['gpus'][0]['temperature_c']=80
+        row=plan([self.candidate('train')],nodes={'rp2':rp2,'cps2-model':cps2},snaps=snaps)[0]
+        self.assertEqual(row['node'],'cps2-model')
+
+    def test_per_node_train_cap_blocks_third_train_on_same_gpu(self):
+        cps2=self.shared_node('cps2-model');cps2['gpus']=cps2['gpus'][:1]
+        active=[self.active(cps2,0,'train','first'),self.active(cps2,0,'train','second')]
+        row=plan([self.candidate('train')],nodes={'cps2-model':cps2},
+                 snaps={'cps2-model':snapshot(cps2)},attempts=active)[0]
+        self.assertEqual(row['decision'],'waiting')
+
+    def test_rp2_train_cap_override_allows_three_but_not_four(self):
+        rp2=self.shared_node('rp2');rp2['gpus']=rp2['gpus'][:1]
+        rp2['policy']['max_shared_jobs_per_gpu']=3
+        rp2['labels']['max_train_jobs_per_gpu']=3
+        active=[self.active(rp2,0,'train','first'),self.active(rp2,0,'train','second')]
+        row=plan([self.candidate('train')],nodes={'rp2':rp2},
+                 snaps={'rp2':snapshot(rp2)},attempts=active)[0]
+        self.assertEqual(row['decision'],'ready')
+        active.append(self.active(rp2,0,'train','third'))
+        row=plan([self.candidate('train')],nodes={'rp2':rp2},
+                 snaps={'rp2':snapshot(rp2)},attempts=active)[0]
+        self.assertEqual(row['decision'],'waiting')
+        self.assertIn('requested per-device VRAM',row['reasons']['rp2'])
+
+    def test_train_never_spills_to_eval_pool(self):
+        farm9=self.shared_node('farm9-gui2');lab1=self.shared_node('lab1')
+        farm9['policy']['max_shared_jobs_per_gpu']=2
+        lab1['policy']['max_shared_jobs_per_gpu']=2
+        lab2=self.shared_node('lab2')
+        nodes={n['id']:n for n in (farm9,lab1,lab2)}
+        snaps={key:snapshot(value) for key,value in nodes.items()}
+        active=[]
+        for n in (farm9,lab1):
+            for gpu in range(2):
+                active.extend(self.active(n,gpu,'train',n['id']+str(gpu)+'-'+str(copy_))
+                              for copy_ in range(2))
+        row=plan([self.candidate('train')],nodes=nodes,snaps=snaps,attempts=active)[0]
+        self.assertEqual(row['decision'],'waiting')
+        self.assertIn('workload pool restriction',row['reasons']['lab2'])
+
+    def test_eval_remains_in_eval_pool_after_first_coverage_round(self):
+        lab2=self.shared_node('lab2');lab3=self.shared_node('lab3')
+        farm9=self.shared_node('farm9-gui2')
+        nodes={n['id']:n for n in (lab2,lab3,farm9)}
+        snaps={key:snapshot(value) for key,value in nodes.items()}
+        active=[self.active(lab2,0,'eval','l20')]
+        row=plan([self.candidate('eval')],nodes=nodes,snaps=snaps,attempts=active)[0]
+        self.assertEqual((row['node'],row['gpus']),('lab2',['GPU-lab2-1']))
+        active=[self.active(n,gpu,'eval',n['id']+str(gpu))
+                for n in (lab2,lab3) for gpu in range(2)]
+        row=plan([self.candidate('eval')],nodes=nodes,snaps=snaps,attempts=active)[0]
+        self.assertEqual(row['node'],'lab2')
+
+    def test_eval_never_runs_in_train_pool(self):
+        rp2=self.shared_node('rp2')
+        row=plan([self.candidate('eval')],nodes={'rp2':rp2},
+                 snaps={'rp2':snapshot(rp2)})[0]
+        self.assertEqual(row['decision'],'waiting')
+        self.assertIn('workload pool restriction',row['reasons']['rp2'])
 
     def test_warm_occupied_gpu_blocked_but_other_gpu_usable(self):
         n = node(); n['policy'].update(temperature_scope='gpu', allow_gpu_sharing=True)

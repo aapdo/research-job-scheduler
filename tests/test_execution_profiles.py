@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from test_scheduler import node,job,experiment,snapshot,plan
 from research_scheduler.store import Store,dumps
@@ -31,6 +32,30 @@ class ExecutionPreparationTests(unittest.TestCase):
         self.store.db.close();self.tmp.cleanup()
 
     def consumer(self):return next(j['spec'] for j in self.store.jobs() if j['id']=='consumer')
+
+    def test_unchanged_ready_profile_avoids_full_jobs_and_attempt_reads(self):
+        ep.tick(self.controller,execute=True)
+        self.succeed();ep.tick(self.controller,execute=True)
+        with patch.object(self.store,'jobs',side_effect=AssertionError('full job scan')), \
+                patch.object(self.store,'attempts',side_effect=AssertionError('old attempt scan')):
+            ep.tick(self.controller,execute=True)
+
+    def test_new_consumer_invalidates_ready_profile_cache(self):
+        ep.tick(self.controller,execute=True)
+        self.succeed();ep.tick(self.controller,execute=True)
+        new=job('new-consumer');new.update(hosts=['a'],cwd='/original',dataset='data')
+        self.store.register_experiment(experiment([new],key='new-experiment'))
+        ep.tick(self.controller,execute=True)
+        stored=json.loads(self.store.db.execute("SELECT spec FROM jobs WHERE id='new-consumer'").fetchone()[0])
+        self.assertIn('b',stored['hosts'])
+
+    def test_changed_receipt_invalidates_ready_profile_cache(self):
+        ep.tick(self.controller,execute=True)
+        self.succeed();ep.tick(self.controller,execute=True)
+        (self.root/'receipt'/'EXECUTION_READY.json').write_text('{}')
+        ep.tick(self.controller,execute=True)
+        self.assertEqual(self.store.db.execute('SELECT state FROM execution_preparations').fetchone()[0],
+                         'verification_failed')
 
     def test_inline_catalog_requires_exact_wrapper_code(self):
         c=copy.deepcopy(self.catalog);code='verified wrapper'

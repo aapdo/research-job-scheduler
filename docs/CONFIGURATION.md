@@ -76,7 +76,7 @@ node를 drain한 뒤 local replica로 전환하는 경우에는
 
 | 필드 | 기본값 | 의미 |
 |---|---:|---|
-| `stable_polls` | 3 | 신규 시작에 필요한 연속 정상 관측 횟수 |
+| `stable_polls` | GPU 노드 2, 그 외 3 | 신규 시작에 필요한 연속 정상 관측 횟수 |
 | `max_snapshot_age_s` | 60 | 배치에 사용할 자원 snapshot의 최대 나이 |
 | `max_cpu_percent` | 90 | 신규 배치 시 CPU 사용률 상한 |
 | `max_gpu_percent` | 10 | 신규 배치 시 GPU 사용률 상한 |
@@ -211,11 +211,28 @@ job ID는 DB 전체에서 고유해야 합니다. 모든 dependency가 기존 DB
 | `assets` | `{}` | 사용할 node asset의 `{이름: 기대 SHA256}` |
 | `max_attempts` | `1` | 최초 시도·확인된 실패 재시도·node failover를 포함한 전체 시도 상한 |
 | `failover_safe` | `false` | node 장애 시 새 attempt로 재배치해도 안전하다는 운영자 확인 |
-| `metadata` | `{}` | 사용자 메모. 배치 기준이나 실행 인수로 자동 해석하지 않음 |
+| `metadata` | `{}` | 확장 계약. 일반 메모 외에 execution profile·report placement 등 문서화된 필드는 배치에 사용 |
 
 `argv`는 실행 파일과 인수의 배열이며 shell 문자열로 eval하지 않습니다.
 `config.json` 생성만으로 설정이 학습에 적용되지는 않으므로 `--config {config_path}` 등의
 인수를 연구 코드에 연결해야 합니다. 재시도 시 배치 크기·LR·epoch를 자동 조정하지 않습니다.
+
+### Report를 LAB4에서 실행
+
+새 `analysis` report는 LAB4에서 실행합니다. 공용 등록 경로가 다음 계약으로 정규화합니다.
+
+- `report_role: "report"`
+- `report_execution: "archive_host"`
+- `hosts: ["lab4"]`
+- `execution_profiles.lab4`: `argv`, `cwd`, `resource_contract`가 고정된 실행 profile
+
+report는 `gpu_count=0`이어야 합니다. 여러 dependency는 검증된 LAB4 artifact 위치로 전달한 뒤 읽습니다.
+성공 producer의 전체 archive 완료를 새로운 DAG 선행으로 추가하지 않습니다.
+
+등록 코드에서는 `research_scheduler.report_placement.on_archive_host()`를 사용할 수 있습니다.
+자체 포함된 표준 Python report는 자동 변환하고, 외부 실행 파일·패키지·절대경로 입력이 필요한 report는
+LAB4 runtime profile을 준비해야 합니다. `control_report_exception`은 신규 LAB4 정책을 우회하지 않습니다.
+기존 frozen attempt와 동일한 과거 등록의 idempotent 재조회는 보존합니다.
 
 ### Resources
 

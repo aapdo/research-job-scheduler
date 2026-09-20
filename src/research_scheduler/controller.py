@@ -6,7 +6,7 @@ import shlex
 import subprocess
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import agent
 from .planner import base_health, gpu_healthy, placements
@@ -44,6 +44,21 @@ class Transport:
             from .gpu_ownership import enrich
             value=enrich(node,request,value)
         return value
+
+
+def status_request(attempt):
+    """Send observation inputs, not the frozen experiment and launch payload."""
+    spec = attempt['spec']
+    request = {k: spec[k] for k in ('id', 'job', 'attempt_dir', 'resources', 'gpus', 'outputs') if k in spec}
+    request['node_spec'] = {'id': spec['node_spec']['id']}
+    job = spec.get('job_spec', {})
+    request['job_spec'] = {'kind': job.get('kind'), 'metadata': {
+        'oom_same_host_retry_allowed': job.get('metadata', {}).get('oom_same_host_retry_allowed', False)}}
+    request['config'] = {'mode': spec.get('config', {}).get('mode')}
+    request['_oom_previous'] = attempt.get('report', {}).get('oom_observation', {})
+    if attempt.get('report', {}).get('failure_class') == 'experiment_oom':
+        request['_oom_verified_evidence'] = attempt['report'].get('failure_evidence')
+    return request
 
 
 class Controller:
@@ -104,6 +119,9 @@ class Controller:
                 data["last_counted_at"] = now if count_poll else old.get("last_counted_at", now)
                 data["stable_polls"] = ((old.get("stable_polls", 0) if continuous else 0)
                                         + int(count_poll)) if healthy else 0
+                if healthy:
+                    data['stable_since']=(old.get('stable_since',old.get('received_at',now))
+                                          if continuous and old.get('stable_polls',0)>0 else now)
                 old_gpus = {g["uuid"]: g for g in old.get("gpus", [])}
                 mode = "shared" if n["policy"]["allow_gpu_sharing"] else "exclusive"
                 for gpu in data.get("gpus", []):
@@ -209,6 +227,14 @@ class Controller:
             frontier.extend(spec.get('depends_on', []))
         relevant.update(r[0] for r in self.store.db.execute(
             "SELECT DISTINCT job FROM attempts WHERE status IN ('starting','running','unknown')"))
+        # Strict hardware round-robin needs the most recent full-build launch
+        # even after it has completed or failed; this is one bounded job lookup,
+        # not a scan of every historical attempt spec.
+        latest_build=self.store.db.execute(
+            "SELECT a.job FROM attempts a JOIN jobs j ON j.id=a.job "
+            "WHERE json_extract(j.spec,'$.kind') IN ('rtl_build','rtl_ooc') "
+            "ORDER BY a.created DESC,a.id DESC LIMIT 1").fetchone()
+        if latest_build:relevant.add(latest_build[0])
         max_interval = max((g.get('min_start_interval_s', 0) for g in groups.values()), default=0)
         if max_interval:
             relevant.update(r[0] for r in self.store.db.execute(
@@ -276,30 +302,29 @@ class Controller:
                 grouped.setdefault(a['node'], []).append(a)
 
         def read_node(rows):
-            requests = []
-            for a in rows:
-                request=dict(a['spec'],_oom_previous=a.get('report',{}).get('oom_observation',{}))
-                if a.get('report',{}).get('failure_class')=='experiment_oom':
-                    request['_oom_verified_evidence']=a['report'].get('failure_evidence')
-                requests.append(request)
+            requests = [status_request(a) for a in rows]
+            transport_node = dict(rows[0]['spec']['node_spec'], _rpc_timeout_s=15)
             try:
-                result=self.transport.call(rows[0]['spec']['node_spec'],'status_batch',
+                result=self.transport.call(transport_node,'status_batch',
                                            {'attempts':requests})
                 if not isinstance(result,dict) or set(result)!={a['id'] for a in rows}:
                     raise ValueError('incomplete status batch')
                 return result
-            except Exception:
-                # Keep existing per-attempt recovery for old/fake transports or
-                # a lost batch response; no lifecycle write is inferred from ACK.
+            except (NotImplementedError, AssertionError, KeyError):
+                # Explicit adapter lack of batch support only. A network error
+                # must never amplify into N serial SSH timeouts.
                 result={}
                 for a,request in zip(rows,requests):
                     try:
-                        result[a['id']]=self.transport.call(a['spec']['node_spec'],'status',request)
+                        result[a['id']]=self.transport.call(transport_node,'status',request)
                     except Exception as exc:
                         result[a['id']]=dict(status='unknown',reason=str(exc))
                 return result
+            except Exception as exc:
+                return {a['id']: dict(a.get('report', {}), status='unknown',
+                    reason='status batch unavailable; retry next cycle: '+str(exc)) for a in rows}
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
             for result in pool.map(read_node, grouped.values()):
                 reports.update(result)
         return [(a, reports[a['id']]) for a in attempts]
@@ -463,16 +488,23 @@ class Controller:
                          "{gpu_count}": str(len(placement["gpus"])), "{gpus}": ",".join(placement["gpus"]),
                          "{dataset_path}": dataset_path, "{filesystem}": filesystem}
         inputs = list(spec["input_files"])
+        for contract in spec.get("dataset_files", []):
+            relative = PurePosixPath(contract["path"])
+            inputs.append({"path": str(Path(dataset_path).joinpath(*relative.parts)),
+                           "sha256": contract["sha256"]})
         for dep in spec["depends_on"]:
             a = successful[dep]
             if dep in spec.get("order_only_dependencies", []):
                 continue
             cached = a.get('artifact_locations', {}).get(node['id'])
-            local = a['node'] == node['id'] or (node['storage_domain'] and
-                    a['spec']['node_spec']['storage_domain'] == node['storage_domain'])
-            if not local and cached:
+            local = not a.get('origin_retired') and (a['node'] == node['id'] or (node['storage_domain'] and
+                    a['spec']['node_spec']['storage_domain'] == node['storage_domain']))
+            if cached and (not local or cached.get('complete_attempt')):
                 substitutions['{dep:' + dep + '}'] = cached['root']
-                inputs.extend(dict(path=f['path'], sha256=f['sha256']) for f in cached['files'].values())
+                required = a['report'].get('dependency_artifacts') or a['report'].get('outputs', {})
+                selected = ({k: v for k, v in cached['files'].items() if k in required}
+                            if cached.get('complete_attempt') and required else cached['files'])
+                inputs.extend(dict(path=f['path'], sha256=f['sha256']) for f in selected.values())
                 continue
             if not local:
                 raise ValueError('dependency has no verified destination artifacts: ' + dep)
@@ -583,7 +615,8 @@ class Controller:
             result.append(dict(placement,attempt=request['id'],status=status))
         return result
 
-    def tick(self, execute=False, refresh=True, max_launches=1, warmup=True, launch_budget_s=None, parallel_launches=False):
+    def tick(self, execute=False, refresh=True, max_launches=1, warmup=True, launch_budget_s=None, parallel_launches=False,
+             final_reconcile=True):
         if not isinstance(max_launches, int) or isinstance(max_launches, bool) or max_launches < 1:
             raise ValueError("max_launches must be a positive integer")
         if launch_budget_s is not None and (isinstance(launch_budget_s, bool)
@@ -631,11 +664,15 @@ class Controller:
             refresh_expired()
             if execute and refresh and warmup:
                 self.stabilize_healthy_nodes()
+            mark('controller_preplan_health_s')
             # Artifact admission needs the same fresh independent observations
             # as model admission, not the stale samples from before reconcile.
-            artifact_tick(self, execute=execute)
-            refresh_expired()
+            from .artifact_service import external_artifacts_enabled
+            if not external_artifacts_enabled(self.store):
+                artifact_tick(self, execute=execute)
             mark('controller_artifacts_s')
+            refresh_expired()
+            mark('controller_postartifact_health_s')
             plan = self.plan()
             mark('controller_plan_s')
             if not execute:
@@ -711,7 +748,8 @@ class Controller:
             # Reap work that ended during preparation/planning/launch RPCs now,
             # rather than leaving it active until the next long dispatch cycle.
             mark('controller_launch_s')
-            self.reconcile(recover_oom=execute, exclude_attempts={p.get('attempt') for p in launches})
+            if final_reconcile:
+                self.reconcile(recover_oom=execute, exclude_attempts={p.get('attempt') for p in launches})
             mark('controller_final_reconcile_s')
             final_plan = current
             return {"mode": "execute", "launched": launches[0] if launches else None,

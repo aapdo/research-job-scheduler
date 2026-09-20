@@ -67,6 +67,25 @@ class OverviewTests(unittest.TestCase):
             self.assertEqual(reader.attempts()[0]['spec']['experiment_spec'],raw['experiment_spec'])
         finally:reader.db.close()
 
+    def test_read_only_planner_loads_verified_dependency_locations(self):
+        receipt={'root':'/b/relay','files':{'RESULT.json':{'path':'/b/relay/RESULT.json',
+                 'sha256':'a'*64,'bytes':1}}}
+        with sqlite3.connect(self.db) as db:
+            spec=json.loads(db.execute("SELECT spec FROM attempts WHERE id='attempt-1'").fetchone()[0])
+            report={'outputs':{'RESULT.json':{'path':'/a/RESULT.json','sha256':'a'*64,'bytes':1}},
+                    'dependency_artifacts':{'RESULT.json':{'path':'/a/RESULT.json','sha256':'a'*64,'bytes':1}}}
+            db.execute("UPDATE attempts SET status='succeeded',spec=?,report=? WHERE id='attempt-1'",
+                       (json.dumps(spec),json.dumps(report)))
+            db.execute("UPDATE jobs SET status='succeeded' WHERE id='train'")
+            db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                       ('relay','attempt-1','b','download','succeeded','{}',
+                        json.dumps({'artifact':receipt}),time.time()))
+        reader=ReadStore(self.db)
+        try:
+            attempt=reader.attempts(planning=True,job_ids={'train'})[0]
+            self.assertEqual(attempt['artifact_locations']['b']['root'],'/b/relay')
+        finally:reader.db.close()
+
     def test_assignment_campaign_and_read_only(self):
         c=sqlite3.connect(self.db);before=list(c.execute('SELECT * FROM events'));c.close()
         with patch('subprocess.run', side_effect=AssertionError('default must not use SSH')):
@@ -172,6 +191,14 @@ class OverviewTests(unittest.TestCase):
             'PROGRESS.json':dict(phase='w8a8',batches=2050,config='percentile'),
             'PROGRESS_CONTRACT.json':dict(planned_batches=9913)})
         self.assertEqual(p['planned_batches'],9913)
+
+    def test_legacy_paddle_eval_log_exposes_phase_and_batches(self):
+        p=self.read_progress_fixture({
+            'stdout.log':'[09/18] ppdet.engine.callbacks INFO: Eval iter: 3300\n',
+            'evaluation/fp32/bbox.json':'[]',
+            'evaluation/quantized/placeholder':'running'})
+        self.assertEqual((p['completed_cells'],p['planned_cells'],p['phase'],p['batches']),
+                         (1,2,'quantized',3300))
 
     def test_invalid_progress_is_explicit(self):
         self.assertIn('error',self.read_progress_fixture({'TRAIN_PROGRESS.json':'{broken'}))

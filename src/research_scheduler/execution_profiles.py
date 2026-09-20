@@ -178,7 +178,7 @@ def recovered_validation_retry(spec, attempt, node, snapshot, health, now):
             or stamp in used or recovery.get('boot_id')!=snapshot.get('boot_id')
             or not recovery.get('cuda_verified') or health.get('phase')!='healthy'
             or not 0<=now-snapshot.get('received_at',0)<=60
-            or snapshot.get('stable_polls',0)<3 or snapshot.get('gpu_error')
+            or snapshot.get('stable_polls',0)<node['policy']['stable_polls'] or snapshot.get('gpu_error')
             or snapshot.get('d_state',1) or not snapshot.get('read_ok')):
         return None
     expected={g['uuid'] for g in node['gpus'] if g['enabled'] and g['uuid'] not in node['policy'].get('disabled_gpu_uuids',[])}
@@ -196,7 +196,8 @@ def refresh_validation_runtime_recovery(store,node,snapshot,health,attempt,now):
     if (report.get('failure_class')!='gpu_validation_unavailable'
             or labels.get('gpu_runtime_recovery',{}).get('verified_at',0)>report.get('finished',float('inf'))
             or now-labels.get('validation_cuda_probe_at',0)<60
-            or health.get('phase')!='healthy' or snapshot.get('stable_polls',0)<3
+            or health.get('phase')!='healthy'
+            or snapshot.get('stable_polls',0)<node['policy']['stable_polls']
             or not 0<=now-snapshot.get('received_at',0)<=60 or snapshot.get('gpu_error')
             or not snapshot.get('gpus') or not snapshot.get('read_ok') or snapshot.get('d_state',1)):
         return
@@ -224,19 +225,34 @@ def tick(controller, execute=False):
     tables(store)
     catalogs={r['id']:json.loads(r['spec']) for r in store.db.execute('SELECT * FROM execution_catalog')}
     if not catalogs:return
-    jobs={j['id']:j for j in store.jobs()};nodes=store.specs('nodes')
+    # Terminal jobs need only status for preparation/validation transitions.
+    # Decode scientific profiles only for current demand.
+    jobs={r['id']:dict(r) for r in store.db.execute('SELECT id,status FROM jobs')}
+    demand={}
+    for r in store.db.execute("SELECT * FROM jobs WHERE status='queued' AND json_extract(spec,'$.kind') IN ('train','eval')"):
+        j=dict(r,spec=json.loads(r['spec']));jobs[j['id']]=j
+        demand.setdefault((j['spec']['cwd'],j['spec'].get('dataset')),[]).append(j)
+    nodes=store.specs('nodes')
     records={(r['profile'],r['node']):dict(r) for r in store.db.execute('SELECT * FROM execution_preparations')}
     budgets={}
     for r in store.db.execute('SELECT * FROM execution_resource_budgets'):
         budgets.setdefault((r['profile'],r['node']),{})[r['kind']]=json.loads(r['spec'])
-    attempts={a['job']:a for a in store.attempts(job_ids={r['job'] for r in records.values()}) if a['status']=='succeeded'}
+    attempts={}
+    ready_cache=getattr(store,'_execution_ready_cache',{})
+    store._execution_ready_cache=ready_cache
+    active_by_catalog={}
+    for (profile,_),record in records.items():
+        if jobs[record['job']]['status'] in (*ACTIVE,'queued'):
+            active_by_catalog[profile]=active_by_catalog.get(profile,0)+1
     for catalog in catalogs.values():
-        active=sum(jobs[r['job']]['status'] in (*ACTIVE,'queued') for (key,_),r in records.items() if key==catalog['id'])
+        active=active_by_catalog.get(catalog['id'],0)
+        matching=[j for j in demand.get((catalog['match']['cwd'],catalog['match']['dataset']),[])
+                  if matches(j,catalog)]
         for target,recipe in catalog['targets'].items():
             node=nodes[target]
             if node.get('target')!=recipe['target']:continue
             if not node['enabled'] or not any(g['enabled'] and g['uuid'] not in node['policy'].get('disabled_gpu_uuids',[]) for g in node['gpus']):continue
-            consumers=[j for j in jobs.values() if matches(j,catalog) and j['spec']['kind'] in recipe['resources']
+            consumers=[j for j in matching if j['spec']['kind'] in recipe['resources']
                        and target not in j['spec'].get('metadata',{}).get('excluded_hosts',[])]
             limit=node.get('labels',{}).get('max_gpus_per_job')
             if limit is not None:
@@ -268,7 +284,25 @@ def tick(controller, execute=False):
             if state!='succeeded':
                 with store.db:store.db.execute('UPDATE execution_preparations SET state=? WHERE profile=? AND node=?',(state,*key))
                 continue
+            def ready_signature():
+                validation_id=('EXEC_VERIFY_'+digest(dict(profile=catalog['id'],node=target,recipe=recipe))[:24]
+                               if 'validation' in recipe else None)
+                return digest(dict(recipe=recipe,match=catalog['match'],node=nodes[target],
+                                   budgets=budgets.get(key,{}),preparation=record,
+                                   validation_status=jobs.get(validation_id,{}).get('status'),
+                                   consumers=[(j['id'],j['spec']) for j in consumers]))
+            cached=ready_cache.get(key)
+            if record['state']=='ready' and cached and cached[0]==ready_signature():
+                try:
+                    st=Path(cached[1]).stat()
+                    if (st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns)==cached[2]:
+                        continue
+                except OSError:
+                    pass
             try:
+                if record['job'] not in attempts:
+                    attempts.update({a['job']:a for a in store.attempts(job_ids={record['job']})
+                                     if a['status']=='succeeded'})
                 attempt=attempts[record['job']]
                 check(attempt['spec']['node_spec']['transport']=='local','receipt must come from local coordinator')
                 path=Path(attempt['spec']['attempt_dir'])/'EXECUTION_READY.json'
@@ -290,6 +324,9 @@ def tick(controller, execute=False):
                         continue
                     if validation_job['status']!='succeeded':
                         if validation_job['status']=='failed':
+                            if 'spec' not in validation_job:
+                                validation_job['spec']=json.loads(store.db.execute(
+                                    'SELECT spec FROM jobs WHERE id=?',(validation_id,)).fetchone()[0])
                             latest=store.db.execute('SELECT * FROM attempts WHERE job=? ORDER BY created DESC LIMIT 1',(validation_id,)).fetchone()
                             if latest:
                                 attempt=dict(latest);attempt['report']=json.loads(attempt['report'])
@@ -325,6 +362,9 @@ def tick(controller, execute=False):
                         consumer['spec']=after
                     store.db.execute('UPDATE execution_preparations SET state=\'ready\',receipt=? WHERE profile=? AND node=?',(dumps(receipt),*key))
                     if changes:store.event('execution_hosts_admitted',catalog['id'],dict(node=target,jobs=[j['id'] for j,_ in changes],existing_hosts_preserved=True))
+                record.update(state='ready',receipt=dumps(receipt))
+                st=path.stat()
+                ready_cache[key]=(ready_signature(),str(path),(st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns))
             except Exception as exc:
                 with store.db:
                     store.db.execute('UPDATE execution_preparations SET state=\'verification_failed\',receipt=? WHERE profile=? AND node=?',(dumps({'error':type(exc).__name__}),*key))

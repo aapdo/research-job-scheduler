@@ -19,7 +19,7 @@ from urllib.parse import urlsplit, parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from research_scheduler.overview import collect
-from research_scheduler.planner import base_health
+from research_scheduler.planner import base_health, TRAIN_PREFERRED_NODES, EVAL_PREFERRED_NODES
 from research_scheduler.registration import campaign_label
 from research_scheduler.waiting import work_type
 
@@ -27,6 +27,14 @@ DB = '/home/jy/experiments/research_scheduler/state.db'
 RTL_DB = '/home/jy/experiments/rtl_scheduler_pilot_20260908_1638_r2/state.db'
 INDEX = '/home/jy/experiments/hardware_campaigns/INDEX.json'
 STATIC = Path(__file__).parent / 'dist'
+
+
+def gpu_pool(node):
+    if node in TRAIN_PREFERRED_NODES:
+        return 'train', TRAIN_PREFERRED_NODES.index(node) + 1
+    if node in EVAL_PREFERRED_NODES:
+        return 'eval', EVAL_PREFERRED_NODES.index(node) + 1
+    return 'other', 999
 
 
 class GPUAverages:
@@ -178,6 +186,8 @@ def server_health(path, category):
                 status = 'unavailable'
             cg = snap.get('memory_cgroup', {})
             row = dict(id=key, category=category, enabled=node['enabled'], status=status,
+                       dashboard_visible_when_disabled=bool(
+                           node.get('labels', {}).get('dashboard_visible_when_disabled', False)),
                        reason=reason or state.get('reason', ''), recovery_phase=state.get('phase'),
                        snapshot_age_s=age, snapshot_at=stamp,
                        max_snapshot_age_s=node['policy']['max_snapshot_age_s'],
@@ -257,6 +267,7 @@ def payload(db=DB, rtl_db=RTL_DB, index=INDEX):
     for gpu in view['gpus']:
         g = select(gpu, 'node index uuid enabled temperature_c used_mib total_mib utilization_percent '
                          'snapshot_at sample_started_at snapshot_age_s stale held_jobs_total')
+        g['placement_pool'],g['placement_rank']=gpu_pool(gpu['node'])
         g['assigned_attempts'] = sorted({a['attempt'] for a in gpu['jobs']})
         g['jobs'] = []
         if not g['enabled']:g['gpu_health']='disabled';g['gpu_reason']='신규 배정 금지'
@@ -270,6 +281,8 @@ def payload(db=DB, rtl_db=RTL_DB, index=INDEX):
             j['execution_node'] = a.get('execution_node', gpu['node'])
             g['jobs'].append(j)
         gpu_rows.append(g)
+    gpu_rows.sort(key=lambda g: ({'train':0,'eval':1,'other':2}[g['placement_pool']],
+                                g['placement_rank'],g['node'],g['index']))
     campaigns = []
     for c in view['campaigns']:
         if c.get('external') or c.get('unregistered_project'): continue

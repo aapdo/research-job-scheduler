@@ -1,6 +1,27 @@
 """Spread hardware work across eligible physical hosts before adding more jobs."""
 import math
 
+FULL_BUILD_ORDER=('rtl-pilot-cps2','rtl-farm8-vivado2','rtl-board-cps1','rtl-farm9-vivado2')
+
+
+def _full_build(attempt):
+    spec=attempt.get('spec',{})
+    return (spec.get('job_kind',spec.get('job_spec',{}).get('kind')) in ('rtl_build','rtl_ooc')
+            or spec.get('resources',{}).get('build_slots',0))
+
+
+def full_build_round_rank(node,held,history=()):
+    """Strict persistent cursor; failed/completed launches advance the round too."""
+    by_id={a.get('id',str(i)):a for i,a in enumerate([*history,*held]) if _full_build(a)}
+    fleet=[a for a in by_id.values() if a.get('node') in FULL_BUILD_ORDER]
+    start=0
+    if fleet:
+        latest=max(fleet,key=lambda a:(a.get('created',0),a.get('id','')))
+        start=(FULL_BUILD_ORDER.index(latest['node'])+1)%len(FULL_BUILD_ORDER)
+    try:index=FULL_BUILD_ORDER.index(node['id'])
+    except ValueError:return len(FULL_BUILD_ORDER)
+    return (index-start)%len(FULL_BUILD_ORDER)
+
 
 def build_pressure(node, snap, held, resources, now):
     """Projected dominant pressure, including reservations not yet in telemetry.
@@ -50,9 +71,21 @@ def hardware_workload(node, held):
                      or a['spec']['resources'].get('build_slots',0))})
 
 
-def placement_key(node, snap, held, resources, now, count, index, chosen, kind=None):
+def full_build_workload(node,held):
+    """Count canonical full/OOC builds independently of RTL validation."""
+    domain=node.get('physical_host',node['id'])
+    return len({a.get('job',a.get('id')) for a in held
+                if a['spec'].get('node_spec',{}).get('physical_host',a['node'])==domain
+                and (a['spec'].get('job_spec',{}).get('kind') in ('rtl_build','rtl_ooc')
+                     or a['spec']['resources'].get('build_slots',0))})
+
+
+def placement_key(node, snap, held, resources, now, count, index, chosen, kind=None, history=()):
     legacy = (-node.get('admission_priority', 0), count, index, node['id'], chosen)
     if kind not in ('rtl_sim','rtl_build','rtl_ooc') and not resources.get('build_slots', 0):
         return (0, 0, *legacy)
     score, _ = build_pressure(node, snap, held, resources, now)
-    return (hardware_workload(node,held), -node.get('admission_priority',0), *score, *legacy[1:])
+    if kind in ('rtl_build','rtl_ooc') or resources.get('build_slots',0):
+        return (full_build_round_rank(node,held,history),full_build_workload(node,held),
+                -node.get('admission_priority',0),*score,*legacy[1:])
+    return (hardware_workload(node,held),-node.get('admission_priority',0),*score,*legacy[1:])

@@ -8,7 +8,7 @@ from test_rtl_workflows import rtl_job, attempt
 class BuildPlacementTests(unittest.TestCase):
     def test_cpu_preference_repeats_only_after_all_hosts_get_one(self):
         from research_scheduler.build_placement import placement_key
-        order=['cps2','cps1','farm8','farm9']
+        order=['cps2','farm8','cps1','farm9']
         nodes={key:node(key=key) for key in order}
         for i,n in enumerate(nodes.values()):n.update(admission_priority=40-i*10,rtl_build_slots=4)
         snaps={key:snapshot(n) for key,n in nodes.items()};held=[];result=[]
@@ -17,6 +17,20 @@ class BuildPlacementTests(unittest.TestCase):
             selected=min(nodes,key=lambda key:placement_key(nodes[key],snaps[key],held,req,100,0,0,[],kind='rtl_sim'))
             result.append(selected);a=attempt(nodes[selected],j);a['job']=str(i);held.append(a)
         self.assertEqual(result,order*2)
+
+    def test_full_build_round_robin_ignores_validation_imbalance(self):
+        from research_scheduler.build_placement import placement_key
+        order=['rtl-pilot-cps2','rtl-farm8-vivado2','rtl-board-cps1','rtl-farm9-vivado2']
+        nodes={key:node(key=key) for key in order}
+        for i,n in enumerate(nodes.values()):n.update(admission_priority=40-i*10,rtl_build_slots=3)
+        snaps={key:snapshot(n) for key,n in nodes.items()}
+        held=[attempt(nodes[order[0]],rtl_job('sim-'+str(i),'rtl_sim')) for i in range(3)]
+        selected=[]
+        for i in range(4):
+            j=rtl_job('build-'+str(i),'rtl_build');req=attempt(nodes[order[0]],j)['spec']['resources']
+            key=min(nodes,key=lambda key:placement_key(nodes[key],snaps[key],held,req,100,0,0,[],kind='rtl_build'))
+            selected.append(key);value=attempt(nodes[key],j);value['job']=j['id'];held.append(value)
+        self.assertEqual(selected,order)
 
     def setup_pair(self):
         a, b = node(key='a'), node(key='b')

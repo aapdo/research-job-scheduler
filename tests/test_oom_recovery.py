@@ -20,6 +20,8 @@ class OOMTests(unittest.TestCase):
             class Transport:
                 def call(self,node,action,request):
                     calls.append(action)
+                    if action=='status_batch':
+                        return {a['id']:dict(status='unknown',failure_class='experiment_oom',oom_node='a',termination_verified=False,failure_evidence='run/stdout.log') for a in request['attempts']}
                     return dict(status='failed' if action=='recover_oom' else 'unknown',failure_class='experiment_oom',oom_node='a',termination_verified=action=='recover_oom',failure_evidence='run/stdout.log')
             controller=Controller(store,Transport())
             controller.reconcile();self.assertNotIn('recover_oom',calls);self.assertEqual(store.jobs()[0]['status'],'unknown')

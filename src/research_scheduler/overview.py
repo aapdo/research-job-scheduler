@@ -64,8 +64,61 @@ class ReadStore:
             rows = self._attempt_summary
         else:
             rows = self.rows('attempts')
-        return [a for a in rows if (not active or a['status'] in ACTIVE)
-                and (job_ids is None or a['job'] in job_ids)]
+        result = [a for a in rows if (not active or a['status'] in ACTIVE)
+                  and (job_ids is None or a['job'] in job_ids)]
+        # The read-only admission planner must see the same verified artifact
+        # locations as the writable controller. Otherwise the dashboard reports
+        # a cross-filesystem dependency wait after the relay has already
+        # succeeded. Keep this targeted to planner/summary job subsets so the
+        # overview never decodes every historical transfer receipt per refresh.
+        if job_ids is not None and (summary or planning):
+            by_id = {a['id']: a for a in result if a['status'] == 'succeeded'}
+            if by_id:
+                ids = list(by_id)
+                query = ("SELECT attempt,node,direction,report FROM artifact_transfers "
+                         "WHERE status='succeeded' AND attempt IN ("
+                         + ','.join('?' for _ in ids) + ") ORDER BY created")
+                transfers = list(self.db.execute(query, ids))
+                for row in transfers:
+                    attempt = by_id.get(row['attempt'])
+                    if attempt is None:
+                        continue
+                    receipt = json.loads(row['report']).get('artifact')
+                    if receipt and row['direction'] == 'upload':
+                        attempt['report']['hf_artifact'] = receipt
+                for row in transfers:
+                    if row['direction'] not in ('download', 'archive'):
+                        continue
+                    attempt = by_id.get(row['attempt'])
+                    if attempt is None:
+                        continue
+                    transfer_report = json.loads(row['report'])
+                    receipt = transfer_report.get('artifact')
+                    if not receipt:
+                        continue
+                    report = attempt['report']
+                    job_spec = attempt.get('spec', {}).get('job_spec', {})
+                    declared = job_spec.get('dependency_artifacts', job_spec.get('hf_artifacts', []))
+                    published = report.get('hf_artifact', {})
+                    if (declared and not report.get('dependency_artifacts')
+                            and published.get('attempt') != attempt['id']):
+                        continue
+                    required = (report.get('dependency_artifacts') or
+                                published.get('files') or
+                                report.get('outputs', {}))
+                    if not set(required).issubset(receipt.get('files', {})):
+                        continue
+                    if row['direction'] == 'archive' and any(
+                            (receipt['files'][name].get('sha256'), receipt['files'][name].get('bytes')) !=
+                            (value.get('sha256'), value.get('bytes'))
+                            for name, value in required.items()):
+                        continue
+                    attempt.setdefault('artifact_locations', {})[row['node']] = receipt
+                    if row['direction'] == 'archive' and (
+                            transfer_report.get('origin_retired') or
+                            transfer_report.get('source_cleanup', {}).get('deleted')):
+                        attempt['origin_retired'] = True
+        return result
 
 
 def dependency_details(job, by_id, trail=(), depth=0):
@@ -125,7 +178,9 @@ def collect(db, *, node=None, campaign=None, job=None, hardware_index=None, live
             for name, values in changes.items():
                 if len(values) >= 4 and values[0] == values[2] and values[1] == values[3] and values[0] != values[1]:
                     snap = snapshots.get(name, {})
-                    resolved = snap.get('stable_polls', 0) >= 3 and snap.get('received_at', 0) > latest_change[name]
+                    required = nodes.get(name, {}).get('policy', {}).get('stable_polls', 3)
+                    resolved = (snap.get('stable_polls', 0) >= required
+                                and snap.get('received_at', 0) > latest_change[name])
                     diagnostics.append(dict(node=name, kind='repeating_storage_profile', recent_max_jobs=values[:4],
                                             active=not resolved, last_change_age_s=age(now, latest_change[name])))
                     if not resolved and (not node or node == name):
@@ -301,7 +356,7 @@ def attach_progress(rows, nodes, timeout):
         if row['status'] in ACTIVE and row.get('attempt_dir'):
             grouped.setdefault(row['node'], []).append(row)
     code = inspect.getsource(legacy_posterior_phase) + '''
-import json,sys,time
+import json,sys,time,re
 from pathlib import Path
 for key,d in json.loads(sys.argv[1]):
  out={'id':key}
@@ -347,7 +402,22 @@ for key,d in json.loads(sys.argv[1]):
    elif p.is_file():
     assert p.stat().st_size<=131072
     out['progress']={'phase':json.loads(p.read_text()).get('phase')}
-   else:out['progress']={'unavailable':'no progress marker'}
+   else:
+    # Legacy Paddle eval workers may expose only their bounded stdout log.
+    # Report observed batches and the two audited fp32/quantized phases without
+    # inventing throughput or a batch denominator.
+    log=root/'stdout.log'
+    if log.is_file():
+     with log.open('rb') as stream:
+      stream.seek(max(0,log.stat().st_size-131072));text=stream.read(131072).decode('utf-8','replace')
+     seen=re.findall(r'Eval iter:\s*([0-9]+)',text)
+     base=root/'evaluation';done=sum((base/name/'bbox.json').is_file() for name in ('fp32','quantized'))
+     if seen and (base/'fp32').exists():
+      phase='complete' if done>=2 else 'quantized' if (base/'fp32'/'bbox.json').is_file() else 'fp32'
+      out['progress']={'completed_cells':done,'planned_cells':2,'phase':phase,
+                       'batches':int(seen[-1]),'age_s':round(max(0,time.time()-log.stat().st_mtime),1)}
+     else:out['progress']={'unavailable':'no progress marker'}
+    else:out['progress']={'unavailable':'no progress marker'}
  except Exception as e:out['progress']={'error':str(e)}
  print(json.dumps(out))
 '''

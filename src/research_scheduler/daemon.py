@@ -22,10 +22,17 @@ def save(path,value):
 def cycle(controller,output,max_launches=24):
     started=time.monotonic()
     result=controller.tick(execute=True,max_launches=max_launches,warmup=False,
-                           launch_budget_s=20,parallel_launches=True)
+                           launch_budget_s=20,parallel_launches=True,final_reconcile=False)
     dispatch=time.monotonic()-started
     notification_started=time.monotonic()
-    notifications=poll_campaigns(controller.store)
+    try:
+        notifications=poll_campaigns(controller.store)
+    except RuntimeError as exc:
+        if 'holds the scheduler lock' not in str(exc):
+            raise
+        # Another short registry operation may follow dispatch. Preserve its
+        # successful result and retry notification collection next cycle.
+        notifications={'deferred': 'registry busy'}
     notification_seconds=time.monotonic()-notification_started
     active=controller.store.attempts(active=True,summary=True)
     state=dict(time=time.time(),manager='research_scheduler.daemon',
@@ -54,15 +61,15 @@ def main(argv=None):
     # Keep the same Store/DB dispatch lock; additionally reject duplicate daemons.
     with args.db.with_suffix('.manager.lock').open('a') as owner:
         fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        store=Store(args.db);store.lock_wait_s=2
+        store=Store(args.db);store.lock_wait_s=15
         try:
             controller=Controller(store)
             while not stop.is_set():
                 started=time.monotonic();phases={}
                 try:phases=cycle(controller,args.output,args.max_launches)
                 except Exception as exc:
-                    save(args.output/'LAST_CONTROLLER_ERROR.json',dict(time=time.time(),error=type(exc).__name__))
-                    print(json.dumps(dict(event='controller_error',error=type(exc).__name__)),flush=True)
+                    save(args.output/'LAST_CONTROLLER_ERROR.json',dict(time=time.time(),error=type(exc).__name__,message=str(exc)[-1000:]))
+                    print(json.dumps(dict(event='controller_error',error=type(exc).__name__,message=str(exc)[-1000:])),flush=True)
                 elapsed=time.monotonic()-started
                 timing=dict(time=time.time(),phases=phases,target_interval_s=args.interval,
                             elapsed_s=elapsed,wait_s=max(0,args.interval-elapsed),

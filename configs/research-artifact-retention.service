@@ -1,0 +1,22 @@
+[Unit]
+Description=Research artifact transfers and LAB4 retention
+
+[Service]
+Type=exec
+WorkingDirectory=/home/jy/carla_online_switch
+Environment=RS_HF_UPLOAD_DEFAULT=0
+Environment=RS_HF_UPLOAD_INTERVAL_S=20
+Environment=RS_MODEL_VRAM_MIB=9216
+Environment=RS_MODEL_EVAL_VRAM_MIB=3072
+Environment=RS_ATTEMPT_ARCHIVE_POLICY=/home/jy/carla_online_switch/scheduler/configs/attempt_archive_lab4_v2.json
+Environment=PYTHONPATH=/home/jy/experiments/research_scheduler/releases/controller-20260920-artifact-service-v3/src
+ExecStart=/usr/bin/python3 -m research_scheduler.artifact_service --db /home/jy/experiments/research_scheduler/state.db --output /home/jy/experiments/research_scheduler/artifact_runtime --interval 5
+Restart=always
+RestartSec=5
+TimeoutStopSec=90
+KillMode=process
+StandardOutput=append:/home/jy/experiments/research_scheduler/artifact_service.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

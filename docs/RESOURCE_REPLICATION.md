@@ -42,6 +42,20 @@ remain execution-profile gates; identical images/common payloads can be shared
 without rewriting their bytes. Markers assume immutable managed data; this is
 not a continuously running bit-rot scanner or a bidirectional filesystem mirror.
 
+Dataset identity and physical location are separate contracts. Jobs store a
+logical dataset ID. Each node stores that ID's absolute root exactly once in its
+`datasets` mapping; manifests, annotations and job configuration store only safe
+paths relative to that root. The controller resolves the root at placement and
+passes it as `RS_DATASET_PATH`. An execution catalog may contain each target's
+absolute destination root only to prepare and register that node mapping; it
+must not copy the root into the scientific job or an otherwise portable input
+profile. Absolute paths inside legacy COCO/profile files require a new immutable
+relative-path profile and validation receipt rather than string replacement of
+an active attempt.
+`dataset_files` is the launch-time contract for such inputs: every entry is a
+root-relative path plus SHA-256, is resolved only after node selection, and is
+rehash-checked by the remote runner before the scientific child starts.
+
 Initial live scope: SCDA/UV referenced images (125,498 files) and SCDA shared
 input payloads across the eleven currently approved LAB/FARM/CPS model nodes.
 Bootstrap and verification records: `/home/jy/experiments/resource_replication_20260911/`.

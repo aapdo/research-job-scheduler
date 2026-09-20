@@ -8,6 +8,118 @@
 `--execute`를 지정한 실행기가 신규 작업을 시작합니다. 다만 `daemon --execute`가 이미 운영 중이면
 새로 등록한 job도 자동 배치됩니다. 기존 연구 큐를 자동으로 가져오거나 변경하지 않습니다.
 
+## 현재 운영 배치 정책 (2026-09-19)
+
+- 2026-09-20 사용자 승인: 모델 GPU 노드의 신규 배정에는 연속 정상 관측 2회를 요구한다.
+  CPU-only resource-control과 하드웨어 노드는 기존 3회를 유지한다. 실행 profile 추가로 snapshot이
+  갱신된 경우에도 같은 2회 기준을 사용하며, fresh snapshot·GPU별 정상 관측·온도·VRAM gate는 유지한다.
+- 2026-09-20 상태 회수 지연 보완: 모델 daemon은 주기당 전체 attempt 상태를 한 번 회수한다.
+  서버별 status batch는 15초 timeout·최대 16개 서버 병렬 조회를 사용하며, 통신 실패 뒤 작업별 SSH를
+  연속 재시도하지 않는다. 실패한 관측은 unknown으로 예약을 보존하고 다음 주기에 재조회한다.
+  상태 요청은 attempt 식별·경로·OOM 관측에 필요한 필드만 전송하며 frozen 실행 원본은 보존한다.
+  신규 배정의 60초 snapshot 유효기간과 배정 직전 실측 확인은 유지한다.
+- 2026-09-20 사용자 승인: `CPS2-MODEL`은 신규 모델 GPU 배정을 금지한다(`enabled=false`).
+  현재 활성 모델 attempt는 없으며, 하드웨어 DB의 `rtl-pilot-cps2` 승인·빌드 정책과는 별개다.
+  이전 execution profile과 검증 이력은 보존하고 자동 재활성화하지 않는다.
+- `RP1`은 SSH 장애로 신규 배정을 금지한 뒤 2026-09-20 사용자가 실제 서버를 삭제해
+  모델 인벤토리에서도 제거했다. 기존 execution profile, 검증·실패·archive 이력만 보존한다.
+- 2026-09-20 사용자 승인: 모델 양자화 캠페인(PTQ/QAT/INT8/A8 등)은
+  `s-bank-final-*` FP32 비교보다 항상 높은 등록 우선순위를 사용한다.
+  신규 양자화 experiment priority는 최소 30000, final-bank FP32는 최대 29000이며
+  기존 더 높은 양자화 우선순위는 유지한다. `Store.register_experiment`에서 적용한다.
+  현재 비종료 캠페인도 같은 규칙으로 보정하며 frozen attempt와 실행 중 작업은 유지한다.
+  검증·artifact 선행, 자원 gate, 실행 가능한 하위 작업의 backfill은 그대로 적용한다.
+
+이 절은 일반 스키마 예제가 아니라 현재 운영 배포의 정책 요약입니다. 배정 정책·상한·서버 역할을
+변경할 때는 repository 코드와 실제 controller 배포본, 운영 DB 적용 결과를 검증한 뒤 이 절도 같은
+변경에서 갱신합니다. 실행 중 attempt의 frozen 설정과 과거 이력은 소급 변경하지 않습니다.
+
+- 1차 train pool은 `RP2 → CPS2-MODEL → CPS1-MODEL → FARM9-GUI2`, 2차 train
+  pool은 `LAB1 → FARM8-GUI2 → FARM6 → FARM7`이다. 1차 풀 전체의 배정 가능 GPU를 한 번씩 채운
+  뒤에만 두 번째 train을 배정한다. 같은 깊이에서는 빈 GPU·낮은 스케줄러 부하·VRAM·온도 조건을
+  먼저 보고 서버 순위는 동률을 해소한다. 1차 풀의 train은 기본 GPU당 두 개가 상한이며,
+  2026-09-20 사용자 승인으로 RP2만 GPU당 세 개·서버 전체 아홉 개까지 허용한다. GPU 사용률
+  70% 이상·80°C 이상·VRAM/health 부적합이면 상한에 여유가 있어도 해당 GPU를 건너뛴다.
+  RP1·RP3의 과거 온보딩·검증 이력은 보존하지만 두 서버는 2026-09-20 인벤토리에서 제거됐다.
+  현재 RP 계열 후보인 RP2의 새 작업도 해당 execution profile과 host별 검증을 통과해야 한다.
+  RP 노드 환경은 각 노드에서 frozen requirements와 공식 패키지 인덱스로 설치한다. 데이터는 HF의
+  pinned revision에 있는 압축 chunk를 우선 내려받고, HF에 없는 입력만 원본 서버에서 단일 압축 묶음으로
+  만들어 백그라운드 전송한다. 개별 파일 반복 전송과 전체 데이터 선복제는 온보딩 조건으로 사용하지 않는다.
+  RP 노드 간 환경·데이터 직접 복제는 하지 않는다. 일반·NVIDIA 패키지는 공식 PyPI, Paddle wheel은 Paddle 공식
+  CUDA 채널로 분리 설치해 `extra-index` 선택 때문에 모든 wheel이 한 CDN으로 몰리지 않게 한다.
+  대형 Paddle wheel은 해당 노드가 Paddle 공식 CDN에서 resumable HTTP range로 병렬 다운로드하고,
+  공식 응답의 파일 크기·CRC32 및 wheel ZIP 무결성을 확인한 뒤 설치한다.
+  일시적으로 안정 관측을 쌓는 빈 GPU는 최대 180초 동안 기존 GPU의 두 번째 train이나 2차 풀로의
+  조기 이탈을 보류한다. 1차 풀에서 GPU execution validation이 진행 중이면 같은 계획 주기의 train을
+  2차 풀로 보내지 않고 검증 결과를 먼저 회수한다. 1차 풀에서 GPU당 두 개까지 실제로 더 받을 수 없을 때 2차 풀을 한 번씩
+  채운다. train은 두 train pool 안에서만 실행하며 eval pool로 fallback하지 않는다.
+- 모델 eval pool은 `LAB2 → LAB3 → LAB4 → LAB8 → LAB6`이다. eval은 이 풀 안에서만 실행하며
+  train pool로 fallback하지 않는다. 선택된 서버 안에서는 이미 작업이 있는 GPU보다 다른 GPU를 먼저 쓴다.
+  이 제한은 GPU train/eval의 실행 destination에 적용한다. train pool에서 생성된 checkpoint/result를
+  eval pool로 relay하거나 그 반대로 전달하는 것은 계속 허용하며, relay destination은 소비 작업의 풀을 따른다.
+  준비·smoke·analysis와 이미 실행 중인 frozen attempt는 이 변경으로 이동·중단하지 않는다.
+- 2026-09-20 사용자 요청으로 모델 노드 `RP1`, `RP3`, `FARM1`, `FARM2`를 인벤토리에서 제거했다.
+  과거 attempt·전송·검증 이력은 보존하지만 신규 probe·준비·배정 대상으로 사용하지 않는다.
+  하드웨어 노드 `rtl-farm2-vivado2`도 별도 하드웨어 DB 인벤토리에서 제거했다.
+- Vivado full/OOC build는 마지막 실제 배정을 커서로 사용해
+  `CPS2 → FARM8 → CPS1 → FARM9 → CPS2…` 순환한다. 상태 불량 또는 상한 도달 서버는 건너뛴다.
+  상한은 CPS2 3, FARM8 3, CPS1 3, FARM9 2이며 RTL validation 수는 이 순환 커서에 포함하지 않는다.
+- 모든 역할/순서는 eligibility를 대신하지 않는다. 실행 profile, 데이터·artifact 접근, fresh health,
+  RAM/VRAM, 온도, memory PSI, 라이선스와 사용자 사용 금지 조건을 먼저 통과해야 한다.
+- 모델 작업에는 local-disk headroom·disk reservation admission gate를 적용하지 않는다. FARM6/7/8/9의
+  filesystem 운영 한계와 하드웨어 full-build의 별도 disk reservation·gate는 모델 스케줄러와 분리해 유지한다.
+- CPU-only `resource-control` 작업도 노드의 `min_free_ram_mib`를 남겨야 한다. 노드 RAM 한도와 같은
+  크기의 요청은 실행 가능하지 않으며, 검증된 더 작은 요청 또는 resource variant를 등록한다.
+- HF publication은 명시적인 `hf.enabled=true`가 없으면 등록 프로세스의 환경과 무관하게 비활성이다.
+  사용자가 특정 업로드를 요청하지 않은 새 캠페인은 HF branch/repository나 upload job을 만들지 않고
+  `hf` 설정을 생략하거나 `enabled=false`로 등록한다. 서로 다른 local filesystem의 dependency는
+  검증된 controller-local bounded relay를 우선 사용하며, 전체 파일·크기·SHA와 destination receipt가
+  일치한 뒤에만 후속 작업을 실행한다. Dependency relay는 HF publication 설정과 무관하게 동작한다.
+- 실행 환경 준비 관리는 queued train/eval의 설정만 읽고 cwd·dataset으로 후보를 묶어 profile당 한 번
+  매칭한다. 과거 작업은 상태만 조회하고, 준비 attempt는 실제 처리할 대상만 지연 조회한다. ready 항목은
+  소비 작업·recipe·자원 예산·노드 설정·검증 상태·receipt 파일 메타데이터가 같으면 재처리를 건너뛴다.
+  새 대기 작업이나 관련 상태 변경 시 다시 검증·반영하며, 프로세스 재시작 시 캐시를 재구축한다.
+  서버 상태 수집과 GPU 검증 작업의 실제 배정은 기존 controller가 계속 수행한다.
+- 모델 attempt는 성공·실패 후 5분 이상 사용하지 않으면 HF 없이 LAB4로 자동 보관한다. 현재 지정된 27개
+  캠페인은 과거 attempt도 포함하며, `automatic_since` 이후 종료되는 attempt와 향후 등록 캠페인은
+  목록 추가 없이 자동 포함한다. 디스크 회수 대상으로 지정한 RP2는 캠페인과 무관하게 과거 terminal
+  attempt를 우선 backfill한다. FARM 원본만 controller local staging을 사용한다. LAB/CPS/RP는 LAB4에서
+  원본 서버로 직접 SSH/rsync 연결하고, LAB4 원본은 서버 내부에서 보관한다. 제어 머신에서 생성된 결과만
+  제어 머신에서 LAB4로 전송한다. LAB4의 전체 파일 크기·SHA 재검증과 5분 비사용 조건을 통과한 원본만 삭제하며, 이후 dependency가
+  다시 필요하면 relay는 LAB4 보관본을 source로 사용해 대상 서버에 복구한다. 상세 계약은
+  [LAB4 attempt archive](docs/ATTEMPT_ARCHIVE.md)를 따른다.
+  전송 예약·상태 회수·SHA 검증·원본 삭제는 `research-artifact-retention.service`가 같은 DB에서
+  처리한다. `artifact_service_config.enabled=1`이면 모델 controller는 artifact tick을 건너뛰고
+  DB의 전송 예약 및 검증 receipt만 배정에 반영한다. 별도 서비스는 원격 RPC 동안 공용 registry 잠금을
+  해제하고, 삭제 직전 새 참조를 재검사한다. 서비스 장애 중에도 controller가 전송을 중복 인계하지 않는다.
+  전송 슬롯 2개 중 실행 가능한 후속 작업의 dependency relay를 먼저 최대 1개 배정하고, 일반 LAB4
+  archive는 나머지 슬롯을 최대 1개 사용한다. 이미 한 종류가 실행 중이면 다른 종류가 빈 슬롯을 사용하며,
+  archive backlog가 dependency relay 선택 전에 매 주기 반환해 후속 작업을 굶기지 않게 한다.
+  여러 후보 서버 중에서는 필요한 dependency 일부가 이미 검증된 서버를 먼저 골라 한 서버의 입력을
+  완성한 뒤 실행하되, train/eval GPU pool 순서가 누락 파일 수보다 먼저다. 상위 GPU 후보가 실행
+  profile 등록 뒤 정상 관측을 쌓는 중이면 최대 180초 기다리고, 그동안 낮은 pool로 relay해 실행 위치를
+  고정하지 않는다. 공통 입력만 여러 빈 서버에 반복 복제해 후속 시작을 늦추지 않는다.
+  2026-09-20 보완: 배정기와 relay는 선행 파일만 도착했을 때 실행 가능한 GPU 후보를 함께 계산하고
+  같은 train/eval pool 라운드를 적용한다. 상위 pool에서 전송만 기다리면 하위 pool의 기존 복제본으로
+  먼저 실행하지 않고 `preferred GPU pool dependency relay pending`으로 표시하며 해당 pool에 relay한다.
+  eval dependency는 producer가 RP/train pool에 있어도 eval pool destination으로 relay한다.
+  같은 역할의 상위 서버가 VRAM·온도·동시성·host/profile·fresh health 조건에 부적합하면 같은 pool의
+  다음 서버로 넘어가며 반대 역할 pool을 실행 destination으로 사용하지 않는다.
+  같은 우선 라운드에서 이미 입력과 자원이 준비된 후보가 있으면 추가 복제 없이 배정한다.
+  전송 가정은 후보 비교에만 사용하며 실제 실행은 기존 verified receipt가 있어야 한다.
+- 신규 attempt 예약 이벤트에는 선택 당시의 전체 eligible 서버와 서버별 rejection 사유를
+  `placement_audit`으로 보존한다. 이후 실행 중인 서버만 보고 과거 배정 이유를 추정하지 않는다.
+- 새 report job은 `report_execution=archive_host`, `hosts=[lab4]`로 LAB4에서 생성한다. 표준 Python만
+  사용하는 self-contained report는 등록 시 자동 변환하고, 별도 runtime이 필요한 report는 LAB4 실행
+  profile을 준비해야 등록된다. 결과는 검증된 dependency 위치에서 읽으며 새 중간 report gate를 추가하지
+  않는다. 실행 중 attempt와 완료 이력은 유지한다.
+  사용자가 LAB4를 영구 집계 위치로 명시한 cross-node report는 `report_storage=lab4-direct-relay`와
+  운영 예외 사유를 기록한다. 이 report의 결과 relay가 대기 중이면 같은 LAB4를 사용하는 다음
+  retention archive보다 먼저 처리해 archive backlog가 report를 영구 차단하지 않게 한다.
+- 정식 progress marker가 없는 legacy Paddle eval은 최대 128 KiB의 `stdout.log` 끝부분에서
+  `Eval iter`만 읽어 관측 batch와 fp32/quantized 단계를 표시한다. 이를 완료율이나 예상 시간으로
+  확대하지 않으며, 새 worker revision은 `PROGRESS.json`을 직접 기록해야 한다.
+
 ## 목차
 
 - [주요 기능과 기본 개념](#주요-기능과-기본-개념)
@@ -25,6 +137,13 @@ RTL 회귀·OOC·Vivado full build·보드 시험도 CPU-only 작업으로 표�
 GPU 기본 정책은 유지하며, 별도 build 슬롯·공유 토큰·물리 호스트 예약·보고서 검증을 사용합니다.
 보드 실행은 단일 gateway와 기존 도구가 공유하는 잠금 통합이 필요합니다.
 등록 예제와 안전한 도입 순서는 [RTL workflows](docs/RTL_WORKFLOWS.md)를 참고하세요.
+
+2026-09-20 하드웨어 보드 수집 계약 복구: 성공한 빌드 뒤 선행 보드 gate가 확정
+실패하여 최종 보드가 미시작 대기인 경우, 명시적 `blocked_board_recovery`로 새
+보드 revision을 등록할 수 있습니다. 명령·입력·config·정확 비교·빌드·잠금과
+기타 선행 조건을 유지하며 수집 목록/새 ID만 교정합니다. 원래 실패 이력은
+보존하고 attempt가 전혀 없는 대기 꼬리만 취소·대체합니다. 실행 중/상태 불명
+작업에는 적용하지 않으며 자동 복구·전체 재빌드·서비스 재시작 권한이 아닙니다.
 
 - 서버와 GPU 등록: SSH/local 실행, GPU UUID·모델·VRAM 조회, 장치별 사용 허용.
 - 실험 관리: 이름·RQ·job별 목적, 설정값, 예상 자원량, 우선순위, 학습→평가 의존성.
@@ -49,8 +168,10 @@ GPU 기본 정책은 유지하며, 별도 build 슬롯·공유 토큰·물리 �
 `depends_on`은 기본적으로 선행 artifact의 같은 filesystem 접근과 해시 검증까지 요구합니다.
 완료 순서만 기다리는 dependency는 해당 ID를 `order_only_dependencies`에도 적을 수 있습니다.
 이 경우 서로 다른 local node에서도 후속을 배치할 수 있지만 `{dep:ID}` 경로 참조는 금지됩니다.
-원격 artifact가 필요하면 [HF 결과 공유](docs/HF_ARTIFACTS.md)를 등록하거나 workflow의 명시적인
-수집·전송 단계를 사용합니다. HF download가 검증되기 전에는 다른 local 서버에 후속 job을 배치하지 않습니다.
+원격 artifact가 필요하면 기본적으로 controller-local bounded relay를 사용하고 destination의 파일·크기·SHA와
+receipt를 검증합니다. 사용자가 장기 publication을 명시적으로 요청한 경우에만
+[HF 결과 공유](docs/HF_ARTIFACTS.md)를 등록합니다. Relay 또는 명시적으로 승인된 HF download가 검증되기
+전에는 다른 local 서버에 후속 job을 배치하지 않습니다.
 `cluster`는 실행 서버 집합과 혼동될 수 있어 알림 단위의 코드 명칭은 `campaign`, 화면 표현은
 “실험 그룹”을 사용합니다.
 
@@ -170,6 +291,20 @@ research-scheduler --db "$SCHEDULER_DB" set-dataset research-node-b vehicle-v1 /
 미등록·접근 불가 경로는 해당 실험의 배치 대상에서 제외합니다. 데이터 복사·다운로드·symlink
 생성은 하지 않으며 같은 이름의 데이터 내용·버전·split 동등성은 사용자가 관리합니다.
 기존 `dataset_path` 직접 지정도 지원하지만 `dataset`과 동시에 지정할 수는 없습니다.
+새 등록은 가능한 한 논리 `dataset`을 사용합니다. 서버별 절대 root는 node의
+`datasets[dataset_id]`에만 보관하고, job config·annotation/profile에는 root 기준 상대경로를 둡니다.
+실행 요청을 만들 때만 `{dataset_path}`와 `RS_DATASET_PATH`가 선택 서버의 root로 해석됩니다.
+기존 frozen attempt와 legacy `dataset_path`는 보존하지만, 다른 서버용 profile을 만들기 위해
+절대경로를 복사·치환하지 않습니다.
+
+필수 데이터 파일은 job의 `dataset_files`에 root 기준 상대경로와 SHA-256으로 고정할 수 있습니다.
+스케줄러는 서버 선택 후에만 실제 root와 결합하고 runner 시작 직전에 다시 해시를 확인합니다.
+
+```json
+{"dataset": "vehicle-v1", "dataset_files": [
+  {"path": "annotations/train.json", "sha256": "<64-hex>"}
+]}
+```
 
 실행 중인 attempt를 유지하면서 node의 **향후** local/NFS 경로를 전환하려면 storage profile을
 사용합니다. 아래 명령은 기존 attempt의 frozen 경로를 바꾸지 않고 신규 배치 설정만 교체합니다.
@@ -221,6 +356,26 @@ research-scheduler --db "$SCHEDULER_DB" daemon --execute --interval 20 --max-lau
 상속하며, 개별 job에서 덮어쓸 수 있습니다. 선택된 실제 종류는 `{filesystem}` 치환값과
 `RS_FILESYSTEM` 환경 변수로 전달됩니다. 이 설정은 배치 대상을 제한할 뿐 mount·복사·동기화를
 수행하지 않습니다.
+
+### 평가 worker 및 batch 정책 (2026-09-19)
+
+새 모델 평가 실행본은 배정된 서버에 따라 LAB2·LAB3·LAB4·LAB6·LAB8에서는
+worker 4 / batch 24, 그 외 서버에서는 worker 8 / batch 48을 사용한다.
+`tools/evaluation_host_policy.py`가 frozen attempt의 `node_spec.id`를 읽으며,
+PicoDet 공통 evaluator와 condition-sharded evaluator에서 적용한다.
+새 bundle에는 이 helper도 포함해야 한다. 기존 frozen runtime 전체를 소급 변경하는
+정책은 아니며, 다른 evaluator를 등록할 때도 같은 값을 명시적으로 연결하고 검증한다.
+GPU 검증은 해당 서버의 실제 worker/batch 조합으로 수행한 후 본 평가를 허용한다.
+서버별 값은 고정된 두 조합이며 순간 부하에 따라 학습 도중 임의 변경하지 않는다.
+서버 사용 승인과 배정은 기존 스케줄러 정책을 따른다.
+
+실패한 eval을 같은 과학 설정의 성공한 재시작이 대체할 때는 실패 attempt를 삭제하거나
+성공으로 바꾸지 않는다. 원본 job의 `metadata.recovery_replacement`와 성공 job의
+`metadata.independent_restart`를 양방향으로 연결하고, plan SHA·mode·arm·epoch·override 및
+성공 output SHA가 일치할 때만 캠페인 현재 집계에서 성공한 재시작을 한 번 센다.
+학습용 recovery 규칙과 달리 eval 대체는 대상 job이 실제로 성공한 뒤에만 활성화한다.
+동일 dependency config를 가진 analysis 준비 작업의 코드 경로 복구도 성공 output SHA와
+양방향 링크가 있을 때 같은 원칙으로 대체 집계한다.
 
 ### 학습과 평가의 의존 관계
 
@@ -330,6 +485,7 @@ daemon은 전이와 전송 결과를 durable outbox와 event log에 기록하므
 | `set-gpu NODE UUID enabled|disabled` | active attempt를 바꾸지 않고 향후 GPU 배치 허용 여부 변경 |
 | `set-external-gpu-processes NODE enabled|disabled` | 특정 node에서 외부 PID와 VRAM headroom 기반 공존 허용 |
 | `set-gpu-margin NODE MIB` | 향후 배치에 적용할 GPU별 VRAM 안전 여유 변경 |
+| `set-min-free-disk NODE MIB` | 실행 중 attempt를 유지하고 향후 local-disk 최소 여유 변경 |
 | `set-gpu-packing NODE enabled|disabled` | scheduler job 간 VRAM 기반 shared 배치 설정 |
 | `set-temperature-policy NODE` | 기본 80°C warm cap·85°C hard launch limit 설정 |
 | `set-job-gpu-mode JOB shared|exclusive` | 대기 중인 job의 GPU packing 방식 변경 |
@@ -409,6 +565,8 @@ MIG/MPS·선점·자동 checkpoint resume·VRAM peak 자동 profiling은 지원�
 | [STATE_MACHINE.md](docs/STATE_MACHINE.md) | job/attempt/node 상태와 재시도·invalid 처리 |
 | [HF_ARTIFACTS.md](docs/HF_ARTIFACTS.md) | campaign HF 저장소, 자동 upload/download와 checkpoint 경로 변환 |
 | [DATASET_PREPARATION.md](docs/DATASET_PREPARATION.md) | 미등록 데이터 준비·검증·경로 등록 자동화 |
+| [RUNPOD_MODEL_NODE_ONBOARDING.md](docs/RUNPOD_MODEL_NODE_ONBOARDING.md) | RP2/RP1 runtime·local profile·checksum·실제 GPU 검증 절차 |
+| [ATTEMPT_ARCHIVE.md](docs/ATTEMPT_ARCHIVE.md) | 대상 캠페인의 LAB4 전체 attempt 보관·검증·5분 후 원본 삭제·필요 시 복구 |
 | [OPEN_SOURCE_REVIEW.md](docs/OPEN_SOURCE_REVIEW.md) | Slurm·ClearML·Ray 검토와 구현 선택 근거 |
 | [VALIDATION_20260906.md](docs/VALIDATION_20260906.md) | 배치·전송·의존성 회귀 테스트와 실제/모의 검증 범위 |
 | [node.ssh.json](examples/node.ssh.json) | 서버 등록 예제 |

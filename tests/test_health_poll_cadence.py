@@ -34,8 +34,12 @@ class PollCadenceTests(unittest.TestCase):
             return self.controller.refresh()['a']
 
     def test_62_second_cadence_and_freshness(self):
-        self.assertEqual(self.poll(1000)['stable_polls'], 1)
-        self.assertEqual(self.poll(1062)['stable_polls'], 2)
+        first=self.poll(1000)
+        self.assertEqual(first['stable_polls'], 1)
+        self.assertEqual(first['stable_since'],1000)
+        second=self.poll(1062)
+        self.assertEqual(second['stable_polls'], 2)
+        self.assertEqual(second['stable_since'],1000)
         result = self.poll(1124)
         self.assertEqual(result['stable_polls'], 3)
         self.assertTrue(all(g['stable_polls'] == 3 for g in result['gpus']))
@@ -55,7 +59,9 @@ class PollCadenceTests(unittest.TestCase):
         self.data['d_state'] = 1
         self.assertEqual(self.poll(1062)['stable_polls'], 0)
         self.data['d_state'] = 0
-        self.assertEqual(self.poll(1124)['stable_polls'], 1)
+        recovered=self.poll(1124)
+        self.assertEqual(recovered['stable_polls'], 1)
+        self.assertEqual(recovered['stable_since'],1124)
 
     def test_gpu_bad_sample_resets_only_gpu_streak(self):
         self.poll(1000)

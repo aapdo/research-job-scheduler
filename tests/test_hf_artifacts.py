@@ -15,7 +15,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'src'))
 from research_scheduler import agent, hf_worker, relay_worker
-from research_scheduler.artifacts import hf_spec, campaign_for, tick, reservations, publication_summary
+from research_scheduler.artifacts import (hf_spec, campaign_for, tick, reservations,
+    publication_summary, cleanup_archived_sources, start_attempt_archive,
+    urgent_archive_destination_staging)
 from research_scheduler.notifications import register_campaign
 from research_scheduler.controller import Controller
 from research_scheduler.store import Store, dumps
@@ -23,6 +25,43 @@ from test_scheduler import node, snapshot, job, experiment, plan, reservation
 
 
 class LocalRelayWorkerTests(unittest.TestCase):
+    def test_lab4_report_dependency_staging_precedes_more_archives(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'db')
+            source=node(key='source');lab4=node(key='lab4')
+            source.update(transport='ssh',target='source-host')
+            lab4.update(transport='ssh',target='lab4-host')
+            s.register_node(source);s.register_node(lab4)
+            predecessor=job('predecessor',gpu_count=0);predecessor['outputs']=['RESULT.json']
+            report=job('report',deps=['predecessor'],gpu_count=0)
+            report.update(kind='analysis',hosts=['lab4'],name='LAB4 report')
+            report['resources']=dict(gpu_count=0,gpu_mode='exclusive',vram_mib=0,
+                                     cpu=1,ram_mib=1024)
+            report['metadata']={
+                'report_role':'report',
+                'report_execution':'archive_host',
+                'report_storage':'lab4-direct-relay',
+                'execution_profiles':{'lab4':{
+                    'argv':['python3','-c','print(1)'],
+                    'cwd':'/lab4',
+                    'resource_contract':copy.deepcopy(report['resources']),
+                }},
+            }
+            s.register_experiment(experiment([predecessor,report]))
+            with s.db:
+                s.db.execute("UPDATE jobs SET status='succeeded' WHERE id='predecessor'")
+                s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',
+                    ('predecessor.done','predecessor','source','{}','succeeded',1,
+                     dumps({'outputs':{'RESULT.json':dict(bytes=1,sha256='0'*64)}})))
+            self.assertTrue(urgent_archive_destination_staging(s,'lab4'))
+            with s.db:
+                s.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                    ('relay','predecessor.done','lab4','download','succeeded','{}',
+                     dumps({'artifact':{'attempt':'predecessor.done','files':{
+                         'RESULT.json':dict(bytes=1,sha256='0'*64)}}}),2))
+            self.assertFalse(urgent_archive_destination_staging(s,'lab4'))
+            s.db.close()
+
     def test_remote_relay_streaming_does_not_require_rsync(self):
         with tempfile.TemporaryDirectory() as root:
             root=Path(root);destination=root/'payload';payload=b'checkpoint'
@@ -65,6 +104,162 @@ class LocalRelayWorkerTests(unittest.TestCase):
             self.assertEqual(receipt['transport'],'controller-local-relay')
             self.assertEqual(receipt['files']['LAYOUTS.json']['sha256'],sha)
             self.assertFalse((attempt/'relay-staging').exists())
+
+    def test_complete_attempt_archive_includes_config_checkpoint_and_allows_verified_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);work=root/'runs';source=work/'done';transfer=root/'transfer';destination=root/'lab4'
+            source.mkdir(parents=True);transfer.mkdir()
+            frozen=dict(id='attempt.done',attempt_dir=str(source),
+                        node_spec=dict(work_root=str(work)),job_spec=dict(kind='train'))
+            spec_sha=hashlib.sha256(dumps(frozen).encode()).hexdigest()
+            request=dict(frozen,spec_sha256=spec_sha)
+            (source/'spec.json').write_text(json.dumps(request))
+            (source/'state.json').write_text(json.dumps(
+                dict(attempt='attempt.done',status='succeeded',finished=1)))
+            (source/'config.json').write_text('{"epochs":5}\n')
+            (source/'run/epochs/e5').mkdir(parents=True)
+            (source/'run/epochs/e5/model.pdparams').write_bytes(b'checkpoint')
+            config=dict(mode='attempt-archive',source_attempt='attempt.done',source_node='farm9',
+                        source_target='@local',source_root=str(source),source_spec_sha256=spec_sha,
+                        destination_target='@local',destination_root=str(destination),
+                        campaigns=['campaign'],experiment='experiment',job='job',
+                        transport_route='controller-local-staging')
+            (transfer/'config.json').write_text(json.dumps(config))
+            with patch.dict('os.environ',{'RS_CONFIG_PATH':str(transfer/'config.json'),
+                                           'RS_ATTEMPT_DIR':str(transfer)}):
+                relay_worker.main()
+            receipt=json.loads((transfer/'HF_RECEIPT.json').read_text())
+            self.assertTrue(receipt['complete_attempt'])
+            self.assertEqual(set(receipt['files']),{
+                'spec.json','state.json','config.json','run/epochs/e5/model.pdparams'})
+            self.assertEqual((destination/'run/epochs/e5/model.pdparams').read_bytes(),b'checkpoint')
+            with patch.object(agent, 'assert_attempt_not_open'):
+                result=agent.cleanup_archived_attempt(dict(request,archive_receipt=receipt))
+            self.assertTrue(result['deleted'])
+            self.assertFalse(source.exists())
+
+    def test_archive_receipt_is_a_dependency_location(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'db');first=job('first',gpu_count=0);first['outputs']=['RESULT.json']
+            s.register_experiment(experiment([first]))
+            receipt=dict(attempt='first.done',root='/lab4/archive/first.done',complete_attempt=True,
+                         files={'RESULT.json':dict(path='/lab4/archive/first.done/RESULT.json',
+                                                   bytes=1,sha256='0'*64)})
+            with s.db:
+                s.db.execute("UPDATE jobs SET status='succeeded' WHERE id='first'")
+                s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',
+                    ('first.done','first','farm9',dumps(dict(attempt_dir='/farm9/first.done')),
+                     'succeeded',1,dumps({'outputs':{'RESULT.json':dict(bytes=1,sha256='0'*64)}})))
+                s.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                    ('archive','first.done','lab4','archive','succeeded','{}',
+                     dumps({'artifact':receipt}),2))
+            self.assertEqual(s.attempts()[0]['artifact_locations']['lab4']['root'],receipt['root'])
+            s.db.close()
+
+    def test_source_cleanup_waits_for_recent_attempt_users(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'db');source=node(key='source');lab4=node(key='lab4')
+            lab4.update(transport='ssh',target='lab4-host')
+            s.register_node(source);s.register_node(lab4)
+            first=job('first',gpu_count=0);consumer=job('consumer',gpu_count=0)
+            s.register_experiment(experiment([first,consumer]))
+            source_root='/source/attempt.done';now=10_000
+            receipt=dict(attempt='attempt.done',root='/lab4/attempt.done',attempt_archive=True,
+                         complete_attempt=True,manifest_sha256='1'*64,
+                         files={'spec.json':dict(path='/lab4/attempt.done/spec.json',bytes=1,sha256='0'*64)})
+            with s.db:
+                s.db.execute("UPDATE jobs SET status='succeeded' WHERE id='first'")
+                s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',
+                    ('attempt.done','first','source',dumps(dict(id='attempt.done',attempt_dir=source_root,
+                     node_spec=source,spec_sha256='2'*64)),'succeeded',1,dumps({'finished':1})))
+                s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',
+                    ('consumer.recent','consumer','lab4',dumps(dict(attempt_dir='/consumer',
+                     input_files=[{'path':source_root+'/RESULT.json'}])),'succeeded',now-60,dumps({'finished':now-60})))
+                s.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                    ('archive','attempt.done','lab4','archive','succeeded','{}',
+                     dumps({'artifact':receipt,'finished':1}),1))
+            class Capture:
+                def __init__(self):self.calls=[]
+                def call(self,node,action,request):
+                    self.calls.append((node['id'],action,request))
+                    if action == 'verify_archived_attempt':
+                        return {'verified':True,'manifest_sha256':'1'*64}
+                    return {'deleted':True}
+            transport=Capture();controller=Controller(s,transport)
+            with patch.object(__import__('research_scheduler.artifacts',fromlist=['time']).time,'time',return_value=now):
+                self.assertFalse(cleanup_archived_sources(
+                    controller,s.specs('nodes'),{'delete_after_idle_s':1800}))
+                with s.db:s.db.execute("DELETE FROM attempts WHERE id='consumer.recent'")
+                self.assertTrue(cleanup_archived_sources(
+                    controller,s.specs('nodes'),{'delete_after_idle_s':1800}))
+            self.assertEqual([(n,a) for n,a,_ in transport.calls],
+                             [('lab4','verify_archived_attempt'),('source','cleanup_archived_attempt')])
+            s.db.close()
+
+    def test_one_unverifiable_source_does_not_starve_later_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'db');lab4=node(key='lab4')
+            sources=[node(key='source-a'),node(key='source-b')]
+            for n in [lab4,*sources]:
+                n.update(transport='ssh',target=n['id']+'-host')
+                s.register_node(n)
+            jobs=[job('first',gpu_count=0),job('second',gpu_count=0)]
+            s.register_experiment(experiment(jobs))
+            for index,(j,n) in enumerate(zip(jobs,sources),1):
+                attempt=j['id']+'.done';sha=str(index)*64
+                receipt=dict(attempt=attempt,root='/lab4/'+attempt,attempt_archive=True,
+                             complete_attempt=True,manifest_sha256=sha,
+                             files={'spec.json':dict(path='/lab4/'+attempt+'/spec.json',bytes=1,
+                                                     sha256='0'*64)})
+                with s.db:
+                    s.db.execute("UPDATE jobs SET status='succeeded' WHERE id=?",(j['id'],))
+                    s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',
+                        (attempt,j['id'],n['id'],dumps(dict(id=attempt,attempt_dir='/'+attempt,
+                         node_spec=n,spec_sha256='2'*64)),'succeeded',index,dumps({'finished':index})))
+                    s.db.execute('INSERT INTO artifact_transfers VALUES(?,?,?,?,?,?,?,?)',
+                        ('archive-'+str(index),attempt,'lab4','archive','succeeded','{}',
+                         dumps({'artifact':receipt,'finished':index}),index))
+            class Capture:
+                def call(self,n,action,request):
+                    if action=='verify_archived_attempt':
+                        return {'verified':True,'manifest_sha256':request['archive_receipt']['manifest_sha256']}
+                    if n['id']=='source-a':raise PermissionError('cannot inspect proc fd')
+                    return {'deleted':True}
+            controller=Controller(s,Capture())
+            with patch.object(__import__('research_scheduler.artifacts',fromlist=['time']).time,
+                              'time',return_value=10_000):
+                self.assertTrue(cleanup_archived_sources(
+                    controller,s.specs('nodes'),{'archive_node':'lab4','delete_after_idle_s':300}))
+            first_report=json.loads(s.db.execute(
+                "SELECT report FROM artifact_transfers WHERE id='archive-1'").fetchone()[0])
+            second_report=json.loads(s.db.execute(
+                "SELECT report FROM artifact_transfers WHERE id='archive-2'").fetchone()[0])
+            self.assertIn('PermissionError',first_report['cleanup_error'])
+            self.assertTrue(second_report['source_cleanup']['deleted'])
+            s.db.close()
+
+    def test_attempt_archive_route_and_campaign_folder_are_frozen(self):
+        with tempfile.TemporaryDirectory() as root:
+            s=Store(Path(root)/'db')
+            farm=node(root=str(Path(root)/'farm'),key='farm9-gui2');farm.update(transport='ssh',target='farm9')
+            lab4=node(root=str(Path(root)/'lab4'),key='lab4');lab4.update(transport='ssh',target='lab4')
+            relay=node(root=str(Path(root)/'relay'),key='resource-control')
+            for n in (farm,lab4,relay):s.register_node(n)
+            class Capture:
+                def __init__(self):self.requests=[]
+                def call(self,node,action,request):self.requests.append((node,action,request));return {'status':'starting'}
+            transport=Capture();controller=Controller(s,transport)
+            attempt=dict(id='attempt.done',job='job',node='farm9-gui2',status='succeeded',
+                         experiment_id='experiment',report={},spec=dict(
+                             attempt_dir='/farm/attempt.done',spec_sha256='1'*64))
+            start_attempt_archive(controller,attempt,farm,lab4,['campaign-a','campaign-b'])
+            config=json.loads(s.db.execute(
+                "SELECT spec FROM artifact_transfers WHERE direction='archive'").fetchone()[0])['config']
+            self.assertEqual(config['transport_route'],'controller-local-staging')
+            self.assertTrue(config['destination_root'].endswith(
+                '/attempt-archive/campaign-a/experiment/job/attempt.done'))
+            self.assertEqual(config['campaigns'],['campaign-a','campaign-b'])
+            s.db.close()
 
     def test_dependency_staging_does_not_require_hf_campaign(self):
         with tempfile.TemporaryDirectory() as root:
@@ -340,7 +535,7 @@ class HFWorkerTests(unittest.TestCase):
                                                  hf_relocate_json=['result.json'])
         child=job('child',gpu_count=0,deps=['first']);child.update(hosts=['b'],argv=['cat','{dep:first}/weights.bin'])
         s.register_experiment(experiment([first,child]))
-        register_campaign(s,dict(id='study',name='Study',rq='why',projects=['general'],hf={'repo_id':'test/results',
+        register_campaign(s,dict(id='study',name='Study',rq='why',projects=['general'],hf={'repo_id':'test/results', 'enabled':True,
             'revision':'codex/archive-test' if archive else 'main'}))
         with s.db:
             s.db.execute("UPDATE jobs SET status='succeeded' WHERE id='first'")
@@ -351,7 +546,8 @@ class HFWorkerTests(unittest.TestCase):
         if repair:
             with s.db:
                 s.db.execute('CREATE TABLE artifact_repair_queue(attempt TEXT PRIMARY KEY,config TEXT,state TEXT,created REAL,expires REAL)')
-                cfg=dict(self.config,archive_payload=True,repair_revision='test-repair',hf=dict(self.config['hf'],revision='codex/archive-test'))
+                cfg=dict(self.config,archive_payload=True,repair_revision='test-repair',
+                         hf=dict(self.config['hf'],revision='codex/archive-test',enabled=True))
                 s.db.execute('INSERT INTO artifact_repair_queue VALUES(?,?,?,?,?)',('first.123',dumps(cfg),'pending',0,__import__('time').time()+1000))
         parent=self
         class Transfers:
@@ -479,7 +675,7 @@ class HFIntegrationTests(unittest.TestCase):
             s=Store(Path(root)/'db')
             c=dict(id='campaign',name='Study',rq='why',projects=['general'])
             register_campaign(s,c)
-            new=register_campaign(s,dict(c,hf={'repo_id':'user/study'}))
+            new=register_campaign(s,dict(c,hf={'repo_id':'user/study','enabled':True}))
             self.assertEqual(new['hf']['repo_type'],'model')
             self.assertEqual(campaign_for(dict(id='e',project='general'),{'c':new})['id'],'campaign')
             with self.assertRaises(ValueError):hf_spec({'repo_id':'user/study','token':'secret'})
@@ -490,9 +686,9 @@ class HFIntegrationTests(unittest.TestCase):
             s=Store(Path(root)/'db')
             s.register_experiment(experiment([job('first')]))
             a=register_campaign(s,dict(id='all',name='All',rq='why',projects=['general'],
-                                      hf={'repo_id':'user/results'}))
+                                      hf={'repo_id':'user/results','enabled':True}))
             b=register_campaign(s,dict(id='subset',name='Subset',rq='why',experiments=['e'],
-                                      hf={'repo_id':'user/results'}))
+                                      hf={'repo_id':'user/results','enabled':True}))
             self.assertEqual(campaign_for(dict(id='e',project='general'),{'subset':b,'all':a})['id'],'all')
             with self.assertRaises(ValueError):
                 register_campaign(s,dict(id='conflict',name='Conflict',rq='why',experiments=['e'],
@@ -508,7 +704,7 @@ class HFIntegrationTests(unittest.TestCase):
             children=[job('old-child',deps=['old']),job('new-child',deps=['urgent'])]
             s.register_experiment(experiment([old,urgent,*children]))
             register_campaign(s,dict(id='campaign',name='Study',rq='why',projects=['general'],
-                                    hf={'repo_id':'user/results'}))
+                                    hf={'repo_id':'user/results','enabled':True}))
             with s.db:
                 s.db.execute("UPDATE jobs SET status='succeeded' WHERE id in ('old','urgent')")
                 for index,key in enumerate(('old','urgent')):
@@ -532,7 +728,7 @@ class HFIntegrationTests(unittest.TestCase):
             first=job('first');first['outputs']=['weights']
             s.register_experiment(experiment([first]))
             campaign=register_campaign(s,dict(id='campaign',name='Study',rq='why',projects=['general'],
-                                               hf={'repo_id':'user/results'}))
+                                               hf={'repo_id':'user/results','enabled':True}))
             with s.db:
                 s.db.execute("UPDATE jobs SET status='succeeded' WHERE id='first'")
                 s.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',

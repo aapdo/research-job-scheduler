@@ -125,6 +125,14 @@ class SchemaAndStoreTests(unittest.TestCase):
         n = node_spec(dict(id="server", work_root="/tmp/dedicated", target="my-server"))
         self.assertFalse(n["enabled"])
 
+    def test_gpu_nodes_default_to_two_stable_polls(self):
+        gpu = node_spec(dict(id="gpu-server", work_root="/tmp/gpu", target="gpu-server",
+                             gpus=[dict(uuid="GPU-default", index=0, memory_mib=24000,
+                                        name="test GPU", enabled=True)]))
+        cpu = node_spec(dict(id="cpu-server", work_root="/tmp/cpu", target="cpu-server"))
+        self.assertEqual(gpu["policy"]["stable_polls"], 2)
+        self.assertEqual(cpu["policy"]["stable_polls"], 3)
+
     def test_filesystem_defaults_inheritance_override_and_validation(self):
         self.assertEqual(node()["filesystem"], "local")
         self.assertEqual(node(root="/tmp/nfs", group="shared")["filesystem"], "nfs")
@@ -287,6 +295,23 @@ class SchemaAndStoreTests(unittest.TestCase):
         for value in (-1, float("nan"), True):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.store.set_gpu_margin_mib("a", value)
+
+    def test_min_free_disk_change_is_future_only_and_audited(self):
+        n = node()
+        n["policy"]["min_free_disk_mib"] = 16384
+        self.store.register_node(n)
+        result = self.store.set_min_free_disk_mib("a", 8192)
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["old_min_free_disk_mib"], 16384)
+        self.assertEqual(self.store.specs("nodes")["a"]["policy"]["min_free_disk_mib"], 8192)
+        self.assertFalse(self.store.set_min_free_disk_mib("a", 8192)["changed"])
+        event = self.store.db.execute(
+            "select data from events where kind='min_free_disk_policy_changed' and subject='a'"
+        ).fetchone()
+        self.assertEqual(json.loads(event["data"])["min_free_disk_mib"], 8192)
+        for value in (0, -1, 1.5, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.store.set_min_free_disk_mib("a", value)
 
     def test_gpu_packing_temperature_policy_and_pending_mode_are_audited(self):
         n = node()

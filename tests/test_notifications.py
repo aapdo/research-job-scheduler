@@ -103,7 +103,7 @@ class CampaignNotificationTests(unittest.TestCase):
         self.store.register_experiment(experiment())
         for i in range(11):
             spec = campaign('campaign-' + str(i))
-            spec['hf'] = dict(repo_id='test/model')
+            spec['hf'] = dict(repo_id='test/model', enabled=True)
             register_campaign(self.store, spec)
         with patch.object(self.store, 'jobs', wraps=self.store.jobs) as jobs, \
                 patch.object(self.store, 'observation_attempts', wraps=self.store.observation_attempts) as attempts, \

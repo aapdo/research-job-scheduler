@@ -11,6 +11,20 @@ server=importlib.util.module_from_spec(spec);spec.loader.exec_module(server)
 
 
 class DashboardTests(unittest.TestCase):
+    def test_gpu_pool_order_matches_scheduler_policy(self):
+        self.assertEqual(server.gpu_pool('rp2'),('train',1))
+        self.assertEqual(server.gpu_pool('cps2-model'),('train',2))
+        self.assertEqual(server.gpu_pool('cps1-model'),('train',3))
+        self.assertEqual(server.gpu_pool('farm9-gui2'),('train',4))
+        self.assertEqual(server.gpu_pool('lab1'),('train',5))
+        self.assertEqual(server.gpu_pool('farm6'),('train',7))
+        self.assertEqual(server.gpu_pool('farm7'),('train',8))
+        self.assertEqual(server.gpu_pool('rp1'),('other',999))
+        self.assertEqual(server.gpu_pool('rp3'),('other',999))
+        self.assertEqual(server.gpu_pool('farm1'),('other',999))
+        self.assertEqual(server.gpu_pool('lab2'),('eval',1))
+        self.assertEqual(server.gpu_pool('lab6'),('eval',5))
+
     def test_dashboard_compact_gzip_preserves_campaign_details(self):
         import gzip
         import threading

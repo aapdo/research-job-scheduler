@@ -183,7 +183,11 @@ def node_spec(raw):
     p.setdefault("disabled_gpu_uuids", [])
     check(isinstance(p["disabled_gpu_uuids"], list) and all(isinstance(g, str) and g.startswith("GPU-")
           for g in p["disabled_gpu_uuids"]), "invalid disabled_gpu_uuids")
-    defaults = dict(stable_polls=3, max_snapshot_age_s=60, max_health_poll_gap_s=120, max_cpu_percent=90,
+    # GPU model nodes use the shorter admission streak approved for model
+    # scheduling.  CPU-only/resource-control and hardware nodes retain the
+    # conservative three-poll default.
+    defaults = dict(stable_polls=2 if n["gpus"] else 3,
+                    max_snapshot_age_s=60, max_health_poll_gap_s=120, max_cpu_percent=90,
                     max_gpu_percent=10, min_free_ram_mib=1024, min_free_disk_mib=1024,
                     gpu_margin_mib=1024, max_idle_used_mib=256, allow_gpu_sharing=False,
                     allow_external_gpu_processes=False, max_shared_jobs_per_gpu=2,
@@ -267,7 +271,7 @@ def experiment_spec(raw):
     check(isinstance(e["jobs"], list) and e["jobs"], "at least one job required")
     for j in e["jobs"]:
         fields(j, "id name kind purpose argv cwd env config resources depends_on order_only_dependencies priority labels hosts "
-               "assets input_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem dependency_artifacts hf_artifacts hf_relocate_json resource_variants "
+               "assets input_files dataset_files outputs max_attempts metadata failover_safe dataset_path dataset filesystem dependency_artifacts hf_artifacts hf_relocate_json resource_variants "
                "validation preflight_argv board_id")
         identifier(j["id"])
         check(j["kind"] in ("train", "eval", "prepare", "analysis", *RTL_KINDS), "invalid job kind")
@@ -276,7 +280,7 @@ def experiment_spec(raw):
               and all(isinstance(v, str) and "\x00" not in v for v in j["argv"]), "argv must be a string array")
         absolute(j["cwd"])
         for k, v in dict(env={}, config={}, depends_on=[], priority=0, labels={}, hosts=[],
-                         assets={}, input_files=[], outputs=[], max_attempts=1, metadata={}, purpose="",
+                         assets={}, input_files=[], dataset_files=[], outputs=[], max_attempts=1, metadata={}, purpose="",
                          failover_safe=False, dataset_path="", dataset="",
                          filesystem=e["filesystem"]).items():
             j.setdefault(k, v)
@@ -317,6 +321,17 @@ def experiment_spec(raw):
             fields(f, "path sha256")
             check(isinstance(f["path"], str), "input path required")
             check(bool(re.fullmatch(r"[0-9a-f]{64}", f["sha256"])), "input SHA256 required")
+        check(isinstance(j["dataset_files"], list), "dataset_files must be a list")
+        check(not j["dataset_files"] or bool(j["dataset"]),
+              "dataset_files require a logical dataset mapping")
+        for f in j["dataset_files"]:
+            fields(f, "path sha256")
+            path = f["path"]
+            check(isinstance(path, str) and path and not PurePosixPath(path).is_absolute()
+                  and ".." not in PurePosixPath(path).parts and "\\" not in path,
+                  "dataset_files paths must be relative to the logical dataset root")
+            check(bool(re.fullmatch(r"[0-9a-f]{64}", f["sha256"])),
+                  "dataset_files SHA256 required")
         for out in j["outputs"]:
             check(isinstance(out, str) and out and not PurePosixPath(out).is_absolute()
                   and ".." not in PurePosixPath(out).parts, "outputs must be relative files inside attempt_dir")
