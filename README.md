@@ -4,11 +4,96 @@
 실험 이름과 RQ(Research Question, 실험으로 확인할 질문)를 실행 설정·결과와 함께 보관합니다.
 특정 연구 코드나 데이터셋에 종속되지 않으며, 이미 준비된 Linux 서버에 SSH로 접속해 명령을 실행합니다.
 
-현재 버전은 **단일 운영자용 CLI MVP**입니다. 등록 명령 자체는 연구 작업을 실행하지 않으며,
-`--execute`를 지정한 실행기가 신규 작업을 시작합니다. 다만 `daemon --execute`가 이미 운영 중이면
-새로 등록한 job도 자동 배치됩니다. 기존 연구 큐를 자동으로 가져오거나 변경하지 않습니다.
+코드 구조와 2026-09-26 정리 결과는 [코드 정리 기록](docs/CODE_CLEANUP_20260926.md)에 있습니다.
+저장소 수정과 운영 서비스의 release 적용은 별도 단계이며, 현재 서비스가 읽는 release 경로를
+배포 전에 대조합니다.
 
-## 현재 운영 배치 정책 (2026-09-19)
+등록은 CLI에서 수행하고, 운영 중인 model daemon이 새 작업을 배정합니다.
+수동 실행 모드에서는 `--execute`를 지정해야 신규 작업이 시작됩니다. 결과 relay와 보관은
+별도 artifact service가 처리할 수 있습니다. 등록 명령 자체는 연구 작업을 실행하지 않습니다.
+기존 연구 큐를 자동으로 가져오거나 변경하지 않습니다.
+
+## 운영 서비스 중지 및 재시작 (2026-09-26)
+
+2026-09-26에 다음 여섯 서비스를 중지했습니다. 모델·하드웨어 DB의 활성 attempt는 중지 직전
+각각 0건이었습니다. 현재 모두 `inactive`이며, 영구 user unit의 자동 시작도 꺼져 있습니다.
+
+| 서비스 | 역할 | 시작 방식 |
+|---|---|---|
+| `research-model-controller.service` | 모델 작업 상태 회수·신규 배정 | 기존 user unit |
+| `research-artifact-retention.service` | dependency relay·LAB4 보관 | 기존 user unit |
+| `research-dashboard.service` | 읽기 전용 웹, 포트 30091 | 기존 user unit |
+| `research-rtl-physical-health.service` | 하드웨어 물리 서버 health | 기존 user unit |
+| `research-hardware-pipeline.service` | 하드웨어 캠페인 배정 | 임시 user unit, `systemd-run`으로 생성 |
+| `cda-schedule-rtl520-observer.service` | 별도 CDA RTL520 캠페인 관찰·등록 | 기존 user unit |
+
+다시 켜기 전에 실제 unit의 실행 경로를 확인합니다. 모델 controller는
+`/home/jy/experiments/research_scheduler/state.db`를 사용하며, 현재 unit의 `PYTHONPATH`는
+`controller-20260920-execution-demand-v1/src`입니다. artifact service는 같은 DB와
+`controller-20260920-artifact-service-v3/src`를 사용합니다. 이 저장소에 commit·push한 코드가
+기존 unit의 release에 자동 반영되지는 않습니다.
+
+```bash
+systemctl --user cat research-model-controller.service research-artifact-retention.service
+systemctl --user cat research-dashboard.service research-rtl-physical-health.service
+systemctl --user cat cda-schedule-rtl520-observer.service
+```
+
+기존 설정 그대로 여섯 서비스를 수동으로 다시 켜려면 다음 순서로 실행합니다. 하드웨어 pipeline은
+영구 unit 파일이 없는 임시 서비스이므로 `systemctl start` 대신 아래 `systemd-run` 명령을 사용합니다.
+
+```bash
+systemctl --user start research-rtl-physical-health.service
+systemd-run --user --unit=research-hardware-pipeline \
+  --description='Hardware campaign pipeline dispatcher' \
+  --working-directory=/home/jy/carla_online_switch \
+  --property=Restart=on-failure --property=KillMode=control-group \
+  /usr/bin/python3 -B /home/jy/carla_online_switch/hardware/campaigns/pipeline.py --serve
+systemctl --user start research-artifact-retention.service
+systemctl --user start research-model-controller.service
+systemctl --user start research-dashboard.service
+systemctl --user start cda-schedule-rtl520-observer.service
+```
+
+모델 controller가 시작되면 기존 DB의 실행 가능한 대기 작업을 다시 배정합니다. 서비스 상태는
+아래처럼 확인합니다. 수동 `start`는 부팅 시 자동 시작을 켜지 않습니다.
+
+```bash
+systemctl --user status research-model-controller.service research-artifact-retention.service \
+  research-dashboard.service research-rtl-physical-health.service \
+  research-hardware-pipeline.service cda-schedule-rtl520-observer.service --no-pager
+```
+
+다시 모두 중지할 때는 모델과 하드웨어 배정기를 먼저 멈춥니다. 영구 unit의 자동 시작을 계속
+꺼두려면 `disable --now`를 사용합니다.
+
+```bash
+systemctl --user stop research-model-controller.service research-hardware-pipeline.service
+systemctl --user disable --now research-artifact-retention.service research-dashboard.service \
+  research-rtl-physical-health.service cda-schedule-rtl520-observer.service
+```
+
+## 현재 운영 배치 정책 (2026-09-26 확인, 서비스 중지)
+
+- 2026-09-21 `s-tce-i3-b020-severity-sweep` 사용자 승인 예외: HOSVD I3 B020의
+  severity 0.01/0.02/0.03 평가·smoke는 LAB1/FARM8-GUI2 외 RP2/FARM9-GUI2도
+  허용한다. job별 `eval_train_pool_override_hosts`로 제한하며, 입력 복제 및 GPU
+  runtime 검증과 일반 자원 gate를 유지한다. 다른 eval의 pool은 변경하지 않는다.
+  같은 512-clip B020 평가의 `s-tce-i3-b020-policy-extension`도 사용자 승인으로
+  동일 서버 범위를 사용한다. 새 runtime/batch 검증 후 배정하며 기존 sweep은 변경하지 않는다.
+
+- 2026-09-21 `s-cts-i3-top1-fp32-e0e5` 사용자 지정 예외: FP32이지만 등록 시 최상위
+  우선순위를 사용한다. train 100/80/50%는 RP2 GPU 0/1/2, 40/25/20/10%는
+  FARM9-GUI2 GPU 0/1/2/3의 job별 UUID allowlist로 제한한다. E0는 전체 eval pool,
+  E5는 자기 train의 성공 서버에 `same_host_eval_dependency`로 연결한다.
+  노드 disabled/drain 및 자원 gate를 해제하는 승인은 아니며, 일반 pool 정책은 유지한다.
+
+- 2026-09-21 rank-allocation 비교 실험의 사용자 승인 예외: 해당 train job의
+  `metadata.train_gpu_allowlist`에 명시한 UUID만 학습 후보로 사용한다.
+  RP2·FARM9-GUI2·FARM6 전체, LAB1 GPU 4/5/6/7, FARM8-GUI2 GPU 2/3이다.
+  이 job 범위에서 LAB1·FARM8 학습을 허용하며 다른 job의 pool은 바꾸지 않는다.
+  disabled/retired 노드·GPU, health·온도·VRAM·동시성 gate는 그대로 유지한다.
+  Eval은 기존 eval pool을 사용한다.
 
 - 2026-09-20 사용자 승인: 모델 GPU 노드의 신규 배정에는 연속 정상 관측 2회를 요구한다.
   CPU-only resource-control과 하드웨어 노드는 기존 3회를 유지한다. 실행 profile 추가로 snapshot이
@@ -18,9 +103,13 @@
   연속 재시도하지 않는다. 실패한 관측은 unknown으로 예약을 보존하고 다음 주기에 재조회한다.
   상태 요청은 attempt 식별·경로·OOM 관측에 필요한 필드만 전송하며 frozen 실행 원본은 보존한다.
   신규 배정의 60초 snapshot 유효기간과 배정 직전 실측 확인은 유지한다.
-- 2026-09-20 사용자 승인: `CPS2-MODEL`은 신규 모델 GPU 배정을 금지한다(`enabled=false`).
-  현재 활성 모델 attempt는 없으며, 하드웨어 DB의 `rtl-pilot-cps2` 승인·빌드 정책과는 별개다.
-  이전 execution profile과 검증 이력은 보존하고 자동 재활성화하지 않는다.
+- 2026-09-21 사용자 요청: `CPS1-MODEL`, `CPS2-MODEL`은 모델 스케줄러 인벤토리에서 제거했다. 각각 하드웨어 노드
+  `rtl-board-cps1`, `rtl-pilot-cps2`와는 별개다. 이전 execution profile과 검증 이력은 보존하고 자동 재활성화하지 않는다.
+- **CPS 직접 모델 평가 예외 (2026-09-21):** CPS1·CPS2가 모델 scheduler에 없더라도, 사용자가 명시적으로 요청한
+  모델 GPU 평가(특히 detector AP)는 해당 서버에서 scheduler 밖으로 직접 실행할 수 있다. 필요한 runtime·입력·GPU 상태를
+  실행 직전에 확인하고 서버/GPU를 지정할 수 있으며, 결과·명령·시각은 서버 로컬 receipt로 남긴다. 이 직접 평가는
+  `state.db`에 scheduler job/attempt/예약/relay를 만들거나 수정하지 않는다. 학습, GPU smoke, 자동 failover에는 적용하지
+  않으며, `rtl-board-cps1`·`rtl-pilot-cps2`의 하드웨어 DB와 실행 슬롯도 전혀 건드리지 않는다.
 - `RP1`은 SSH 장애로 신규 배정을 금지한 뒤 2026-09-20 사용자가 실제 서버를 삭제해
   모델 인벤토리에서도 제거했다. 기존 execution profile, 검증·실패·archive 이력만 보존한다.
 - 2026-09-20 사용자 승인: 모델 양자화 캠페인(PTQ/QAT/INT8/A8 등)은
@@ -34,14 +123,21 @@
 변경할 때는 repository 코드와 실제 controller 배포본, 운영 DB 적용 결과를 검증한 뒤 이 절도 같은
 변경에서 갱신합니다. 실행 중 attempt의 frozen 설정과 과거 이력은 소급 변경하지 않습니다.
 
-- train pool 순서는 `RP2 → CPS2-MODEL → CPS1-MODEL → FARM9-GUI2 → LAB1 → FARM8-GUI2 → FARM6 → FARM7 → LAB3 → LAB8`이다.
+- 2026-09-21 최신 사용자 요청으로 RP2·FARM9-GUI2·LAB1은 train/eval dual-role이다.
+  FARM8-GUI2는 eval 전용이며 기존 실행 중 attempt는 이동·중단하지 않는다.
+- LAB1·FARM8-GUI2·FARM9-GUI2는 scheduler 외부 사용도 허용한다. 외부 사용자가 별도 process를 실행할 수 있으며,
+  scheduler는 해당 process를 종료·이동하지 않고 NVML의 외부 VRAM·utilization·온도를 admission에 반영한다.
+  외부 사용 허용은 managed pool 역할을 바꾸는 뜻이 아니다. LAB1·FARM9-GUI2는 dual-role,
+  FARM8-GUI2는 eval 역할을 계속 따른다. 외부 process로 GPU가 고온·고사용률·미식별 메모리 상태이면
+  해당 GPU의 scheduler 추가 배정은 자동 보류된다.
+- train pool 순서는 `RP2 → FARM9-GUI2 → LAB1 → FARM6 → FARM7`이다.
   각 서버의 배정 가능한 모든 GPU에 train을 하나씩 채우면 다음 순위 서버로 이동하며, 전체 train pool의
   배정 가능한 GPU가 모두 깊이 1에 도달한 뒤에만 어느 GPU든 두 번째 train을 받을 수 있다. 같은 서버에서는
   빈 GPU·낮은 스케줄러 부하·VRAM·온도 조건을 먼저 본다. train은 기본 GPU당 두 개가 상한이며,
-  2026-09-20 사용자 승인으로 RP2만 GPU당 세 개·서버 전체 아홉 개까지 허용한다. GPU 사용률
+  2026-09-20 최신 사용자 승인으로 RP2는 GPU 0만 학습 세 개, GPU 1·2는 각각 두 개,
+  서버 전체 일곱 개까지 허용한다. GPU 0 예외는 UUID로 고정한다. GPU 사용률
   70% 이상·80°C 이상·VRAM/health 부적합이면 상한에 여유가 있어도 해당 GPU를 건너뛴다.
-  RP1·RP3의 과거 온보딩·검증 이력은 보존하지만 두 서버는 2026-09-20 인벤토리에서 제거됐다.
-  현재 RP 계열 후보인 RP2의 새 작업도 해당 execution profile과 host별 검증을 통과해야 한다.
+  RP1·RP3는 제거된 서버다. 현재 RP 계열 후보인 RP2의 새 작업은 해당 execution profile과 host별 검증을 통과해야 한다.
   RP 노드 환경은 각 노드에서 frozen requirements와 공식 패키지 인덱스로 설치한다. 데이터는 HF의
   pinned revision에 있는 압축 chunk를 우선 내려받고, HF에 없는 입력만 원본 서버에서 단일 압축 묶음으로
   만들어 백그라운드 전송한다. 개별 파일 반복 전송과 전체 데이터 선복제는 온보딩 조건으로 사용하지 않는다.
@@ -52,8 +148,8 @@
   일시적으로 안정 관측을 쌓는 상위 서버의 빈 GPU는 최대 180초 동안 다음 서버 이동을 보류한다.
   상위 서버에서 GPU execution validation이 진행 중이면 같은 계획 주기의 train을 다음 서버로 보내지 않고
   검증 결과를 먼저 회수한다. train은 train pool 안에서만 실행하며 eval pool로 fallback하지 않는다.
-- 모델 eval pool은 `LAB2 → LAB4 → LAB6`이다. LAB8은 2026-09-20 사용자 요청으로 eval pool에서
-  제외하고 train pool의 후순위 서버로 전환했다. 기존 LAB8 eval attempt는 이동·중단하지 않는다. eval은 이 풀 안에서만 실행하며
+- 모델 eval pool은 `LAB1 → RP2 → FARM9-GUI2 → FARM8-GUI2 → LAB2 → LAB3 → LAB4 → LAB6 → LAB8`이다. LAB3·LAB8·FARM8-GUI2는
+  eval 전용이고 RP2·FARM9-GUI2·LAB1은 dual-role이다. 기존 attempt는 이동·중단하지 않는다. eval은 이 풀 안에서만 실행하며
   train pool로 fallback하지 않는다. 선택된 서버 안에서는 이미 작업이 있는 GPU보다 다른 GPU를 먼저 쓴다.
   이 제한은 GPU train/eval의 실행 destination에 적용한다. train pool에서 생성된 checkpoint/result를
   eval pool로 relay하거나 그 반대로 전달하는 것은 계속 허용하며, relay destination은 소비 작업의 풀을 따른다.
@@ -82,6 +178,10 @@
   소비 작업·recipe·자원 예산·노드 설정·검증 상태·receipt 파일 메타데이터가 같으면 재처리를 건너뛴다.
   새 대기 작업이나 관련 상태 변경 시 다시 검증·반영하며, 프로세스 재시작 시 캐시를 재구축한다.
   서버 상태 수집과 GPU 검증 작업의 실제 배정은 기존 controller가 계속 수행한다.
+  명시적으로 `hosts`를 제한한 recovery·relocation job에는 해당 host의 profile만 추가하며, profile 준비
+  루프가 다른 서버를 후보로 다시 넓히지 않는다.
+  `{dep:JOB}` 경로는 반드시 같은 job의 `depends_on`에 등록된 JOB만 참조할 수 있다. 등록 시 이 계약을
+  검증해 stale dependency가 launch request 생성을 실패시키고 다른 ready 작업까지 막는 것을 방지한다.
 - 모델 attempt는 성공·실패 후 5분 이상 사용하지 않으면 HF 없이 LAB4로 자동 보관한다. 현재 지정된 27개
   캠페인은 과거 attempt도 포함하며, `automatic_since` 이후 종료되는 attempt와 향후 등록 캠페인은
   목록 추가 없이 자동 포함한다. 디스크 회수 대상으로 지정한 RP2는 캠페인과 무관하게 과거 terminal
@@ -117,14 +217,16 @@
   단, 작업 metadata에 `same_host_eval_dependency`가 사용자 승인으로 명시된 eval은 그 정확한 선행
   학습의 성공 attempt가 실행된 서버 하나에서만 평가를 허용한다. 이 작업별 예외는 다른 eval이나
   일반적인 train-pool fallback을 허용하지 않는다.
+  별도의 operator 승인 작업은 `eval_train_pool_override_hosts`와 사유를 명시할 수 있다. 이 예외는
+  `hosts`와 `allowed_execution_hosts`에도 같은 서버가 포함된 경우에만 해당 작업에 적용되며,
+  일반 eval이나 다른 캠페인의 train-pool 사용을 열지 않는다.
   같은 역할의 상위 서버가 VRAM·온도·동시성·host/profile·fresh health 조건에 부적합하면 같은 pool의
   다음 서버로 넘어가며 반대 역할 pool을 실행 destination으로 사용하지 않는다.
   같은 우선 라운드에서 이미 입력과 자원이 준비된 후보가 있으면 추가 복제 없이 배정한다.
   전송 가정은 후보 비교에만 사용하며 실제 실행은 기존 verified receipt가 있어야 한다.
-- 2026-09-20 사용자 요청으로 `CPS1-MODEL`은 모델 신규 배정에서 drain한다. 기존 pool 순서의 CPS1
-  위치는 비활성 노드로 건너뛰며 자동 재활성화하지 않는다. 당시 실행 중이던
+- 2026-09-21 사용자 요청으로 `CPS1-MODEL`은 모델 스케줄러 인벤토리에서 제거했다. 하드웨어 노드 `rtl-board-cps1`과는 별개다. 당시 실행 중이던
   `TQPAIR_I3_FP32_B010_QAT_V1`은 완료 epoch 2의 model·optimizer·LR·RNG checkpoint를 검증해
-  FARM9 전용 다음 attempt로 재개했다.
+  FARM9 전용 다음 attempt로 재개했다. CPS1·CPS2의 명시 요청 detector AP 직접 평가는 위의 CPS 직접 모델 평가 예외를 따른다.
   FARM↔LAB dependency 전송은 방화벽 경계를 직접 넘지 않고 controller-local bounded staging을 사용한 뒤
   검증 성공 시 staging을 삭제한다. CPS1의 사용 가능 여부는 dependency relay의 조건이 아니다. RP/CPS가 포함되거나 같은 영역 안의 전송은 제어 머신 디스크에
   적재하지 않는 direct stream을 사용한다. 다중 파일은 압축하지 않은 tar stream 하나로 전송하고,
@@ -244,6 +346,15 @@ python examples/local_demo.py --directory runtime/demo
 
 ```bash
 python -m unittest discover -s tests -v
+```
+
+이 제어 머신의 시스템 pytest는 설치된 외부 plugin과 버전이 맞지 않으므로, pytest로 전체
+회귀 테스트를 실행할 때는 plugin 자동 로드를 끕니다. 2026-09-26 기준 전체 회귀 테스트가
+통과했습니다. 스케줄러 저장소만 단독 checkout한 경우 상위 프로젝트의 CG18 종료 도구를
+검사하는 테스트 1개는 건너뜁니다.
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q
 ```
 
 ## 빠른 시작

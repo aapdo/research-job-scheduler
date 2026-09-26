@@ -312,6 +312,9 @@ def experiment_spec(raw):
         # Control dependencies only wait for success. Artifact transfer must be
         # explicit in the workflow; they never imply remote path accessibility.
         text = json.dumps({k: j.get(k) for k in ("argv", "cwd", "env", "config", "input_files", "preflight_argv")})
+        referenced = set(re.findall(r"\{dep:([^{}]+)\}", text))
+        check(referenced <= set(j["depends_on"]),
+              "dependency placeholders must reference jobs listed in depends_on")
         check(not any("{dep:" + d + "}" in text for d in order_only),
               "order-only dependency cannot be used as an artifact path")
         for asset_hash in j["assets"].values():

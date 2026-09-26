@@ -1,4 +1,4 @@
-"""Bounded detached HF publication and destination staging; no GPU transfer lease."""
+"""Dependency relay, attempt retention, and opt-in HF publication."""
 import copy
 import hashlib
 import json
@@ -758,23 +758,9 @@ def reserve_transfer_slots(live, start_dependency, start_archive, archive_urgent
     return launched
 
 
-def tick(controller, execute):
-    """Called with scheduler lock. Ten dependency relays plus one archive lane."""
-    from .notifications import campaign_specs, campaign_processing_due
-    from .planner import base_health, fit, dependency_priorities, dependency_missing_for_node
+def reconcile_transfers(controller, transfers, health):
+    """Refresh active transfer receipts and release failed relay reservations."""
     store = controller.store
-    phase_times = {}; phase_started = time.monotonic()
-    def mark(name):
-        nonlocal phase_started
-        now=time.monotonic();phase_times[name]=round(now-phase_started,4);phase_started=now
-        controller.artifact_phase_times=phase_times
-    campaigns = {key:value for key,value in campaign_specs(store).items()
-                 if campaign_processing_due(store,value)}
-    health = controller.node_health()
-    mark('campaigns_health_s')
-    hf_enabled = any(c.get('hf', {}).get('enabled') is True for c in campaigns.values())
-    transfers = rows(store, compact=True, active_only=not hf_enabled)
-    mark('transfer_rows_s')
     for r in transfers:
         if r['status'] not in ACTIVE or health.get(r['node'], {}).get('phase') in ('ssh_retrying', 'unavailable'):
             continue
@@ -797,6 +783,123 @@ def tick(controller, execute):
             if state != r['status']:
                 store.event('artifact_transfer_' + state, r['id'], dict(attempt=r['attempt'], direction=r['direction']))
         r.update(status=state, report=report)
+
+
+def transfer_jobs(store, hf_enabled, repair_queue_exists):
+    """Load only jobs needed for relay when HF publication is disabled."""
+    if hf_enabled:
+        return {j['id']: j for j in store.jobs()}
+    # Historical terminal profiles are audit data, not dispatch inputs.
+    needed_jobs = {r[0] for r in store.db.execute("SELECT id FROM jobs WHERE status='queued'")}
+    needed_jobs.update(r[0] for r in store.db.execute(
+        "SELECT d.value FROM jobs j,json_each(j.spec,'$.depends_on') d WHERE j.status='queued'"))
+    needed_jobs.update(r[0] for r in store.db.execute(
+        "SELECT job FROM attempts WHERE status IN ('starting','running','unknown')"))
+    if repair_queue_exists:
+        needed_jobs.update(r[0] for r in store.db.execute(
+            "SELECT job FROM attempts WHERE id IN (SELECT attempt FROM artifact_repair_queue WHERE state='pending')"))
+    jobs = {}
+    ids = sorted(needed_jobs)
+    for offset in range(0, len(ids), 500):
+        batch = ids[offset:offset+500]
+        for r in store.db.execute('SELECT * FROM jobs WHERE id IN ('+','.join('?' for _ in batch)+')', batch):
+            jobs[r['id']] = dict(r, spec=json.loads(r['spec']))
+    return jobs
+
+
+def stage_inputs(store, jobs, repair_queue_exists):
+    """Load the producer attempts needed by runnable dependency consumers."""
+    ready_queued = [j for j in jobs.values() if j['status'] == 'queued'
+                    and not j['spec'].get('metadata',{}).get('operator_hold')
+                    and not j['spec'].get('labels',{}).get('operator_hold')
+                    and all(jobs[d]['status'] == 'succeeded' for d in j['spec']['depends_on'])]
+    detailed_jobs = {d for j in ready_queued for d in j['spec']['depends_on']}
+    detailed_jobs.update(r[0] for r in store.db.execute(
+        "SELECT DISTINCT job FROM attempts WHERE status IN ('starting','running','unknown')"))
+    if repair_queue_exists:
+        detailed_jobs.update(r[0] for r in store.db.execute(
+            "SELECT job FROM attempts WHERE id IN "
+            "(SELECT attempt FROM artifact_repair_queue WHERE state='pending')"))
+    groups = store.specs('groups_')
+    max_interval = max((g.get('min_start_interval_s', 0) for g in groups.values()), default=0)
+    if max_interval:
+        detailed_jobs.update(r[0] for r in store.db.execute(
+            'SELECT DISTINCT job FROM attempts WHERE created>=?', (time.time()-max_interval,)))
+    return ready_queued, groups, store.attempts(summary=True, job_ids=detailed_jobs)
+
+
+def start_next_publication(controller, jobs, experiments, campaigns, transfers,
+                           attempts, queued, demand, nodes, eligible):
+    """Select one completed attempt for optional HF publication."""
+    from .planner import dependency_priorities
+    store = controller.store
+    needed = {d for j in queued for d in j['spec']['depends_on']}
+    priorities = dependency_priorities(list(jobs.values()), experiments)
+    # Historical successes stay compact until one candidate is selected.
+    latest_success = {}
+    for row in store.db.execute("SELECT id,job,node,created FROM attempts WHERE status='succeeded' ORDER BY created"):
+        latest_success[row['job']] = dict(row)
+    published = {t['attempt'] for t in transfers if t['direction']=='upload' and t['status']=='succeeded'}
+    detailed = {a['id']:a for a in attempts}
+    for candidate in sorted(latest_success.values(), key=lambda a: (a['job'] not in demand,
+                    -demand.get(a['job'], 0), a['job'] not in needed,
+                    -priorities[a['job']][0], -priorities[a['job']][1],
+                    -priorities[a['job']][2], a['created'])):
+        if candidate['id'] in published:
+            continue
+        job = jobs.get(candidate['job'])
+        if job is None:
+            continue
+        spec = job['spec']
+        if not spec['outputs']:
+            continue
+        campaign = campaign_for(experiments[job['experiment']], campaigns)
+        n = nodes.get(candidate['node'])
+        if not campaign or n is None:
+            continue
+        a = detailed.get(candidate['id'])
+        if a is None and n['enabled'] and not eligible(candidate, n, 'upload'):
+            continue
+        if a is None:
+            a = next((item for item in store.attempts(summary=True,job_ids={candidate['job']})
+                      if item['id']==candidate['id']), None)
+            if a is None:
+                continue
+        if a['report'].get('hf_artifact') or not eligible(a,n,'upload'):
+            continue
+        relocations = list(spec.get('hf_relocate_json', []))
+        if 'TRAIN_RESULT.json' in spec['outputs'] and 'TRAIN_RESULT.json' not in relocations:
+            relocations.append('TRAIN_RESULT.json')
+        config = dict(hf=campaign['hf'], campaign=campaign['id'], attempt=a['id'], job=a['job'],
+                      source_root=a['spec']['attempt_dir'], outputs=a['report']['outputs'],
+                      patterns=list(dict.fromkeys(spec['outputs'] + spec.get('hf_artifacts', []))),
+                      relocate_json=relocations,
+                      archive_payload=campaign['hf'].get('archive_payload', True))
+        history = [r for r in transfers if r['attempt'] == a['id'] and r['direction'] == 'upload']
+        if history and history[-1]['spec']['config'].get('repair_revision'):
+            config['repair_revision'] = history[-1]['spec']['config']['repair_revision']
+        return start(controller, a, n, 'upload', config)
+    return None
+
+
+def tick(controller, execute):
+    """Reconcile transfers, then reserve up to 24 relays and 8 archive lanes."""
+    from .notifications import campaign_specs, campaign_processing_due
+    from .planner import base_health, fit, dependency_missing_for_node
+    store = controller.store
+    phase_times = {}; phase_started = time.monotonic()
+    def mark(name):
+        nonlocal phase_started
+        now=time.monotonic();phase_times[name]=round(now-phase_started,4);phase_started=now
+        controller.artifact_phase_times=phase_times
+    campaigns = {key:value for key,value in campaign_specs(store).items()
+                 if campaign_processing_due(store,value)}
+    health = controller.node_health()
+    mark('campaigns_health_s')
+    hf_enabled = any(c.get('hf', {}).get('enabled') is True for c in campaigns.values())
+    transfers = rows(store, compact=True, active_only=not hf_enabled)
+    mark('transfer_rows_s')
+    reconcile_transfers(controller, transfers, health)
     mark('transfer_reconcile_s')
     if not execute:
         return
@@ -809,51 +912,17 @@ def tick(controller, execute):
     transfer_capacity = 32  # 24 dependency relays plus eight independent archive lanes.
     if len(live) >= transfer_capacity:
         return
-    if hf_enabled:
-        jobs = {j['id']: j for j in store.jobs()}
-    else:
-        # Only runnable successors and their direct producers are needed for
-        # internal relay. Historical terminal job profiles are audit data.
-        needed_jobs = {r[0] for r in store.db.execute("SELECT id FROM jobs WHERE status='queued'")}
-        needed_jobs.update(r[0] for r in store.db.execute(
-            "SELECT d.value FROM jobs j,json_each(j.spec,'$.depends_on') d WHERE j.status='queued'"))
-        needed_jobs.update(r[0] for r in store.db.execute(
-            "SELECT job FROM attempts WHERE status IN ('starting','running','unknown')"))
-        if store.db.execute("SELECT 1 FROM sqlite_master WHERE name='artifact_repair_queue'").fetchone():
-            needed_jobs.update(r[0] for r in store.db.execute(
-                "SELECT job FROM attempts WHERE id IN (SELECT attempt FROM artifact_repair_queue WHERE state='pending')"))
-        jobs = {}
-        ids = sorted(needed_jobs)
-        for offset in range(0, len(ids), 500):
-            batch = ids[offset:offset+500]
-            for r in store.db.execute('SELECT * FROM jobs WHERE id IN ('+','.join('?' for _ in batch)+')', batch):
-                jobs[r['id']] = dict(r, spec=json.loads(r['spec']))
+    repair_queue_exists = bool(store.db.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='artifact_repair_queue'").fetchone())
+    jobs = transfer_jobs(store, hf_enabled, repair_queue_exists)
     mark('jobs_s')
     experiments = {r['id']:json.loads(r['spec']) for r in store.db.execute(
         "SELECT id,json_remove(spec,'$.jobs') AS spec FROM experiments")}
     mark('experiments_s')
     from .model_vram_policy import normalize
     jobs = {k:dict(j,spec=normalize(j['spec'])) for k,j in jobs.items()}
-    # Dependency staging is an internal scheduler guarantee, independent of
-    # whether a campaign publishes long-term results to HF. This also covers
-    # future campaigns that only declare ordinary depends_on outputs.
-    ready_queued = [j for j in jobs.values() if j['status'] == 'queued'
-                    and not j['spec'].get('metadata',{}).get('operator_hold')
-                    and not j['spec'].get('labels',{}).get('operator_hold')
-                    and all(jobs[d]['status'] == 'succeeded' for d in j['spec']['depends_on'])]
-    detailed_jobs = {d for j in ready_queued for d in j['spec']['depends_on']}
-    detailed_jobs.update(r[0] for r in store.db.execute(
-        "SELECT DISTINCT job FROM attempts WHERE status IN ('starting','running','unknown')"))
-    if store.db.execute("SELECT 1 FROM sqlite_master WHERE name='artifact_repair_queue'").fetchone():
-        detailed_jobs.update(r[0] for r in store.db.execute(
-            "SELECT job FROM attempts WHERE id IN "
-            "(SELECT attempt FROM artifact_repair_queue WHERE state='pending')"))
-    groups = store.specs('groups_')
-    max_interval = max((g.get('min_start_interval_s', 0) for g in groups.values()), default=0)
-    if max_interval:
-        detailed_jobs.update(r[0] for r in store.db.execute(
-            'SELECT DISTINCT job FROM attempts WHERE created>=?', (time.time()-max_interval,)))
-    attempts = store.attempts(summary=True, job_ids=detailed_jobs)
+    # Dependency staging also runs when HF publication is disabled.
+    ready_queued, groups, attempts = stage_inputs(store, jobs, repair_queue_exists)
     mark('attempts_s')
     from .planner import admission_vram
     attempts = [dict(a, admission_vram_mib=admission_vram(a, jobs.get(a.get('job'),{}), time.time()))
@@ -898,7 +967,7 @@ def tick(controller, execute):
                             or time.time() - s.get('received_at', 0) > other['policy']['max_snapshot_age_s']):
                         return False
             last = max((x['created'] for x in attempts + transfers if x['spec']['startup_group'] == group), default=0)
-            if time.time() - last < store.specs('groups_')[group]['min_start_interval_s']:
+            if time.time() - last < groups[group]['min_start_interval_s']:
                 return False
         if not hf_enabled and direction == 'download':
             history = [dict(r, spec=json.loads(r['spec']), report=json.loads(r['report']))
@@ -915,7 +984,7 @@ def tick(controller, execute):
 
     # Explicit finite operator repairs are consumed by the single dispatcher,
     # ahead of ordinary publication. Preserve all health, slot and 429 gates.
-    if store.db.execute("SELECT 1 FROM sqlite_master WHERE name='artifact_repair_queue'").fetchone():
+    if repair_queue_exists:
         for pending in store.db.execute("SELECT * FROM artifact_repair_queue WHERE state='pending' ORDER BY created").fetchall():
             if pending['expires'] < time.time():
                 with store.db:store.db.execute("UPDATE artifact_repair_queue SET state='expired' WHERE attempt=?",(pending['attempt'],))
@@ -948,6 +1017,7 @@ def tick(controller, execute):
     mark('demand_scan_s')
     def start_dependency(_live):
         from .planner import dependency_pool_candidates
+        active = [a for a in attempts if a['status'] in ACTIVE] + reservations(store)
         for j in queued:
             if not all(jobs[d]['status'] == 'succeeded' for d in j['spec']['depends_on']):
                 continue
@@ -959,8 +1029,7 @@ def tick(controller, execute):
                 pool={intent['node']: dependency_missing_for_node(j['spec'], intent['node'], successful, nodes)}
             else:
                 pool = dependency_pool_candidates(j['spec'], nodes, snapshots,
-                    [a for a in attempts if a['status'] in ACTIVE] + reservations(store),
-                    attempts, successful, groups, time.time())
+                    active, attempts, successful, groups, time.time())
             if pool is not None and any(not missing for missing in pool.values()):
                 continue
             staging_nodes = sorted((n for n in nodes.values() if pool is None or n['id'] in pool), key=lambda n:
@@ -995,7 +1064,6 @@ def tick(controller, execute):
                             item['artifact_locations'] = dict(item.get('artifact_locations', {}))
                             item['artifact_locations'][n['id']] = {}
                             hypothetical[d] = item
-                    active = [a for a in attempts if a['status'] in ACTIVE] + reservations(store)
                     snapshot = snapshots.get(n['id'], {})
                     fits = [fit(dict(j['spec'], resources=resources), n, snapshot,
                                 active,
@@ -1045,55 +1113,8 @@ def tick(controller, execute):
     mark('dependency_reserve_s')
     if launched or not hf_enabled:
         return
-    # Prioritize publications that unblock successors; successful computation stays successful.
-    needed = {d for j in queued for d in j['spec']['depends_on']}
-    priorities = dependency_priorities(list(jobs.values()), experiments)
-    # Select a publication candidate from small immutable metadata; only the
-    # chosen source needs its full frozen attempt/export report.
-    latest_success = {}
-    for row in store.db.execute("SELECT id,job,node,created FROM attempts WHERE status='succeeded' ORDER BY created"):
-        latest_success[row['job']] = dict(row)
-    published = {t['attempt'] for t in transfers if t['direction']=='upload' and t['status']=='succeeded'}
-    detailed = {a['id']:a for a in attempts}
-    for candidate in sorted(latest_success.values(), key=lambda a: (a['job'] not in demand,
-                    -demand.get(a['job'], 0), a['job'] not in needed,
-                    -priorities[a['job']][0], -priorities[a['job']][1],
-                    -priorities[a['job']][2], a['created'])):
-        if candidate['id'] in published:
-            continue
-        job = jobs.get(candidate['job'])
-        if job is None:
-            continue
-        spec = job['spec']
-        if not spec['outputs']:
-            continue
-        campaign = campaign_for(experiments[job['experiment']], campaigns)
-        n = nodes.get(candidate['node'])
-        if not campaign or n is None:
-            continue
-        a = detailed.get(candidate['id'])
-        if a is None and n['enabled'] and not eligible(candidate, n, 'upload'):
-            continue
-        if a is None:
-            a = next((item for item in store.attempts(summary=True,job_ids={candidate['job']})
-                      if item['id']==candidate['id']), None)
-            if a is None:
-                continue
-        if a['report'].get('hf_artifact') or not eligible(a,n,'upload'):
-            continue
-        relocations = list(spec.get('hf_relocate_json', []))
-        if 'TRAIN_RESULT.json' in spec['outputs'] and 'TRAIN_RESULT.json' not in relocations:
-            relocations.append('TRAIN_RESULT.json')
-        config = dict(hf=campaign['hf'], campaign=campaign['id'], attempt=a['id'], job=a['job'],
-                      source_root=a['spec']['attempt_dir'], outputs=a['report']['outputs'],
-                      patterns=list(dict.fromkeys(spec['outputs'] + spec.get('hf_artifacts', []))),
-                      relocate_json=relocations,
-                      archive_payload=campaign['hf'].get('archive_payload', True))
-        history = [r for r in transfers if r['attempt'] == a['id'] and r['direction'] == 'upload']
-        if history and history[-1]['spec']['config'].get('repair_revision'):
-            config['repair_revision'] = history[-1]['spec']['config']['repair_revision']
-        start(controller, a, n, 'upload', config)
-        return
+    start_next_publication(controller, jobs, experiments, campaigns, transfers,
+                           attempts, queued, demand, nodes, eligible)
 
 
 def status(store):

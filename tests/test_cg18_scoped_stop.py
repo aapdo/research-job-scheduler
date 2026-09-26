@@ -9,6 +9,9 @@ import unittest
 
 class ScopedStopTests(unittest.TestCase):
     def test_only_requested_predecessor_tree_is_stopped(self):
+        tool=Path(__file__).resolve().parents[2]/'tools/stop_cg18_attempt_for_multigpu.py'
+        if not tool.is_file():
+            self.skipTest('requires the parent carla_online_switch tools directory')
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)/'CG18_shared_TRAIN.test';root.mkdir()
             code="import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);print(p.pid,flush=True);time.sleep(60)"
@@ -19,7 +22,6 @@ class ScopedStopTests(unittest.TestCase):
                 child=int(process.stdout.readline())
                 (root/'spec.json').write_text(json.dumps(dict(id=root.name,job='CG18_shared_TRAIN',resources={'gpu_count':1})))
                 (root/'state.json').write_text(json.dumps(dict(attempt=root.name,status='running',child_pid=process.pid)))
-                tool=Path(__file__).resolve().parents[2]/'tools/stop_cg18_attempt_for_multigpu.py'
                 result=subprocess.run([sys.executable,str(tool),root.name,str(root)],capture_output=True,text=True,timeout=35)
                 self.assertEqual(result.returncode,0,result.stderr)
                 out=json.loads(result.stdout)

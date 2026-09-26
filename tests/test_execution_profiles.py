@@ -22,7 +22,7 @@ class ExecutionPreparationTests(unittest.TestCase):
             if key=='control':n['gpus']=[]
             else:n.update(transport='ssh',target=key)
             self.store.register_node(n)
-        j=job('consumer');j.update(hosts=['a'],cwd='/original',dataset='data')
+        j=job('consumer');j.update(hosts=['a','b'],cwd='/original',dataset='data')
         self.store.register_experiment(experiment([j]))
         self.recipe=dict(target='b',copies=[],verify_argv=['true'],execution=dict(cwd='/prepared',argv=['python','/prepared/run.py'],env={'PYTHONNOUSERSITE':'1'},config={'input_profiles':{'b':'b'*64}},input_files=[]),resources={'train':dict(gpu_count=1,vram_mib=2000,cpu=1,ram_mib=1000,gpu_mode='exclusive')},dataset_path='/prepared/data',asset=dict(path='/prepared/SHA256SUMS',sha256='a'*64))
         self.catalog=ep.register(self.store,dict(id='demo-v1',coordinator='control',match=dict(cwd='/original',dataset='data'),targets={'b':self.recipe},max_parallel=1))
@@ -43,11 +43,11 @@ class ExecutionPreparationTests(unittest.TestCase):
     def test_new_consumer_invalidates_ready_profile_cache(self):
         ep.tick(self.controller,execute=True)
         self.succeed();ep.tick(self.controller,execute=True)
-        new=job('new-consumer');new.update(hosts=['a'],cwd='/original',dataset='data')
+        new=job('new-consumer');new.update(hosts=['a','b'],cwd='/original',dataset='data')
         self.store.register_experiment(experiment([new],key='new-experiment'))
         ep.tick(self.controller,execute=True)
         stored=json.loads(self.store.db.execute("SELECT spec FROM jobs WHERE id='new-consumer'").fetchone()[0])
-        self.assertIn('b',stored['hosts'])
+        self.assertIn('b',stored['metadata']['execution_profiles'])
 
     def test_changed_receipt_invalidates_ready_profile_cache(self):
         ep.tick(self.controller,execute=True)
@@ -133,16 +133,17 @@ class ExecutionPreparationTests(unittest.TestCase):
             self.store.db.execute("UPDATE jobs SET status='succeeded' WHERE id=?",(row['job'],))
             self.store.db.execute('INSERT INTO attempts(id,job,node,spec,status,created,report) VALUES(?,?,?,?,?,?,?)',('prep-attempt',row['job'],'control',dumps(dict(attempt_dir=str(directory),node_spec={'transport':'local'})),'succeeded',time.time(),dumps({'outputs':{'EXECUTION_READY.json':output}})))
 
-    def test_prepares_once_then_adds_alternative_and_freezes_override(self):
+    def test_prepares_once_then_freezes_allowed_host_override(self):
         original=copy.deepcopy(self.consumer())
         ep.tick(self.controller,execute=False)
         self.assertEqual(len(self.store.jobs()),1)
         ep.tick(self.controller,execute=True);ep.tick(self.controller,execute=True)
         self.assertEqual(len(self.store.jobs()),2)
-        self.assertEqual(self.consumer()['hosts'],['a'])
+        self.assertNotIn('b',self.consumer()['metadata'].get('execution_profiles',{}))
         self.succeed();ep.tick(self.controller,execute=True)
         prepared=self.consumer()
         self.assertEqual(prepared['hosts'],['a','b'])
+        self.assertIn('b',prepared['metadata']['execution_profiles'])
         for key in ('cwd','argv','resources','config','depends_on'):
             self.assertEqual(prepared[key],original[key])
         selected=ep.for_node(prepared,'b')
@@ -186,6 +187,13 @@ class ExecutionPreparationTests(unittest.TestCase):
         ep.tick(self.controller,execute=True)
         self.assertEqual(len(self.store.jobs()),1)
 
+    def test_explicit_host_constraint_does_not_prepare_other_node(self):
+        restricted=self.consumer();restricted['hosts']=['a']
+        with self.store.db:
+            self.store.db.execute('UPDATE jobs SET spec=? WHERE id=?',(dumps(restricted),'consumer'))
+        ep.tick(self.controller,execute=True)
+        self.assertFalse(self.store.db.execute('SELECT 1 FROM execution_preparations').fetchone())
+
     def test_excluded_host_is_not_automatically_readmitted(self):
         original=self.consumer();original.setdefault('metadata',{})['excluded_hosts']=['b']
         with self.store.db:self.store.db.execute('UPDATE jobs SET spec=? WHERE id=?',(dumps(original),'consumer'))
@@ -201,7 +209,7 @@ class ExecutionPreparationTests(unittest.TestCase):
             self.store.db.execute('UPDATE execution_catalog SET spec=?',(dumps(self.catalog),))
         ep.tick(self.controller,execute=True)
         self.assertEqual(len(self.store.jobs()),1)
-        self.assertEqual(self.consumer()['hosts'],['a'])
+        self.assertNotIn('b',self.consumer()['metadata'].get('execution_profiles',{}))
 
     def test_node_one_gpu_limit_still_prepares_one_gpu_recipe(self):
         n=self.store.specs('nodes')['b'];n['labels']['max_gpus_per_job']=1
@@ -251,11 +259,11 @@ class ExecutionPreparationTests(unittest.TestCase):
         ep.tick(self.controller,execute=True);self.succeed();ep.tick(self.controller,execute=True)
         validation=next(j for j in self.store.jobs() if j['id'].startswith('EXEC_VERIFY_'))
         self.assertEqual(validation['spec']['resources']['vram_mib'],1500)
-        self.assertEqual(self.consumer()['hosts'],['a'])
+        self.assertNotIn('b',self.consumer()['metadata'].get('execution_profiles',{}))
 
     def test_wrong_receipt_does_not_admit(self):
         ep.tick(self.controller,execute=True);self.succeed(wrong=True);ep.tick(self.controller,execute=True)
-        self.assertEqual(self.consumer()['hosts'],['a'])
+        self.assertNotIn('b',self.consumer()['metadata'].get('execution_profiles',{}))
         self.assertEqual(self.store.db.execute('SELECT state FROM execution_preparations').fetchone()['state'],'verification_failed')
 
     def test_gpu_validation_is_scheduler_owned_and_gates_candidate_admission(self):
@@ -267,26 +275,28 @@ class ExecutionPreparationTests(unittest.TestCase):
         self.assertEqual(validation['status'],'queued')
         self.assertEqual(validation['spec']['hosts'],['b'])
         self.assertEqual(validation['spec']['kind'],'prepare')
-        self.assertEqual(self.consumer()['hosts'],['a'])
+        self.assertNotIn('b',self.consumer()['metadata'].get('execution_profiles',{}))
         with self.store.db:self.store.db.execute("UPDATE jobs SET status='failed' WHERE id=?",(validation['id'],))
         ep.tick(self.controller,execute=True)
-        self.assertEqual(self.consumer()['hosts'],['a'])
+        self.assertNotIn('b',self.consumer()['metadata'].get('execution_profiles',{}))
         with self.store.db:self.store.db.execute("UPDATE jobs SET status='succeeded' WHERE id=?",(validation['id'],))
         ep.tick(self.controller,execute=True)
-        self.assertEqual(self.consumer()['hosts'],['a','b'])
+        self.assertIn('b',self.consumer()['metadata']['execution_profiles'])
 
     def test_failed_preparation_is_not_duplicated(self):
         ep.tick(self.controller,execute=True)
         key=self.store.db.execute('SELECT job FROM execution_preparations').fetchone()['job']
         with self.store.db:self.store.db.execute("UPDATE jobs SET status='failed' WHERE id=?",(key,))
         ep.tick(self.controller,execute=True)
-        self.assertEqual(len(self.store.jobs()),2);self.assertEqual(self.consumer()['hosts'],['a'])
+        self.assertEqual(len(self.store.jobs()),2)
+        self.assertNotIn('b',self.consumer()['metadata'].get('execution_profiles',{}))
 
     def test_verification_after_user_disables_node_does_not_readmit(self):
         ep.tick(self.controller,execute=True);self.succeed()
         n=self.store.specs('nodes')['b'];n['enabled']=False
         with self.store.db:self.store.db.execute('UPDATE nodes SET spec=? WHERE id=?',(dumps(n),'b'))
-        ep.tick(self.controller,execute=True);self.assertEqual(self.consumer()['hosts'],['a'])
+        ep.tick(self.controller,execute=True)
+        self.assertNotIn('b',self.consumer()['metadata'].get('execution_profiles',{}))
 
     def test_scientific_config_override_is_rejected(self):
         recipe=copy.deepcopy(self.catalog['targets']['b']);recipe['execution']['config']={'epochs':1}

@@ -36,6 +36,12 @@ class OrderOnlyDependenciesTests(unittest.TestCase):
         child['order_only_dependencies']=['unknown']
         with self.assertRaises(ValueError):experiment([job('first'),child])
 
+    def test_dependency_placeholder_must_be_declared(self):
+        child=job('child',deps=['first'])
+        child['config']={'input':'{dep:stale-job}/weights'}
+        with self.assertRaisesRegex(ValueError,'dependency placeholders'):
+            experiment([job('first'),child])
+
     def test_order_only_request_does_not_rehash_unreachable_files(self):
         with tempfile.TemporaryDirectory() as root:
             s=Store(Path(root)/'state.db');s.register_node(node(key='b'))

@@ -256,6 +256,7 @@ def tick(controller, execute=False):
             if node.get('target')!=recipe['target']:continue
             if not node['enabled'] or not any(g['enabled'] and g['uuid'] not in node['policy'].get('disabled_gpu_uuids',[]) for g in node['gpus']):continue
             consumers=[j for j in matching if j['spec']['kind'] in recipe['resources']
+                       and (not j['spec'].get('hosts') or target in j['spec']['hosts'])
                        and target not in j['spec'].get('metadata',{}).get('excluded_hosts',[])]
             limit=node.get('labels',{}).get('max_gpus_per_job')
             if limit is not None:

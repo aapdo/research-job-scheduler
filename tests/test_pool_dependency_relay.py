@@ -10,14 +10,16 @@ from research_scheduler.artifacts import runnable_stage_demand
 class PoolDependencyRelayTests(unittest.TestCase):
     def setup_case(self, kind='eval'):
         self.now = time.time()
-        self.nodes = {n: node(key=n) for n in ('rp2', 'lab4')}
+        # RP2 is dual-role; FARM7 is the train-only fallback candidate here.
+        source_host = 'farm7' if kind == 'eval' else 'rp2'
+        self.nodes = {n: node(key=n) for n in (source_host, 'lab4')}
         self.snaps = {n: snapshot(v, self.now) for n, v in self.nodes.items()}
         consumer = job('consumer', deps=['producer'])
-        consumer.update(kind=kind, hosts=['rp2', 'lab4'])
+        consumer.update(kind=kind, hosts=[source_host, 'lab4'])
         self.exp = experiment([job('producer', gpu_count=0), consumer])
         self.jobs = {s['id']: dict(id=s['id'], spec=s, experiment='e', created=1,
                      status='succeeded' if s['id']=='producer' else 'queued') for s in self.exp['jobs']}
-        ready = 'rp2' if kind=='eval' else 'lab4'
+        ready = source_host if kind=='eval' else 'lab4'
         self.producer = dict(id='producer.1', job='producer', node=ready,
             created=1, status='succeeded', released=True,
             spec=dict(node_spec=self.nodes[ready], job_spec=self.exp['jobs'][0], gpus=[],
@@ -32,7 +34,7 @@ class PoolDependencyRelayTests(unittest.TestCase):
             self.nodes, self.snaps, attempts, {'producer':self.producer}, {}, self.now)
         return next(r for r in result if r['job']=='consumer'), demand
 
-    def test_eval_waits_for_lab_relay_despite_ready_rp(self):
+    def test_eval_waits_for_lab_relay_despite_ready_train_host(self):
         self.setup_case()
         decision, demand = self.decisions()
         self.assertEqual(decision['decision'], 'waiting')
@@ -103,7 +105,7 @@ class PoolDependencyRelayTests(unittest.TestCase):
                     self.jobs['consumer']['spec']['metadata']['execution_profiles']={'lab4': {
                         'resource_contract': self.jobs['consumer']['spec']['resources'],
                         'assets': {'missing-runtime':'a'*64}}}
-                if condition=='host': self.jobs['consumer']['spec']['hosts']=['rp2']
+                if condition=='host': self.jobs['consumer']['spec']['hosts']=['farm7']
                 decision, demand=self.decisions()
                 self.assertEqual(decision['decision'],'waiting')
                 self.assertFalse(demand)

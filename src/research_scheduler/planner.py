@@ -8,26 +8,38 @@ from .build_placement import placement_key, build_pressure
 from .draining import epoch_publication_allowed, host_resource_reservations
 
 
-TRAIN_DENSE_NODES=('rp2','cps2-model','cps1-model','farm9-gui2')
-TRAIN_SECONDARY_NODES=('lab1','farm8-gui2','farm6','farm7','lab3','lab8')
+TRAIN_DENSE_NODES=('rp2','farm9-gui2','lab1')
+TRAIN_SECONDARY_NODES=('farm6','farm7')
 TRAIN_PREFERRED_NODES=TRAIN_DENSE_NODES+TRAIN_SECONDARY_NODES
-EVAL_PREFERRED_NODES=('lab2','lab4','lab6')
-RETIRED_MODEL_NODES=('rp1','rp3','farm1','farm2')
+EVAL_PREFERRED_NODES=('lab1','rp2','farm9-gui2','farm8-gui2','lab2','lab3','lab4','lab6','lab8')
+RETIRED_MODEL_NODES=('rp1','rp3','cps1-model','cps2-model','farm1','farm2')
 
 
-def workload_node_allowed(kind,node_id,job=None,successful=None):
+def workload_node_allowed(kind,node_id,job=None,successful=None,node=None):
     """Keep model train/eval execution inside its configured GPU pool."""
     if node_id in RETIRED_MODEL_NODES:return False
+    if kind=='train' and node and node.get('labels',{}).get('train_admission_hold'):
+        return False
     # Generic/library nodes used outside the managed model fleet have no pool
     # contract here. Every production model GPU is listed in exactly one set.
     if node_id not in set(TRAIN_PREFERRED_NODES)|set(EVAL_PREFERRED_NODES):return True
-    if kind=='train':return node_id in TRAIN_PREFERRED_NODES
+    if kind=='train':
+        scoped=(job or {}).get('metadata',{}).get('train_gpu_allowlist')
+        if scoped is not None:
+            return isinstance(scoped,dict) and bool(scoped.get(node_id))
+        return node_id in TRAIN_PREFERRED_NODES
     if kind=='eval':
         if node_id in EVAL_PREFERRED_NODES:return True
+        metadata=(job or {}).get('metadata',{})
+        overrides=metadata.get('eval_train_pool_override_hosts',[])
+        if (node_id in overrides and node_id in (job or {}).get('hosts',[])
+                and node_id in metadata.get('allowed_execution_hosts',[])
+                and metadata.get('eval_train_pool_override_reason')):
+            return True
         # A user-approved, job-scoped exception may keep an evaluation beside
         # its exact successful training attempt. It does not open the train
         # pool generally and cannot select a different producer/server.
-        dependency=(job or {}).get('metadata',{}).get('same_host_eval_dependency')
+        dependency=metadata.get('same_host_eval_dependency')
         source=(successful or {}).get(dependency)
         return bool(dependency and dependency in (job or {}).get('depends_on',[])
                     and source and source.get('status')=='succeeded'
@@ -57,7 +69,7 @@ def workload_round_candidates(kind, rows, nodes, held, job=None, successful=None
     """
     if kind not in ('train','eval'):
         return rows,lambda row:()
-    rows=[row for row in rows if workload_node_allowed(kind,row[1],job,successful)]
+    rows=[row for row in rows if workload_node_allowed(kind,row[1],job,successful,nodes.get(row[1]))]
     if not rows:return [],lambda row:()
     def depth(row):
         counts=[]
@@ -520,6 +532,15 @@ def placements(jobs, experiments, nodes, snapshots, attempts, groups, now=None, 
 def fit(job, node, snap, held, history, successful, groups, now):
     from .model_vram_policy import normalize
     job=normalize(job)
+    # A catalog declares that the immutable execution source, node-local
+    # input path and GPU smoke receipt are part of admission.  A job must not
+    # fall back to its coordinator-side paths while that node profile is still
+    # being prepared; doing so can launch against files that exist only on the
+    # control machine.
+    catalog=job.get('metadata',{}).get('execution_preparation_catalog')
+    profiles=job.get('metadata',{}).get('execution_profiles',{})
+    if catalog and node['id'] not in profiles:
+        return 'execution profile validation pending: '+catalog, []
     # A partial runtime qualification is not permission for score/statistics jobs.
     capability=node.get('labels',{}).get('execution_capability_limits',{}).get(job.get('dataset'))
     if capability:
@@ -542,7 +563,7 @@ def fit(job, node, snap, held, history, successful, groups, now):
         return 'invalid execution profile', []
     p, req = node["policy"], job["resources"]
     if (req['gpu_count'] and job['kind'] in ('train','eval')
-            and not workload_node_allowed(job['kind'],node['id'],job,successful)):
+            and not workload_node_allowed(job['kind'],node['id'],job,successful,node)):
         return ('workload pool restriction: '+job['kind']+' requires its '
                 +job['kind']+' pool'), []
     runtime_hold = node.get('labels', {}).get('gpu_runtime_quarantine', {})
@@ -648,6 +669,10 @@ def fit(job, node, snap, held, history, successful, groups, now):
     registered = {g["uuid"]: g for g in node["gpus"] if g["enabled"]
                   and g["uuid"] not in p.get("disabled_gpu_uuids", [])
                   and g["uuid"] not in snap.get("gpu_unavailable_uuids", [])}
+    if job['kind']=='train' and 'train_gpu_allowlist' in job.get('metadata',{}):
+        scope=job['metadata']['train_gpu_allowlist']
+        permitted=scope.get(node['id'],[]) if isinstance(scope,dict) else []
+        registered={uuid:g for uuid,g in registered.items() if uuid in permitted}
     if req["gpu_count"]:
         if not registered:
             return "not enough enabled GPUs", []
@@ -741,6 +766,10 @@ def fit(job, node, snap, held, history, successful, groups, now):
             # GPU.  A node-local override is explicit so raising one large
             # RunPod node does not relax the rest of the primary pool.
             train_cap=node.get('labels',{}).get('max_train_jobs_per_gpu',2)
+            per_gpu_caps=node.get('labels',{}).get('max_train_jobs_by_gpu_uuid',{})
+            if not isinstance(per_gpu_caps,dict):
+                return 'invalid per-GPU train sharing caps', []
+            train_cap=per_gpu_caps.get(gpu['uuid'],train_cap)
             if type(train_cap) is not int or train_cap<1:
                 return 'invalid train GPU sharing cap', []
             train_users=sum(a['spec'].get('job_kind',a['spec'].get('job_spec',{}).get('kind'))=='train'
